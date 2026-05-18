@@ -30,7 +30,11 @@ if [ ! -d "$VENV" ]; then
   source "$VENV/bin/activate"
   uv pip install --python "$VENV/bin/python" \
     vllm-lens "peft==0.13.0" bitsandbytes wandb pyarrow \
-    "transformers>=4.45" safetensors pyyaml numpy huggingface_hub
+    "transformers==4.57.1" safetensors pyyaml numpy huggingface_hub
+  # Pin transformers to match the SFT training env — transformers 5.x changed
+  # apply_chat_template's BPE merge behaviour around the ㈎ injection char so
+  # the marker token id no longer appears in the rendered canonical prompt,
+  # tripping schema.compute_canonical_neighbors. See job 1572515 failure.
 fi
 source "$VENV/bin/activate"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
