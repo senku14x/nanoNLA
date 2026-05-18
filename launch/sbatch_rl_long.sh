@@ -30,20 +30,20 @@ python -m nla.train_rl_self_contained \
   --ar-ckpt /workspace-vast/celeste/nla-ckpts/qwen3_8b_L24_ar_sft_safe/iter_0001000/hf \
   --rl-parquet $DATA/rl_shuf.parquet \
   --sidecar $DATA/rl_shuf.parquet \
-  --save-dir /workspace-vast/celeste/nla-ckpts/qwen3_8b_L24_rl_grpo_v3_b16g16 \
+  --save-dir /workspace-vast/celeste/nla-ckpts/qwen3_8b_L24_rl_grpo_v4_lrbump \
   --num-steps 1000 \
   --batch-prompts 16 \
   --group-size 16 \
   --max-new-tokens 150 \
   --temperature 1.0 \
-  --lr 1e-6 \
+  --lr 1e-5 \
   --kl-beta 0.01 \
   --clip-eps 0.2 \
   --lora-r 128 \
   --lora-alpha 16 \
   --use-rslora \
   --train-critic \
-  --critic-lr 1e-5 \
+  --critic-lr 5e-5 \
   --logp-micro-batch 2 \
   --max-rows 30000 \
   --save-every 100 \
@@ -52,5 +52,5 @@ python -m nla.train_rl_self_contained \
   --eval-skip-rows 35000 \
   --max-grad-norm 1.0 \
   --wandb-project nla-qwen3-8b \
-  --wandb-name qwen3_8b_L24_rl_grpo_v3_b16g16_cotrain_rs128 \
+  --wandb-name qwen3_8b_L24_rl_grpo_v4_lrbump_normvh \
   --seed 0

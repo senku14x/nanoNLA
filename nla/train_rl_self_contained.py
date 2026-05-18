@@ -176,8 +176,13 @@ def rollout_one_prompt(
             max_new_tokens=max_new_tokens,
             do_sample=True,
             temperature=temperature,
-            # NO top_p — see comment below. Keeps rollout distribution = training
-            # distribution so importance ratio stays well-behaved.
+            # Explicitly override sampler — Qwen3's generation_config.json may
+            # set top_p<1.0 / top_k>0 / repetition_penalty by default. Any of
+            # these introduce -inf in the sampler logits, breaking the
+            # importance ratio (exp(new_lp - old_lp) → inf).
+            top_p=1.0,
+            top_k=0,
+            repetition_penalty=1.0,
             pad_token_id=tokenizer.eos_token_id,
             return_dict_in_generate=True,
             output_logits=True,  # RAW pre-processor logits — scores are post-top_p
@@ -214,6 +219,43 @@ def rollout_one_prompt(
     return responses
 
 
+def critic_predict(critic, input_ids, attention_mask, mse_scale_f):
+    """Forward the critic and produce a per-sample prediction vector.
+
+    Architecture tweak (vs upstream NLACriticModel.forward):
+      pred = value_head(normalize(backbone_last_hidden, mse_scale))
+
+    The upstream forward does value_head(backbone_last_hidden) directly,
+    which leaves value_head's input norm unbounded. With bf16+Adam on a
+    near-identity value_head, that's exactly the path that NaN'd AR SFT
+    8+ times. Normalising the backbone-last-hidden BEFORE the value_head
+    bounds the input to a fixed norm (mse_scale), so a tiny weight update
+    can't blow up the output norm by 100×. At identity init the two
+    formulas agree (after the loss's final normalize), so swapping is
+    backward-compatible with AR-SFT checkpoints.
+
+    Returns: [B, d_model] fp32 pred tensor. Caller is responsible for
+    grad / no_grad context; this function does not toggle.
+    """
+    cout = critic(input_ids=input_ids, attention_mask=attention_mask)
+    backbone_last = cout.backbone_last_hidden  # [B, T, D] (bf16)
+    if attention_mask is not None:
+        last_idx = attention_mask.sum(dim=1) - 1
+    else:
+        last_idx = torch.full(
+            (input_ids.shape[0],), input_ids.shape[1] - 1, device=input_ids.device,
+        )
+    bs = input_ids.shape[0]
+    last_h = backbone_last[
+        torch.arange(bs, device=input_ids.device), last_idx
+    ].float()  # [B, D]
+    last_h_norm = normalize_activation(last_h, mse_scale_f)
+    pred = critic.value_head(
+        last_h_norm.to(critic.value_head.weight.dtype)
+    ).float()
+    return pred
+
+
 def score_with_critic(
     critic, tokenizer, explanations, activations, template, mse_scale_f, device,
 ):
@@ -230,8 +272,7 @@ def score_with_critic(
             continue
         x = torch.tensor([ids], dtype=torch.long, device=device)
         with torch.no_grad():
-            out = critic(input_ids=x)
-        pred = out.values[0, -1].float()
+            pred = critic_predict(critic, x, None, mse_scale_f)[0]  # [d]
         gold = act.to(device).float()
         pred_n = normalize_activation(pred.unsqueeze(0), mse_scale_f)[0]
         gold_n = normalize_activation(gold.unsqueeze(0), mse_scale_f)[0]
@@ -573,9 +614,12 @@ def main():
         # the SAME explanations the actor produces this step. Loss = MSE against
         # the gold activation, normalised. AR's gradient does NOT flow back into
         # the actor (the explanation tokens are discrete — gradient stops there
-        # automatically). value_head stays frozen to avoid the bf16+Adam blow-up
-        # that NaN'd AR SFT 8+ times before NLA_FREEZE_VALUE_HEAD=1.
+        # automatically). Both backbone AND value_head train; the bf16+Adam
+        # blow-up that NaN'd AR SFT is now neutralised by critic_predict's
+        # normalize-before-value_head trick (bounds value_head input norm).
         for p_ in critic.backbone.parameters():
+            p_.requires_grad_(True)
+        for p_ in critic.value_head.parameters():
             p_.requires_grad_(True)
         critic_trainable = [p for p in critic.parameters() if p.requires_grad]
         try:
@@ -591,7 +635,7 @@ def main():
             )
         n_trainable = sum(p.numel() for p in critic_trainable)
         print(f"[critic] CO-TRAINED, lr={args.critic_lr}, "
-              f"trainable={n_trainable/1e9:.2f}B (backbone only, value_head frozen)")
+              f"trainable={n_trainable/1e9:.2f}B (backbone + value_head)")
     else:
         print(f"[critic] FROZEN (eval-only scorer)")
     critic.eval()  # Qwen3 has no dropout — eval mode is fine for both grad/no-grad
@@ -810,9 +854,7 @@ def main():
                         L = crit_inputs[i].numel()
                         batch_ids[row, :L] = crit_inputs[i].to(device)
                         attn[row, :L] = 1
-                    cout = critic(input_ids=batch_ids, attention_mask=attn)
-                    last_idx = attn.sum(dim=1) - 1
-                    pred = cout.values[torch.arange(bs, device=device), last_idx].float()
+                    pred = critic_predict(critic, batch_ids, attn, mse_scale_f)
                     gold = torch.stack([crit_golds[i] for i in chunk]).to(device).float()
                     pred_n = normalize_activation(pred, mse_scale_f)
                     gold_n = normalize_activation(gold, mse_scale_f)
@@ -907,6 +949,7 @@ def main():
                             input_ids=pt, attention_mask=torch.ones_like(pt),
                             max_new_tokens=args.max_new_tokens,
                             do_sample=True, temperature=1.0,
+                            top_p=1.0, top_k=0, repetition_penalty=1.0,
                             pad_token_id=tokenizer.eos_token_id,
                             return_dict_in_generate=True,
                         )
@@ -923,8 +966,7 @@ def main():
                     if 0 < len(cids) <= 1024:
                         x = torch.tensor([cids], dtype=torch.long, device=device)
                         with torch.no_grad():
-                            cout = critic(input_ids=x)
-                        pred = cout.values[0, -1].float()
+                            pred = critic_predict(critic, x, None, mse_scale_f)[0]
                         gold = activation.to(device).float()
                         pn = normalize_activation(pred.unsqueeze(0), mse_scale_f)[0]
                         gn = normalize_activation(gold.unsqueeze(0), mse_scale_f)[0]
@@ -971,6 +1013,16 @@ def main():
                 f"| ext {log['eval/extraction_rate']:.0%}",
                 flush=True,
             )
+            # Print 3 sample explanations so the log itself shows how outputs
+            # evolve. Pick indices 0, 7, 14 — spread across the eval set.
+            for _ei in (0, 7, 14):
+                if _ei < len(eval_records):
+                    _r = eval_records[_ei]
+                    _expl = _r["explanation"][:200].replace("\n", " ")
+                    print(
+                        f"    [eval@{step} idx={_ei} r={_r['reward']:.3f}] {_expl}",
+                        flush=True,
+                    )
 
         if not args.no_wandb:
             wandb.log(log, step=step)
