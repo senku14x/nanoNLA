@@ -357,10 +357,27 @@ def main():
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--lr", type=float, default=5e-6)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
-    p.add_argument("--lora-r", type=int, default=16)
-    p.add_argument("--lora-alpha", type=int, default=32)
+    p.add_argument("--lora-r", type=int, default=128)
+    p.add_argument("--lora-alpha", type=int, default=16)
+    p.add_argument("--use-rslora", action="store_true", default=True,
+                   help="Use rsLoRA scaling (alpha/sqrt(r) instead of alpha/r). "
+                        "Default ON because we use r=128 where vanilla LoRA's "
+                        "alpha/r=0.125 collapses the effective learning rate.")
+    p.add_argument("--train-critic", action="store_true", default=False,
+                   help="Co-train the AR critic (paper-faithful). Adds a "
+                        "separate optimizer for the critic and supervised MSE "
+                        "loss on (explanation, gold_activation) pairs each step.")
+    p.add_argument("--critic-lr", type=float, default=1e-5)
     p.add_argument("--logp-micro-batch", type=int, default=2)
     p.add_argument("--save-every", type=int, default=50)
+    p.add_argument("--eval-every", type=int, default=10,
+                   help="Run a held-out qualitative eval every N steps. "
+                        "Logs explanation texts to wandb Table; 0 disables.")
+    p.add_argument("--eval-n-prompts", type=int, default=20,
+                   help="Number of fixed held-out prompts for per-step eval.")
+    p.add_argument("--eval-skip-rows", type=int, default=30000,
+                   help="Take eval prompts from rl_shuf rows starting here "
+                        "(past --max-rows training cursor).")
     p.add_argument("--max-rows", type=int, default=None,
                    help="cap rows from rl parquet (avoids 3.7GB full-load for smoke runs)")
     p.add_argument("--clip-eps", type=float, default=0.2)
@@ -398,19 +415,42 @@ def main():
         r=args.lora_r, lora_alpha=args.lora_alpha,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
         lora_dropout=0.0, bias="none", task_type="CAUSAL_LM",
+        use_rslora=args.use_rslora,
     )
     actor = get_peft_model(actor, lora_cfg)
     actor.print_trainable_parameters()
     actor.train()
 
-    # ---- critic (frozen) ----
+    # ---- critic (frozen or co-trained) ----
     print(f"[critic] loading {args.ar_ckpt}")
     critic = NLACriticModel.from_pretrained(
         args.ar_ckpt, torch_dtype=torch.bfloat16,
     ).to(device)
-    critic.eval()
+    # NLACriticModel.from_pretrained returns params with requires_grad=True by
+    # default. Freeze everything first, then conditionally unfreeze backbone.
     for p_ in critic.parameters():
         p_.requires_grad_(False)
+    critic_optim = None
+    if args.train_critic:
+        # Per paper §RL training: AR is co-trained simultaneously with AV on
+        # the SAME explanations the actor produces this step. Loss = MSE against
+        # the gold activation, normalised. AR's gradient does NOT flow back into
+        # the actor (the explanation tokens are discrete — gradient stops there
+        # automatically). value_head stays frozen to avoid the bf16+Adam blow-up
+        # that NaN'd AR SFT 8+ times before NLA_FREEZE_VALUE_HEAD=1.
+        for p_ in critic.backbone.parameters():
+            p_.requires_grad_(True)
+        critic_trainable = [p for p in critic.parameters() if p.requires_grad]
+        critic_optim = torch.optim.AdamW(
+            critic_trainable, lr=args.critic_lr, betas=(0.9, 0.95),
+            weight_decay=0.0,
+        )
+        n_trainable = sum(p.numel() for p in critic_trainable)
+        print(f"[critic] CO-TRAINED, lr={args.critic_lr}, "
+              f"trainable={n_trainable/1e9:.2f}B (backbone only, value_head frozen)")
+    else:
+        print(f"[critic] FROZEN (eval-only scorer)")
+    critic.eval()  # Qwen3 has no dropout — eval mode is fine for both grad/no-grad
     print(f"[critic] value_head shape={tuple(critic.value_head.weight.shape)}")
 
     # ---- karvonen hook on actor ----
@@ -453,6 +493,35 @@ def main():
     pending_idxs = list(range(len(rows)))
     rng.shuffle(pending_idxs)
     cursor = 0
+
+    # ---- Fixed held-out eval prompts (disjoint from training rows + doc-disjoint
+    # from av_train by construction of rl_shuf). Re-streams from parquet so it
+    # doesn't share memory with the train rows.
+    eval_rows = []
+    if args.eval_every > 0 and args.eval_n_prompts > 0:
+        import pyarrow.parquet as _pq
+        _pf = _pq.ParquetFile(args.rl_parquet)
+        _seen = 0
+        for _rg_idx in range(_pf.num_row_groups):
+            if len(eval_rows) >= args.eval_n_prompts:
+                break
+            _rg = _pf.read_row_group(_rg_idx, columns=["prompt", "activation_vector"])
+            _n = _rg.num_rows
+            if _seen + _n <= args.eval_skip_rows:
+                _seen += _n
+                continue
+            _start = max(0, args.eval_skip_rows - _seen)
+            _seen += _start
+            _take = min(args.eval_n_prompts - len(eval_rows), _n - _start)
+            _rg = _rg.slice(_start, _take)
+            for _p, _a in zip(
+                _rg.column("prompt").to_pylist(),
+                _rg.column("activation_vector").to_pylist(),
+            ):
+                eval_rows.append({"prompt": _p, "activation": _a})
+        print(f"[eval] {len(eval_rows)} fixed prompts loaded (rows from "
+              f"{args.eval_skip_rows}, doc-disjoint from training)", flush=True)
+    eval_table_data = []  # accumulates [step, idx, reward, fve, extracted, explanation]
 
     for step in range(args.num_steps):
         t0 = time.time()
@@ -548,6 +617,60 @@ def main():
         grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
         optim.step()
 
+        # ---- AR critic co-training (paper-faithful, optional) ----
+        # Per paper §RL: "Update the AR by one step of gradient descent on the
+        # regression loss ||h_l − AR_θ(z)||²_2". Inputs z = the explanations the
+        # actor just produced this step; targets h_l = the gold activations.
+        # Gradient from this update does NOT flow into the actor (z is discrete).
+        critic_loss_val = float("nan")
+        critic_grad_norm_val = float("nan")
+        if args.train_critic and critic_optim is not None:
+            crit_inputs = []
+            crit_golds = []
+            for expl, act in zip(all_explanations, all_activations):
+                if expl is None:
+                    continue
+                text = template.format(explanation=expl)
+                ids = tokenizer.encode(text, add_special_tokens=False)
+                if len(ids) > 1024 or len(ids) == 0:
+                    continue
+                crit_inputs.append(torch.tensor(ids, dtype=torch.long))
+                crit_golds.append(act)
+            if crit_inputs:
+                bs = len(crit_inputs)
+                max_len = max(t.numel() for t in crit_inputs)
+                pad_id = tokenizer.eos_token_id
+                batch_ids = torch.full(
+                    (bs, max_len), pad_id, dtype=torch.long, device=device,
+                )
+                attn = torch.zeros((bs, max_len), dtype=torch.long, device=device)
+                for i, t in enumerate(crit_inputs):
+                    batch_ids[i, :t.numel()] = t.to(device)
+                    attn[i, :t.numel()] = 1
+                # WITH grad this time — first forward in score_with_critic was no_grad.
+                cout = critic(input_ids=batch_ids, attention_mask=attn)
+                last_idx = attn.sum(dim=1) - 1  # [bs]
+                pred = cout.values[torch.arange(bs, device=device), last_idx].float()
+                gold = torch.stack(crit_golds).to(device).float()
+                pred_n = normalize_activation(pred, mse_scale_f)
+                gold_n = normalize_activation(gold, mse_scale_f)
+                critic_loss = F.mse_loss(pred_n, gold_n)
+                if torch.isfinite(critic_loss):
+                    critic_optim.zero_grad()
+                    critic_loss.backward()
+                    critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                        critic_trainable, args.max_grad_norm,
+                    )
+                    critic_optim.step()
+                    critic_loss_val = critic_loss.item()
+                    critic_grad_norm_val = (
+                        critic_grad_norm.item()
+                        if hasattr(critic_grad_norm, "item")
+                        else float(critic_grad_norm)
+                    )
+                else:
+                    print(f"step {step}: critic loss non-finite, skipping critic update", flush=True)
+
         # ---- logging ----
         valid_rewards = [r for r in rewards if r is not None]
         n_valid = len(valid_rewards)
@@ -584,15 +707,105 @@ def main():
             "mean_resp_len": n_resps_t.mean().item(),
             "kl_mean": grpo_metrics.get("kl_mean", 0.0),
             "clip_frac": grpo_metrics.get("clip_frac", 0.0),
+            "critic_loss": critic_loss_val,
+            "critic_grad_norm": critic_grad_norm_val,
             "wall_s": time.time() - t0,
         }
+        crit_str = (
+            f"| crit {critic_loss_val:.4f} " if args.train_critic else ""
+        )
         print(
             f"step {step:04d} | loss {log['loss']:.4f} | r {log['reward_mean']:.3f} "
-            f"| FVE {log['fve_pct']:.1f}% | kl {log['kl_mean']:.4f} | "
+            f"| FVE {log['fve_pct']:.1f}% {crit_str}| kl {log['kl_mean']:.4f} | "
             f"clip {log['clip_frac']:.2%} | ext {extraction_rate:.0%} | "
             f"t {log['wall_s']:.0f}s",
             flush=True,
         )
+
+        # ---- per-step eval: every N steps, run actor (current weights) on a
+        # FIXED set of held-out prompts and log explanations as a wandb Table.
+        # Lets you scrub through the run and watch explanations evolve.
+        if args.eval_every > 0 and step % args.eval_every == 0:
+            actor.eval()
+            eval_rewards_s = []
+            eval_records = []
+            for ei, row in enumerate(eval_rows):
+                prompt_text = build_prompt_text(row["prompt"], inject_char, tokenizer)
+                activation = torch.tensor(row["activation"], dtype=torch.float32)
+                ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+                pt = torch.tensor([ids], dtype=torch.long, device=device)
+                vectors_ref[0] = activation.unsqueeze(0).to(device).float()
+                try:
+                    with torch.no_grad():
+                        gen = actor.generate(
+                            input_ids=pt, attention_mask=torch.ones_like(pt),
+                            max_new_tokens=args.max_new_tokens,
+                            do_sample=True, temperature=1.0,
+                            pad_token_id=tokenizer.eos_token_id,
+                            return_dict_in_generate=True,
+                        )
+                finally:
+                    vectors_ref[0] = None
+                resp = tokenizer.decode(
+                    gen.sequences[0, pt.shape[1]:], skip_special_tokens=True,
+                )
+                expl = extract_explanation(resp)
+                e_reward = -2.0
+                if expl is not None:
+                    ctext = template.format(explanation=expl)
+                    cids = tokenizer.encode(ctext, add_special_tokens=False)
+                    if 0 < len(cids) <= 1024:
+                        x = torch.tensor([cids], dtype=torch.long, device=device)
+                        with torch.no_grad():
+                            cout = critic(input_ids=x)
+                        pred = cout.values[0, -1].float()
+                        gold = activation.to(device).float()
+                        pn = normalize_activation(pred.unsqueeze(0), mse_scale_f)[0]
+                        gn = normalize_activation(gold.unsqueeze(0), mse_scale_f)[0]
+                        mse = F.mse_loss(pn, gn).item()
+                        if math.isfinite(mse):
+                            e_reward = -mse
+                eval_rewards_s.append(e_reward)
+                eval_records.append({
+                    "step": step, "idx": ei, "reward": e_reward,
+                    "fve": (1.0 - (-e_reward) / fve_baseline) if e_reward > -2.0 else float("nan"),
+                    "extracted": expl is not None,
+                    "explanation": expl if expl is not None else "<extraction failed>",
+                })
+            # Aggregate eval scalars
+            valid_e = [r for r in eval_rewards_s if r > -2.0]
+            log["eval/reward_mean"] = (
+                float(np.mean(eval_rewards_s)) if eval_rewards_s else float("nan")
+            )
+            log["eval/reward_mean_valid"] = (
+                float(np.mean(valid_e)) if valid_e else float("nan")
+            )
+            log["eval/fve_pct"] = (
+                (1.0 - (-float(np.mean(valid_e))) / fve_baseline) * 100.0
+                if valid_e else float("nan")
+            )
+            log["eval/extraction_rate"] = (
+                sum(1 for r in eval_records if r["extracted"]) / len(eval_records)
+                if eval_records else 0.0
+            )
+            # Persistent table — accumulates across the whole run.
+            for r in eval_records:
+                eval_table_data.append([
+                    r["step"], r["idx"], r["reward"], r["fve"],
+                    r["extracted"], r["explanation"][:500],
+                ])
+            if not args.no_wandb:
+                log["eval/samples"] = wandb.Table(
+                    columns=["step", "idx", "reward", "fve", "extracted", "explanation"],
+                    data=list(eval_table_data),
+                )
+            print(
+                f"  [eval@{step}] reward {log['eval/reward_mean']:.3f} "
+                f"| FVE {log['eval/fve_pct']:.1f}% "
+                f"| ext {log['eval/extraction_rate']:.0%}",
+                flush=True,
+            )
+
         if not args.no_wandb:
             wandb.log(log, step=step)
 
