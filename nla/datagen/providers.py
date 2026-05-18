@@ -11,6 +11,8 @@ Swap via `--provider-cls my.module.MyProvider` at stage2 invocation.
 """
 
 import asyncio
+import os
+import time
 from abc import ABC, abstractmethod
 
 import anthropic
@@ -127,3 +129,108 @@ class AnthropicProvider(CompletionProvider):
         if n_failed or n_refused:
             print(f"  [AnthropicProvider] dropped {n_refused} refused + {n_failed} retry-exhausted of {len(prompts)}")
         return out
+
+
+class BatchAnthropicProvider(CompletionProvider):
+    """Anthropic Message Batches API — 50% cheaper than sync, async, async-style turnaround.
+
+    Each `complete(prompts)` call partitions prompts into sub-batches of
+    `max_batch_size` (Anthropic's hard limit is 100k per batch), submits all
+    sub-batches concurrently, polls until each one ends, then fetches results.
+    The order of returned completions matches the input order via the `custom_id`
+    round-trip; missing/failed/expired requests come back as None.
+
+    Authentication: reads `ANTHROPIC_API_KEY_BATCH` first (so the dedicated batch
+    key from CLAUDE.md is preferred), falls back to `ANTHROPIC_API_KEY`. The key
+    is passed explicitly to the client so the env var name is unambiguous.
+    """
+
+    def __init__(
+        self,
+        model: str = "claude-sonnet-4-6",
+        max_tokens: int = 300,
+        temperature: float = 1.0,
+        max_batch_size: int = 50_000,
+        poll_interval_s: float = 30.0,
+    ):
+        api_key = os.environ.get("ANTHROPIC_API_KEY_BATCH") or os.environ.get("ANTHROPIC_API_KEY")
+        assert api_key, "set ANTHROPIC_API_KEY_BATCH (preferred) or ANTHROPIC_API_KEY"
+        self.client = anthropic.AsyncAnthropic(api_key=api_key, max_retries=10)
+        self.model = model
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.max_batch_size = max_batch_size
+        self.poll_interval_s = poll_interval_s
+
+    async def _submit_subbatch(self, prompts: list[str], offset: int) -> list[str | None]:
+        # Encode position within the sub-batch in custom_id so results map back
+        # even when fetched out-of-order. Sub-batch-local index, not global.
+        requests = [
+            {
+                "custom_id": f"r{i:07d}",
+                "params": {
+                    "model": self.model,
+                    "max_tokens": self.max_tokens,
+                    "temperature": self.temperature,
+                    "messages": [{"role": "user", "content": p}],
+                },
+            }
+            for i, p in enumerate(prompts)
+        ]
+        batch = await self.client.messages.batches.create(requests=requests)
+        bid = batch.id
+        print(f"  [batch {bid}] submitted {len(prompts)} prompts (sub-batch offset={offset})")
+
+        # Poll until ended. Anthropic's batch lifecycle: in_progress → ended.
+        # The terminal status field is `processing_status`; per-request status
+        # comes back in the streamed results.
+        t0 = time.monotonic()
+        while True:
+            await asyncio.sleep(self.poll_interval_s)
+            b = await self.client.messages.batches.retrieve(bid)
+            if b.processing_status == "ended":
+                rc = b.request_counts
+                elapsed = time.monotonic() - t0
+                print(
+                    f"  [batch {bid}] ended in {elapsed/60:.1f}min — "
+                    f"succeeded={rc.succeeded} errored={rc.errored} "
+                    f"canceled={rc.canceled} expired={rc.expired}"
+                )
+                break
+
+        out: list[str | None] = [None] * len(prompts)
+        # SDK quirk: messages.batches.results() returns a coroutine that resolves
+        # to an async-iterable. Must await first, then `async for`.
+        results_stream = await self.client.messages.batches.results(bid)
+        async for entry in results_stream:
+            # custom_id "r0000007" -> 7
+            idx = int(entry.custom_id[1:])
+            r = entry.result
+            if r.type != "succeeded":
+                continue  # errored/canceled/expired stay None
+            msg = r.message
+            if msg.stop_reason == "refusal":
+                continue
+            if not msg.content or msg.content[0].type != "text":
+                continue
+            text = msg.content[0].text.strip()
+            if text:
+                out[idx] = text
+        return out
+
+    def complete(self, prompts: list[str]) -> list[str | None]:
+        async def _run() -> list[str | None]:
+            sub_batches = [
+                (i, prompts[i : i + self.max_batch_size])
+                for i in range(0, len(prompts), self.max_batch_size)
+            ]
+            results_per_sub = await asyncio.gather(
+                *(self._submit_subbatch(sb, offset=off) for off, sb in sub_batches),
+                return_exceptions=False,
+            )
+            out: list[str | None] = []
+            for r in results_per_sub:
+                out.extend(r)
+            return out
+
+        return asyncio.run(_run())

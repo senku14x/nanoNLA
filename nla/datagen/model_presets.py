@@ -49,6 +49,14 @@ MODELS: dict[str, ModelPreset] = {
         turn_marker="<|im_start|>",
         accepts_system_role=True,
     ),
+    "qwen3_8b": ModelPreset(
+        hf_name="Qwen/Qwen3-8B",
+        num_layers=36,
+        d_model=4096,
+        extractor_kwargs={"batch_size": 12, "max_length": 4096},
+        turn_marker="<|im_start|>",
+        accepts_system_role=True,
+    ),
     "gemma12b": ModelPreset(
         hf_name="google/gemma-3-12b-it",
         num_layers=48,

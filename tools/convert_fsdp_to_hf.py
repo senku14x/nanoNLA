@@ -72,6 +72,9 @@ def _load_fsdp_state_dict(input_dir: str) -> dict[str, torch.Tensor]:
 
 def _get_candidate_prefixes(keys: list[str]) -> list[str]:
     predefined = [
+        "model_state.model.backbone.model.",  # NLACriticModel + Miles' double-model wrap
+        "model_state.backbone.model.",
+        "model_state.backbone.",
         "model_state.model.",
         "model_state.",
         "model.",
