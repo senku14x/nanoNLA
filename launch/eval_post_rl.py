@@ -144,6 +144,8 @@ def main():
     p.add_argument("--val-parquet", required=True, help="Held-out rl_val parquet")
     p.add_argument("--sidecar", required=True)
     p.add_argument("--n-rows", type=int, default=64)
+    p.add_argument("--skip-rows", type=int, default=0,
+                   help="skip the first N rows (use to avoid rows the RL trainer cycled through)")
     p.add_argument("--max-new", type=int, default=150)
     args = p.parse_args()
 
@@ -154,12 +156,26 @@ def main():
     cfg = load_nla_config(args.sidecar, tokenizer)
     mse_scale_f = resolve_target_scale(cfg.mse_scale, cfg.d_model)
 
+    # Stream row groups, skip args.skip_rows, then take args.n_rows
     pf = pq.ParquetFile(args.val_parquet)
-    rg = pf.read_row_group(0, columns=["prompt", "activation_vector"]).slice(0, args.n_rows)
-    rows = [{"prompt": p_, "activation": a}
-            for p_, a in zip(rg.column("prompt").to_pylist(),
-                              rg.column("activation_vector").to_pylist())]
-    print(f"evaluating on {len(rows)} held-out prompts")
+    rows = []
+    skipped = 0
+    for rg_idx in range(pf.num_row_groups):
+        if len(rows) >= args.n_rows:
+            break
+        rg = pf.read_row_group(rg_idx, columns=["prompt", "activation_vector"])
+        n = rg.num_rows
+        if skipped + n <= args.skip_rows:
+            skipped += n
+            continue
+        start = max(0, args.skip_rows - skipped)
+        skipped += start
+        take = min(args.n_rows - len(rows), n - start)
+        rg = rg.slice(start, take)
+        rows.extend({"prompt": p_, "activation": a}
+                    for p_, a in zip(rg.column("prompt").to_pylist(),
+                                     rg.column("activation_vector").to_pylist()))
+    print(f"evaluating on {len(rows)} held-out prompts (after skipping {args.skip_rows})")
 
     print(f"\n=== Critic load ===")
     critic = NLACriticModel.from_pretrained(args.ar_ckpt, torch_dtype=torch.bfloat16).to(device)
