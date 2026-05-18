@@ -158,11 +158,21 @@ failed extractions get reward `-2.0`.
 
 | metric | pre-RL (AV-SFT only) | post-RL (AV-SFT + RL LoRA) | Δ |
 |---|---|---|---|
-| **mean reward** | -0.5463 | **-0.4224** | **+0.1238** ✅ |
+| **mean reward (= -mse_nrm)** | -0.5463 | **-0.4224** | **+0.1238** ✅ |
+| **FVE** (vs predict-mean baseline 0.684) | 20.18% | **38.28%** | **+18.10 pp** ✅✅ |
 | reward std      | 0.5662  | 0.3750     | -34% (more consistent) |
 | extraction rate | 88%     | 95%        | +7 pp |
 | reward min      | -2.000  | -2.000     | (failed-extraction floor) |
 | reward max      | -0.162  | -0.140     | best case slightly tighter |
+
+**FVE = 1 − mse_actual / baseline_mse**, where the baseline is the
+predict-the-mean ceiling (normalize(μ) as constant pred, μ = mean of held-out
+activations). 0% = no better than constant prediction; 100% = perfect
+reconstruction. Paper's Qwen2.5-7B critic-SFT alone hits FVE = 37.5%
+(TRAINING_NOTES.md) — our post-RL FVE of 38.3% already matches that, and
+that's after only 250 GRPO steps on top of the AV-SFT baseline. Reproduce:
+`python launch/compute_fve_baseline.py --parquet av_val.parquet --sidecar
+rl_shuf.parquet --reward-pre -0.5463 --reward-post -0.4224`.
 
 Per-prompt: 29/64 improved by RL, 34/64 hurt, 1/64 tied. Even though the win
 rate is close to 50/50, the **mean improvement is +0.124** — the wins are
