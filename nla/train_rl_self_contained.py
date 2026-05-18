@@ -527,6 +527,13 @@ def main():
                         "Single full-batch forward OOMs at B*G=256.")
     p.add_argument("--logp-micro-batch", type=int, default=2)
     p.add_argument("--save-every", type=int, default=50)
+    p.add_argument("--resume-from-lora", type=str, default=None,
+                   help="Directory containing a saved LoRA adapter (iter_NNNNNN); "
+                        "loaded onto the AV-SFT base so training continues "
+                        "from those weights.")
+    p.add_argument("--start-step", type=int, default=0,
+                   help="Initial step counter — useful when resuming so wandb "
+                        "x-axis lines up with the previous run.")
     p.add_argument("--eval-every", type=int, default=10,
                    help="Run a held-out qualitative eval every N steps. "
                         "Logs explanation texts to wandb Table; 0 disables.")
@@ -580,7 +587,21 @@ def main():
     # forces input embeddings to require grad, propagating grad to LoRA.
     if args.gradient_checkpointing:
         actor.enable_input_require_grads()
-    actor = get_peft_model(actor, lora_cfg)
+    if args.resume_from_lora is not None:
+        # Resume: load a previously-saved LoRA adapter onto the base.
+        # peft.PeftModel.from_pretrained handles attaching the LoRA layers and
+        # copying weights. Skips the get_peft_model wrapping flow.
+        from peft import PeftModel
+        print(f"[actor] RESUMING from LoRA {args.resume_from_lora}")
+        actor = PeftModel.from_pretrained(actor, args.resume_from_lora, is_trainable=True)
+        # Sanity check we got non-zero LoRA weights (not a freshly-init adapter)
+        _lora_norm = 0.0
+        for n, p_ in actor.named_parameters():
+            if "lora_" in n:
+                _lora_norm += p_.detach().float().pow(2).sum().item()
+        print(f"[actor] resumed; sum(lora_param²) = {_lora_norm:.2e}")
+    else:
+        actor = get_peft_model(actor, lora_cfg)
     actor.print_trainable_parameters()
     actor.train()
     if args.gradient_checkpointing:
@@ -723,7 +744,7 @@ def main():
               f"{args.eval_skip_rows}, doc-disjoint from training)", flush=True)
     eval_table_data = []  # accumulates [step, idx, reward, fve, extracted, explanation]
 
-    for step in range(args.num_steps):
+    for step in range(args.start_step, args.num_steps):
         t0 = time.time()
         # ---- batch select ----
         if cursor + args.batch_prompts > len(pending_idxs):

@@ -6,6 +6,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --time=30:00:00
+#SBATCH --no-requeue
 #SBATCH --output=/workspace-vast/celeste/nla-experiments/logs/%x_%j.out
 
 # Long GRPO run: 1500 steps, ~13h at 33s/step, paper-faithful hparams.
@@ -31,6 +32,8 @@ python -m nla.train_rl_self_contained \
   --rl-parquet $DATA/rl_shuf.parquet \
   --sidecar $DATA/rl_shuf.parquet \
   --save-dir /workspace-vast/celeste/nla-ckpts/qwen3_8b_L24_rl_grpo_v4_lrbump \
+  --resume-from-lora /workspace-vast/celeste/nla-ckpts/qwen3_8b_L24_rl_grpo_v4_lrbump/iter_000100 \
+  --start-step 100 \
   --num-steps 1000 \
   --batch-prompts 16 \
   --group-size 16 \
