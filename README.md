@@ -1,9 +1,13 @@
-# Natural Language Autoencoders (NLA)
+# open-NLAs
 
-Open-source library accompanying the Anthropic Transformer Circuits post
-**[Natural Language Autoencoders Produce Unsupervised Explanations of LLM Activations](https://transformer-circuits.pub/2026/nla/index.html)**.
+Open-source training pipeline for **Natural Language Autoencoders** — a fork of
+[`kitft/natural_language_autoencoders`](https://github.com/kitft/natural_language_autoencoders)
+trimmed down to a minimal, single-GPU-friendly impl, with a self-contained GRPO
+RL trainer added. Original work:
+**[Natural Language Autoencoders Produce Unsupervised Explanations of LLM Activations](https://transformer-circuits.pub/2026/nla/index.html)**
+(Fraser-Taliente et al., Transformer Circuits 2026).
 
-📄 [Blog post](https://www.anthropic.com/research/natural-language-autoencoders) · ▶ [Video walkthrough](https://www.youtube.com/watch?v=j2knrqAzYVY) · 🔬 [Try the released NLAs on Neuronpedia](https://www.neuronpedia.org/nla)
+📄 [Blog post](https://www.anthropic.com/research/natural-language-autoencoders) · ▶ [Video walkthrough](https://www.youtube.com/watch?v=j2knrqAzYVY) · 🔬 [Released NLAs on Neuronpedia](https://www.neuronpedia.org/nla) · 🧪 [Qwen3-8B reproduction guide](docs/qwen3_8b_run.md)
 
 ---
 
@@ -123,57 +127,74 @@ pq.write_table(pa.table({"activation_vector": hs.float().cpu().tolist()}), "demo
 `nla_inference.py` is a single self-contained file. The full recipe —
 model-specific scale factors, the Gemma `√d` embed-scale gotcha, debugging the
 "output is in Chinese" failure mode, AR scoring — is in
-**[docs/inference.md](docs/inference.md)**. Worked transcripts in
-[`examples/`](examples/).
+**[docs/inference.md](docs/inference.md)**.
 
-### Training (reproduce a checkpoint)
+### Training (reproduce Qwen3-8B end-to-end)
 
-Install Miles + SGLang + this package per **[docs/setup.md](docs/setup.md)**,
-then run the three stages (Qwen7B reference: SFT on 2×H100-80GB; RL to ~75% FVE
-on 2×8×H100 — see [`configs/TRAINING_NOTES.md`](configs/TRAINING_NOTES.md)):
+Install Miles + this package per **[docs/setup.md](docs/setup.md)**, then run
+the four stages. Full recipe + tuning notes in
+**[docs/qwen3_8b_run.md](docs/qwen3_8b_run.md)**.
 
 ```bash
-# 0. Generate data (GPU + ANTHROPIC_API_KEY)
-python -m nla.datagen.run_pipeline --config configs/datagen/qwen7b_fineweb_1M.yaml
+# 0. Generate data — 100k FineFineWeb docs + Sonnet 4.6 judges via Anthropic Batches API
+sbatch launch/sbatch_datagen.sh
 
-# 1. AR SFT (MSE on raw activations)
-bash configs/critic_sft.sh
+# 1. AV SFT (Karvonen layer-1 ADD norm-matched injection, our preferred variant)
+sbatch launch/sbatch_av_sft_karvonen.sh
 
-# 2. AV SFT (next-token on API-generated explanations, with injection)
-bash configs/actor_sft.sh
+# 2. AR SFT (frozen-value-head variant — fixes the bf16+Adam NaN that hit step ~29 8+ times)
+sbatch launch/sbatch_prepare_critic.sh
+sbatch launch/sbatch_ar_safe.sh
 
-# 3. RL: simultaneous AV (GRPO) + AR (supervised); reward = -mse_nrm
-bash configs/rl.sh
+# 3. RL: self-contained GRPO with co-trained AR, rsLoRA r=128 actor (single GPU, paper-faithful)
+sbatch launch/sbatch_rl_long.sh
 ```
 
 The full design — data transport through Miles' `multimodal_train_inputs`, the
-injection forward-hook, simultaneous AV/AR scheduling, why `cp_size==1` — is in
-**[docs/design.md](docs/design.md)**. Detailed profiling and hyperparameter
-notes (Qwen7B case study; we reused those settings with only light adjustment
-for the other models — a per-model sweep would likely do better):
-[`configs/TRAINING_NOTES.md`](configs/TRAINING_NOTES.md).
+injection forward-hook, simultaneous AV/AR scheduling — is in
+**[docs/design.md](docs/design.md)**. Profiling and hyperparameter notes are in
+[`configs/TRAINING_NOTES.md`](configs/TRAINING_NOTES.md) (Qwen2.5-7B reference)
+and [`docs/qwen3_8b_run.md`](docs/qwen3_8b_run.md) (Qwen3-8B, this fork).
 
 ---
 
 ## Repo layout
 
 ```
-nla/                  core package
-  schema.py, config.py, models.py     — sidecar contract, NLACriticModel (the AR)
-  train_actor.py                      — NLAFSDPActor (Miles FSDP subclass)
-  megatron/                           — NLAMegatronActor (TP+PP, CP=1 only)
-  rollout/                            — SFT rollout, nla_generate (SGLang input_embeds)
-  reward.py, loss.py                  — -mse_nrm reward, AR MSE loss
+nla/                            core package
+  schema.py, config.py, models.py     — sidecar contract, NLACriticModel (AR)
+  injection.py                        — Karvonen ADD norm-matched residual injection
+  train_actor.py                      — NLAFSDPActor (Miles FSDP subclass, AV+AR SFT)
+  train_rl_self_contained.py          — single-GPU GRPO with co-trained AR (new in fork)
+  rollout/                            — SFT rollout helpers
+  loss.py                             — AR MSE loss
   datagen/                            — 4-stage activation → parquet pipeline
-configs/              training shell configs + datagen YAMLs
-scripts/              multi-GPU launch wrappers (datagen)
-patches/              SGLang training patches (bf16 transport, chunked-prefill) + apply script
-tools/                FSDP-DCP / Megatron-dist ↔ HF checkpoint converters
-docs/                 design.md (training), inference.md (serving)
-release/              HF model-card templates + sidecar sanitiser for releases
-nla_inference.py      standalone single-file inference client
-examples/             worked decode transcripts
+configs/                        training shell configs + datagen YAMLs
+  actor_sft.sh, critic_sft.sh         — Miles+FSDP SFT entry points
+  TRAINING_NOTES.md                   — Qwen2.5-7B profiling + LR scan
+launch/                         sbatch wrappers + repro scripts (Qwen3-8B path)
+scripts/                        multi-GPU launch wrappers (datagen)
+tools/                          FSDP-DCP → HF checkpoint converter
+docs/                           design.md, inference.md, qwen3_8b_run.md
+nla_inference.py                standalone single-file inference client
 ```
+
+## Datasets
+
+The Qwen3-8B pipeline in this fork uses:
+
+| stage | dataset | size | location |
+|---|---|---|---|
+| **Corpus** | [`m-a-p/FineFineWeb`](https://huggingface.co/datasets/m-a-p/FineFineWeb) (67 domains, ~10TB) | sample 100k docs | public on HF Hub |
+| **Stage 0 — activations** | 1.4M (doc, position, residual-stream activation @ Qwen3-8B layer 24) tuples | ~16 GB | regenerable via `launch/sbatch_datagen.sh` |
+| **Stage 3 — SFT/RL parquets** | `av_train`, `av_val`, `ar_sft_shuf_clean`, `rl_shuf` (with Sonnet 4.6 explanations) | ~4 GB | regenerable; upload script at `launch/upload_dataset.py` for HF publishing |
+
+Stage 1 (doc-level 25/25/50 split into AV/AR/RL) and Stage 2 (Sonnet judging
+via the Anthropic Batches API) are deterministic given the corpus + seed.
+Regenerate from FineFineWeb with `launch/sbatch_datagen.sh` (requires
+`ANTHROPIC_API_KEY_BATCH`; ~12h, ~$80 in batch-API tokens). After Stage 3,
+`python launch/upload_dataset.py --repo <your-hf-org>/nla-qwen3-8b-stage3`
+publishes the SFT/RL parquets to HF Hub for re-use.
 
 ---
 
