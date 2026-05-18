@@ -91,3 +91,58 @@ def inject_at_marked_positions(
             torch.distributed.destroy_process_group()
         raise RuntimeError(msg)
     return out
+
+
+def karvonen_inject_in_residual(
+    input_ids: torch.Tensor,
+    resid: torch.Tensor,
+    vectors: torch.Tensor,
+    inj_id: int,
+    left_id: int,
+    right_id: int,
+) -> torch.Tensor:
+    """ADD-norm-matched injection per Karvonen et al. 2025 (Activation Oracles, eq. 1).
+
+    For each marker position p: h'_p = h_p + ||h_p|| * v / ||v||.
+
+    Caller responsibility: register this hook on the OUTPUT of the second
+    transformer layer (i.e. `model.model.layers[1].register_forward_hook(...)`),
+    so the residual entering layer 2 is the modified one. Vectors should be
+    RAW (no injection_scale normalization) — this function does its own norm
+    match against the current residual.
+    """
+    seq_len = input_ids.shape[-1]
+    assert input_ids.shape == resid.shape[:-1], (
+        f"input_ids {tuple(input_ids.shape)} and resid {tuple(resid.shape[:-1])} batch dims must match"
+    )
+    assert vectors.ndim == 2 and vectors.shape[1] == resid.shape[-1], (
+        f"vectors must be [N, d_model], got {tuple(vectors.shape)}, d_model={resid.shape[-1]}"
+    )
+    out = resid.clone()
+    vectors = vectors.to(out.device, out.dtype)
+    matches = (input_ids == inj_id).nonzero()  # [M, 2] (batch, seq), row-major sorted
+    vec_idx = 0
+    for b, p in matches.tolist():
+        if p == 0 or p == seq_len - 1:
+            continue
+        if input_ids[b, p - 1] != left_id or input_ids[b, p + 1] != right_id:
+            continue
+        # Clone the slice before reading — otherwise out[b, p] is a VIEW into
+        # `out`'s storage and the in-place write below modifies the same memory
+        # the autograd graph references → "modified by inplace op" RuntimeError
+        # at backward time.
+        h_p = out[b, p].clone()
+        v_unit = vectors[vec_idx] / (vectors[vec_idx].norm() + 1e-9)
+        out[b, p] = h_p + h_p.norm() * v_unit
+        vec_idx += 1
+    expected = vectors.shape[0]
+    if vec_idx != expected:
+        msg = (
+            f"Karvonen inject: found {vec_idx} marker sites with correct neighbors, "
+            f"expected {expected}. Same diagnosis path as inject_at_marked_positions."
+        )
+        if torch.distributed.is_initialized():
+            print(f"[karvonen_inject_in_residual] FATAL: {msg}", flush=True)
+            torch.distributed.destroy_process_group()
+        raise RuntimeError(msg)
+    return out

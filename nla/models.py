@@ -163,6 +163,19 @@ class NLACriticModel(PreTrainedModel):
         if head_path.exists() and not model.value_head.weight.is_meta:
             model.value_head.load_state_dict(load_file(str(head_path)))
 
+        # Qwen3-8B stability: freeze value_head as identity. The trainable Linear
+        # is what's causing 1/||p||² gradient explosions in bf16 during the
+        # first few steps. With value_head frozen, only the backbone learns —
+        # and the backbone has stable bf16 dynamics (we've verified AV-SFT trains
+        # without divergence on this same setup). The fixed identity head means
+        # pred = backbone_last_hidden, so the AR's prediction is literally the
+        # truncated forward's layer-K residual — what we want anyway, no need
+        # for a learnable affine.
+        if os.environ.get("NLA_FREEZE_VALUE_HEAD") == "1":
+            for p in model.value_head.parameters():
+                p.requires_grad_(False)
+            print("[NLACriticModel] value_head FROZEN (identity)")
+
         # nn.Linear in __init__ is CPU/fp32; load_state_dict upcasts the bf16
         # file tensors into that. Backbone got device+dtype via kwargs (incl.
         # device_map="auto" → accelerate sharding), but value_head is outside

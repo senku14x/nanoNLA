@@ -1,0 +1,43 @@
+# Quick smoke test for Qwen3-8B — 10 docs through full Stage 0→3 pipeline.
+# Verifies the architecture, injection token, and Anthropic provider all work.
+
+model: qwen3_8b
+layer_index: 24                          # 2/3 depth of 36 = 24
+output_dir: /workspace-vast/celeste/nla-data/qwen3_8b_smoke
+
+corpus:
+  name: HuggingFaceFW/fineweb
+  config: sample-10BT
+  split: train
+  text_column: text
+  start: 0
+  length: 10
+
+stage0:
+  positions_per_doc: 3
+  chunk_size: 10
+  seed: 42
+  multigpu: false
+
+stage1:
+  av_sft_frac: 0.25
+  ar_sft_frac: 0.25
+  rl_frac: 0.50
+  seed: 42
+
+stage2:
+  provider_cls: nla.datagen.providers.AnthropicProvider
+  provider_kwargs:
+    model: claude-haiku-4-5-20251001
+    max_tokens: 300
+    concurrency: 8
+  chunk_size: 64
+
+stage3:
+  keep_debug_metadata: true
+
+shuffle:
+  enabled: true
+  seed: 42
+
+storage_cls: nla.datagen.storage.LocalStorage

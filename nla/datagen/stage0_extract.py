@@ -117,7 +117,13 @@ def main() -> None:
         and tokenizer.pad_token_id != tokenizer.eos_token_id
     ) else None
 
-    ds = load_dataset(args.corpus, name=args.corpus_config, split=args.corpus_split)
+    # Allow a local parquet path as --corpus (skip the HF Hub roundtrip and the
+    # `load_dataset("parquet")` builder that needs explicit data_files).
+    import os
+    if args.corpus.endswith(".parquet") and os.path.exists(args.corpus):
+        ds = Dataset.from_parquet(args.corpus)
+    else:
+        ds = load_dataset(args.corpus, name=args.corpus_config, split=args.corpus_split)
     assert isinstance(ds, Dataset), (
         f"expected a concrete Dataset, got {type(ds).__name__}. "
         f"Pass an explicit split (e.g. --corpus-split train), not a streaming/dict dataset."

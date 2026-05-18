@@ -1,0 +1,47 @@
+# NLA datagen — Qwen3-8B over FineWeb sample-10BT (10k docs).
+# 10k × 10 positions = 100k activation vectors, split 25/25/50 → 25k AV / 25k AR / 50k RL.
+#
+# This is roughly the "first real run" scale — small enough to iterate quickly
+# (~$150 of Sonnet batch API), large enough to produce a meaningfully-trained NLA.
+
+model: qwen3_8b
+layer_index: 24
+output_dir: /workspace-vast/celeste/nla-data/qwen3_8b_fineweb_10k
+
+corpus:
+  name: HuggingFaceFW/fineweb
+  config: sample-10BT
+  split: train
+  text_column: text
+  start: 0
+  length: 10000
+
+stage0:
+  positions_per_doc: 10
+  chunk_size: 256
+  seed: 42
+  multigpu: false
+
+stage1:
+  av_sft_frac: 0.25
+  ar_sft_frac: 0.25
+  rl_frac: 0.50
+  seed: 42
+
+stage2:
+  provider_cls: nla.datagen.providers.AnthropicProvider
+  provider_kwargs:
+    model: claude-sonnet-4-6
+    max_tokens: 300
+    temperature: 1.0
+    concurrency: 100
+  chunk_size: 512
+
+stage3:
+  keep_debug_metadata: true
+
+shuffle:
+  enabled: true
+  seed: 42
+
+storage_cls: nla.datagen.storage.LocalStorage

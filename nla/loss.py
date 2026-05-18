@@ -79,6 +79,9 @@ def nla_critic_loss(args, parallel_state, batch, values, sum_of_sample_mean):
     # But ∂loss/∂W isn't: weight-space steps incidentally grow |pred| at
     # ~lr·sign(g) rate (Adam scale-invariance). See training notes — backbone
     # norm grows ~linearly with steps. Mitigation: lower lr or add norm term.
+    # REVERT to paper's normalize-MSE — TRAINING_NOTES says this is stable when
+    # combined with global_batch=256 (4× our previous 64). Mass averaging in
+    # the gradient = less stochastic noise = no NaN.
     loss_per_sample = F.mse_loss(
         normalize_activation(pred, mse_scale),
         normalize_activation(gold, mse_scale),

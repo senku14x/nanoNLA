@@ -39,7 +39,7 @@ from miles.backends.training_utils.loss import loss_function
 
 from nla.arch_adapters import resolve_text_config, resolve_text_model
 from nla.config import NLAConfig, load_nla_config_from_args, write_model_sidecar
-from nla.injection import inject_at_marked_positions
+from nla.injection import inject_at_marked_positions, karvonen_inject_in_residual
 from nla.models import NLACriticModel, embed_dump_path
 from nla.schema import (
     MM_ACTIVATION_KEY, MM_CRITIC_TOKENS_KEY, MM_MSE_SCALE_KEY,
@@ -382,7 +382,8 @@ class NLAFSDPActor(FSDPTrainRayActor):
         # INFERENCE MUST MATCH: nla_generate.py also calls load_nla_config_from_args
         # (same helper, same resolution), so train/infer scale cannot diverge.
         injects = not self._is_critic_model and args.loss_type in ("sft_loss", "policy_loss")
-        if injects:
+        karvonen_mode = os.environ.get("NLA_KARVONEN_INJECTION") == "1"
+        if injects and not karvonen_mode:
             assert cfg.injection_scale is not None, (
                 "Actor training requires injection_scale. Set --nla-injection-scale "
                 "(e.g. '150', 'raw', 'sqrt_d_model'), or point --nla-sidecar-source "
@@ -390,8 +391,14 @@ class NLAFSDPActor(FSDPTrainRayActor):
                 "it's a training hyperparameter, pick explicitly. "
                 f"(Resolved sidecar: {sidecar_source!r}, injection_scale: None.)"
             )
+        if karvonen_mode and injects:
+            print("[NLAFSDPActor] NLA_KARVONEN_INJECTION=1 — using ADD norm-matched "
+                  "residual injection at layer 1 (Karvonen et al. 2025). "
+                  "Ignoring injection_scale; vectors enter raw and get norm-matched in-hook.")
         self._nla_cfg: NLAConfig = cfg
         self._nla_vectors: torch.Tensor | None = None
+        # Set in _get_model_inputs_args so the Karvonen layer-1 hook can find marker positions.
+        self._nla_input_ids: torch.Tensor | None = None
         # Expose mse_scale on args so nla_critic_loss can read it backend-agnostically.
         # (Megatron's forward_step closure can't mutate batch; args is the shared channel.)
         self.args.nla_mse_scale = cfg.mse_scale
@@ -497,10 +504,45 @@ class NLAFSDPActor(FSDPTrainRayActor):
         dist.barrier()
 
     def _register_injection_hook(self, model):
-        embed = model.get_input_embeddings()
         inj = self._nla_cfg.injection_token_id
         left = self._nla_cfg.injection_left_neighbor_id
         right = self._nla_cfg.injection_right_neighbor_id
+
+        # Variant F: Karvonen ADD injection at layer 1's residual stream
+        # (per Karvonen et al. 2025, Activation Oracles eq. 1). Toggle via
+        # NLA_KARVONEN_INJECTION=1. With this set: skip the embedding-replace
+        # hook entirely, install a forward hook on model.model.layers[1]'s
+        # output that does h'_p = h_p + ||h_p|| * v / ||v|| at each marker pos.
+        # Vectors must be RAW (no injection_scale norm) — see
+        # _get_model_inputs_args where we skip normalize_activation if Karvonen.
+        if os.environ.get("NLA_KARVONEN_INJECTION") == "1":
+            text_model = resolve_text_model(model)
+            layers = text_model.model.layers  # ModuleList
+
+            def karvonen_hook(_module, _inputs, output):
+                if self._nla_vectors is None or os.environ.get("NLA_SKIP_INJECTION") == "1":
+                    return output
+                # Decoder layer's forward returns either Tensor or (Tensor, ...)
+                if isinstance(output, tuple):
+                    hidden, *rest = output
+                else:
+                    hidden, rest = output, None
+                ids = self._nla_input_ids
+                assert ids is not None and ids.dtype == torch.long, (
+                    "Karvonen hook needs self._nla_input_ids set by _get_model_inputs_args"
+                )
+                hidden = karvonen_inject_in_residual(
+                    input_ids=ids,
+                    resid=hidden,
+                    vectors=self._nla_vectors,
+                    inj_id=inj, left_id=left, right_id=right,
+                )
+                return (hidden, *rest) if rest is not None else hidden
+
+            layers[1].register_forward_hook(karvonen_hook)
+            return
+
+        embed = model.get_input_embeddings()
 
         def hook(_module, inputs, output):
             if self._nla_vectors is None or os.environ.get("NLA_SKIP_INJECTION") == "1":
@@ -523,8 +565,17 @@ class NLAFSDPActor(FSDPTrainRayActor):
                 batch[MM_ACTIVATION_KEY] = popped
                 batch[MM_MSE_SCALE_KEY] = self._nla_cfg.mse_scale
             else:
-                self._nla_vectors = normalize_activation(popped, self._nla_cfg.injection_scale)
+                # Karvonen variant F: skip injection_scale normalization — the
+                # in-hook formula `h + ||h|| * v/||v||` does its own per-position
+                # norm match against the live residual.
+                if os.environ.get("NLA_KARVONEN_INJECTION") == "1":
+                    self._nla_vectors = popped
+                else:
+                    self._nla_vectors = normalize_activation(popped, self._nla_cfg.injection_scale)
         model_args = super()._get_model_inputs_args(batch)
+        # Karvonen hook needs the raw input_ids to scan for marker positions —
+        # the layer-1 hook only sees residual states, not token ids.
+        self._nla_input_ids = model_args.get("input_ids")
         # use_cache=False kills TWO bugs, both via the same DynamicCache:
         #
         # (1) v22 ref_lp: Gemma3TextModel.forward:518 creates DynamicCache when
