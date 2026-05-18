@@ -422,6 +422,22 @@ def main():
     rows = load_rl_dataset(args.rl_parquet, n_max=args.max_rows)
     print(f"[data] {len(rows)} rows", flush=True)
 
+    # ---- FVE baseline: predict-the-mean MSE on this dataset ----
+    # FVE = 1 - mse_actual / baseline_mse. baseline = MSE between
+    # normalize(μ) and normalize(v_i), where μ = mean of activations.
+    # 0% = no better than constant prediction; 100% = perfect reconstruction.
+    # Paper's Qwen2.5-7B critic-SL alone hit FVE ≈ 37.5%.
+    _act_stack = torch.tensor(
+        [r["activation"] for r in rows[: min(len(rows), 4000)]],
+        dtype=torch.float32,
+    )
+    _mu = _act_stack.mean(dim=0, keepdim=True)
+    _mu_n = normalize_activation(_mu, mse_scale_f)
+    _act_n = normalize_activation(_act_stack, mse_scale_f)
+    fve_baseline = ((_mu_n - _act_n) ** 2).mean(dim=-1).mean().item()
+    del _act_stack, _act_n, _mu, _mu_n
+    print(f"[fve] predict-the-mean baseline mse_nrm = {fve_baseline:.4f}", flush=True)
+
     # ---- optimizer ----
     trainable = [p for p in actor.parameters() if p.requires_grad]
     optim = torch.optim.AdamW(trainable, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0)
@@ -543,6 +559,13 @@ def main():
         n_resps_t = torch.tensor(
             [lp.numel() for lp in new_logps], dtype=torch.float32, device=device,
         )
+        # FVE on valid (non-extraction-failed) samples — gives an
+        # interpretable curve in wandb that maps to paper's reported numbers.
+        # Use valid rewards only so extraction failures don't bias FVE down.
+        fve = (
+            1.0 - (-float(np.mean(valid_rewards))) / fve_baseline
+            if valid_rewards else float("nan")
+        )
         log = {
             "step": step,
             "loss": loss.item(),
@@ -551,6 +574,9 @@ def main():
             "reward_std": float(np.std(valid_rewards)) if valid_rewards else float("nan"),
             "reward_min": float(np.min(valid_rewards)) if valid_rewards else float("nan"),
             "reward_max": float(np.max(valid_rewards)) if valid_rewards else float("nan"),
+            "fve": fve,
+            "fve_pct": fve * 100.0,
+            "fve_baseline": fve_baseline,
             "advantage_mean": adv.mean().item(),
             "advantage_std": adv.std().item(),
             "extraction_rate": extraction_rate,
@@ -562,8 +588,9 @@ def main():
         }
         print(
             f"step {step:04d} | loss {log['loss']:.4f} | r {log['reward_mean']:.3f} "
-            f"| kl {log['kl_mean']:.4f} | clip {log['clip_frac']:.2%} | "
-            f"ext {extraction_rate:.0%} | t {log['wall_s']:.0f}s",
+            f"| FVE {log['fve_pct']:.1f}% | kl {log['kl_mean']:.4f} | "
+            f"clip {log['clip_frac']:.2%} | ext {extraction_rate:.0%} | "
+            f"t {log['wall_s']:.0f}s",
             flush=True,
         )
         if not args.no_wandb:
