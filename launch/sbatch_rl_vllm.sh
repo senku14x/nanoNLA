@@ -21,21 +21,14 @@
 # in the GRPO loss handles residual vLLM/HF engine mismatch.
 
 set -euo pipefail
-# Use a dedicated venv so vLLM/vllm-lens doesn't clash with the SGLang/Miles
-# stack that the SFT runs need. First-time setup auto-bootstraps.
-VENV=/workspace-vast/celeste/envs/nla_vllm
-if [ ! -d "$VENV" ]; then
-  echo "[setup] bootstrapping $VENV"
-  uv venv "$VENV" --python 3.12
-  source "$VENV/bin/activate"
-  uv pip install --python "$VENV/bin/python" \
-    vllm-lens "peft==0.13.0" bitsandbytes wandb pyarrow \
-    "transformers==4.57.1" safetensors pyyaml numpy huggingface_hub
-  # Pin transformers to match the SFT training env — transformers 5.x changed
-  # apply_chat_template's BPE merge behaviour around the ㈎ injection char so
-  # the marker token id no longer appears in the rendered canonical prompt,
-  # tripping schema.compute_canonical_neighbors. See job 1572515 failure.
-fi
+# Use the existing vllm-lens venv (has torch 2.9.1+cu128 matching cluster's
+# CUDA 12.8 driver). The auto-bootstrapped nla_vllm venv pulled torch
+# 2.11.0+cu130 which failed at runtime; pinning torch + vllm + peft together
+# in the existing venv is the working combo. Required pkgs:
+#   torch=2.9.1+cu128 cuda=12.8 vllm=0.16.0 vllm_lens=1.1.0
+#   peft=0.13.0 bnb=0.49.2 transformers=4.57.1 (pinned for BPE-merge compat
+#   with the SFT training env).
+VENV=/workspace-vast/celeste/envs/vllm-lens
 source "$VENV/bin/activate"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HOME=/workspace-vast/pretrained_ckpts
