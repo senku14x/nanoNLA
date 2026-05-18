@@ -187,7 +187,8 @@ Run: `sbatch launch/sbatch_eval_post_rl.sh` (job 1566576, 6:46 elapsed on
 - AV SFT (Karvonen): https://wandb.ai/adamkarvonen/nla-qwen3-8b/runs/epu2zb0m
 - AR SFT (safe): https://wandb.ai/adamkarvonen/nla-qwen3-8b/runs/8ea7vvfk
 - RL GRPO smoke: https://wandb.ai/adamkarvonen/nla-qwen3-8b/runs/l41reyk1
-- RL GRPO overnight: https://wandb.ai/adamkarvonen/nla-qwen3-8b/runs/8ls885ti
+- RL GRPO overnight (250 steps): https://wandb.ai/adamkarvonen/nla-qwen3-8b/runs/8ls885ti
+- RL GRPO long (1500 steps, with live FVE logging): https://wandb.ai/adamkarvonen/nla-qwen3-8b/runs/4cvdfjiw
 
 All runs live under the cohort-shared `adamkarvonen/nla-qwen3-8b` project
 (API key is shared across the cohort; not a leak).
