@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
-#SBATCH --time=24:00:00
+#SBATCH --time=30:00:00
 #SBATCH --output=/workspace-vast/celeste/nla-experiments/logs/%x_%j.out
 
 # Long GRPO run: 1500 steps, ~13h at 33s/step, paper-faithful hparams.
@@ -14,6 +14,7 @@
 
 set -euo pipefail
 source /workspace-vast/celeste/envs/nla/bin/activate
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HOME=/workspace-vast/pretrained_ckpts
 : "${HF_TOKEN:?set HF_TOKEN in your shell}"
 : "${WANDB_API_KEY:?set WANDB_API_KEY in your shell}"

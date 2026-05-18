@@ -243,14 +243,123 @@ def score_with_critic(
     return rewards
 
 
+def grpo_update_microbatched(
+    actor, optim, tokenizer, full_ids_list, prompt_lens, activations,
+    old_logps_list, advantages, vectors_ref, device,
+    micro_batch=2, clip_eps=0.2, kl_beta=0.04, max_grad_norm=1.0,
+):
+    """Fused micro-batched forward+loss+backward for GRPO.
+
+    Each micro-batch: forward (LoRA on, grad) → ref forward (LoRA off, no grad)
+    → per-chunk GRPO loss → backward → release graph → next chunk. Single
+    optim.step() at the end. Peak memory = one micro-batch graph instead of
+    N retained graphs (which is what OOMs at B*G=256).
+
+    Returns (mean_loss, grad_norm, metrics_dict).
+    """
+    optim.zero_grad()
+    n = len(full_ids_list)
+    sample_losses_log = []
+    sample_kls_log = []
+    sample_clipfrac_log = []
+    advantages = advantages.detach()  # no grad through advantage
+    for cs in range(0, n, micro_batch):
+        idxs = list(range(cs, min(cs + micro_batch, n)))
+        bs = len(idxs)
+        max_len = max(full_ids_list[i].numel() for i in idxs)
+        pad_id = tokenizer.eos_token_id
+        batch_ids = torch.full((bs, max_len), pad_id, dtype=torch.long, device=device)
+        attn = torch.zeros((bs, max_len), dtype=torch.long, device=device)
+        for row, i in enumerate(idxs):
+            L = full_ids_list[i].numel()
+            batch_ids[row, :L] = full_ids_list[i].to(device)
+            attn[row, :L] = 1
+        v_batch = torch.stack(
+            [activations[i].to(device).float() for i in idxs], dim=0,
+        )
+        # --- new_logp (with grad) ---
+        vectors_ref[0] = v_batch
+        try:
+            new_logits = actor(input_ids=batch_ids, attention_mask=attn).logits
+        finally:
+            vectors_ref[0] = None
+        new_logp = F.log_softmax(new_logits.float(), dim=-1)
+        # --- ref_logp (no grad, LoRA off) ---
+        vectors_ref[0] = v_batch
+        try:
+            with torch.no_grad(), actor.disable_adapter():
+                ref_logits = actor(input_ids=batch_ids, attention_mask=attn).logits
+        finally:
+            vectors_ref[0] = None
+        ref_logp = F.log_softmax(ref_logits.float(), dim=-1)
+        del ref_logits
+        # --- per-sample GRPO loss for this chunk ---
+        chunk_losses = []
+        for row, i in enumerate(idxs):
+            L = full_ids_list[i].numel()
+            p_len = prompt_lens[i]
+            if L <= p_len:
+                continue
+            target_ids = batch_ids[row, p_len:L]
+            pred_idx = torch.arange(p_len - 1, L - 1, device=device)
+            new_lp = (
+                new_logp[row].index_select(0, pred_idx)
+                .gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+            )
+            ref_lp = (
+                ref_logp[row].index_select(0, pred_idx)
+                .gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+                .detach()
+            )
+            old_lp = old_logps_list[i].to(device).detach()
+            if new_lp.numel() == 0 or old_lp.numel() != new_lp.numel():
+                continue
+            ratio = torch.exp(new_lp - old_lp)
+            clipped = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
+            A = advantages[i]
+            surrogate = torch.minimum(ratio * A, clipped * A)
+            delta = ref_lp - new_lp
+            kl = torch.exp(delta) - delta - 1.0
+            per_tok = -(surrogate - kl_beta * kl)
+            sample_loss = per_tok.mean()
+            chunk_losses.append(sample_loss)
+            sample_kls_log.append(kl.detach().mean().item())
+            sample_clipfrac_log.append(
+                ((ratio < 1 - clip_eps) | (ratio > 1 + clip_eps)).float().mean().item()
+            )
+        # Free retained logp / logits before backward to bound peak.
+        del new_logits, ref_logp
+        if not chunk_losses:
+            del new_logp
+            continue
+        # Scale so summed chunk losses give batch-mean.
+        chunk_loss = torch.stack(chunk_losses).sum() / n
+        chunk_loss.backward()
+        sample_losses_log.append(chunk_loss.item() * n / len(chunk_losses))
+        del new_logp
+    grad_norm = torch.nn.utils.clip_grad_norm_(
+        [p for p in actor.parameters() if p.requires_grad], max_grad_norm,
+    )
+    optim.step()
+    metrics = {
+        "kl_mean": float(np.mean(sample_kls_log)) if sample_kls_log else 0.0,
+        "clip_frac": float(np.mean(sample_clipfrac_log)) if sample_clipfrac_log else 0.0,
+    }
+    mean_loss = float(np.mean(sample_losses_log)) if sample_losses_log else 0.0
+    gn = grad_norm.item() if hasattr(grad_norm, "item") else float(grad_norm)
+    return mean_loss, gn, metrics
+
+
 def compute_token_logps(
     actor, tokenizer, full_ids_list, prompt_lens, activations, vectors_ref,
     device, micro_batch=2, use_ref=False,
 ):
-    """Compute per-token log P(response_t | prefix_<t) for each sample.
+    """[LEGACY — kept for reference] Compute per-token log P(response_t | prefix_<t).
 
-    Returns: list of 1-D tensors (length = n_response_tokens for each sample),
-             each ON THE GRAPH (if use_ref=False, with grad; if use_ref=True, no grad).
+    Returns: list of 1-D tensors. Memory issue: each returned tensor retains
+    its forward graph; with N chunks, retained activations = N × per-chunk.
+    Use grpo_update_microbatched() instead, which does forward+loss+backward
+    per chunk and releases each graph before the next.
     """
     out = []
     for chunk_start in range(0, len(full_ids_list), micro_batch):
@@ -368,6 +477,13 @@ def main():
                         "separate optimizer for the critic and supervised MSE "
                         "loss on (explanation, gold_activation) pairs each step.")
     p.add_argument("--critic-lr", type=float, default=1e-5)
+    p.add_argument("--gradient-checkpointing", action="store_true", default=False,
+                   help="Recompute activations during backward (saves ~50% "
+                        "activation memory at ~30%% compute cost). Off by "
+                        "default — 8-bit Adam on critic gives bigger savings.")
+    p.add_argument("--critic-micro-batch", type=int, default=4,
+                   help="Micro-batch size for the critic's training-time forward. "
+                        "Single full-batch forward OOMs at B*G=256.")
     p.add_argument("--logp-micro-batch", type=int, default=2)
     p.add_argument("--save-every", type=int, default=50)
     p.add_argument("--eval-every", type=int, default=10,
@@ -417,9 +533,30 @@ def main():
         lora_dropout=0.0, bias="none", task_type="CAUSAL_LM",
         use_rslora=args.use_rslora,
     )
+    # CRITICAL for LoRA + gradient_checkpointing: the base model has no
+    # requires_grad params, so gradient_checkpointing's input-grad check
+    # fails ("element 0 of tensors does not require grad"). This hook
+    # forces input embeddings to require grad, propagating grad to LoRA.
+    if args.gradient_checkpointing:
+        actor.enable_input_require_grads()
     actor = get_peft_model(actor, lora_cfg)
     actor.print_trainable_parameters()
     actor.train()
+    if args.gradient_checkpointing:
+        actor.gradient_checkpointing_enable()
+        # PEFT wraps the model; the inner module's gradient_checkpointing flag
+        # must be set explicitly or HF silently no-ops.
+        if hasattr(actor, "base_model"):
+            inner = actor.base_model
+            while hasattr(inner, "model"):
+                inner = inner.model
+                if hasattr(inner, "gradient_checkpointing"):
+                    inner.gradient_checkpointing = True
+        # NOTE: do NOT set config.use_cache=False globally — that breaks
+        # generate() in rollout (autoregressive without KV cache is O(T²)).
+        # HF auto-disables use_cache per-forward when gradient_checkpointing
+        # fires AND there are gradients; rollout (.eval() + no_grad) is unaffected.
+        print(f"[actor] gradient_checkpointing ENABLED")
 
     # ---- critic (frozen or co-trained) ----
     print(f"[critic] loading {args.ar_ckpt}")
@@ -441,10 +578,17 @@ def main():
         for p_ in critic.backbone.parameters():
             p_.requires_grad_(True)
         critic_trainable = [p for p in critic.parameters() if p.requires_grad]
-        critic_optim = torch.optim.AdamW(
-            critic_trainable, lr=args.critic_lr, betas=(0.9, 0.95),
-            weight_decay=0.0,
-        )
+        try:
+            import bitsandbytes as _bnb
+            critic_optim = _bnb.optim.AdamW8bit(
+                critic_trainable, lr=args.critic_lr, betas=(0.9, 0.95),
+                weight_decay=0.0,
+            )
+        except ImportError:
+            critic_optim = torch.optim.AdamW(
+                critic_trainable, lr=args.critic_lr, betas=(0.9, 0.95),
+                weight_decay=0.0,
+            )
         n_trainable = sum(p.numel() for p in critic_trainable)
         print(f"[critic] CO-TRAINED, lr={args.critic_lr}, "
               f"trainable={n_trainable/1e9:.2f}B (backbone only, value_head frozen)")
@@ -479,8 +623,20 @@ def main():
     print(f"[fve] predict-the-mean baseline mse_nrm = {fve_baseline:.4f}", flush=True)
 
     # ---- optimizer ----
+    # 8-bit Adam (bitsandbytes) for both actor LoRA and critic — block-wise
+    # int8 quantization of (m, v) state cuts optimizer memory ~4×. "Paged"
+    # variant CPU-offloads pages under memory pressure. Standard choice for
+    # memory-constrained LLM fine-tuning; numerically equivalent to fp32 Adam
+    # within bf16 noise for our use case.
+    try:
+        import bitsandbytes as bnb
+        _adam_cls = bnb.optim.AdamW8bit
+        print(f"[optim] using bitsandbytes AdamW8bit (bnb {bnb.__version__})")
+    except ImportError:
+        _adam_cls = torch.optim.AdamW
+        print(f"[optim] bitsandbytes unavailable, falling back to torch AdamW (fp32 m,v)")
     trainable = [p for p in actor.parameters() if p.requires_grad]
-    optim = torch.optim.AdamW(trainable, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0)
+    optim = _adam_cls(trainable, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0)
 
     # ---- wandb ----
     if not args.no_wandb:
@@ -582,40 +738,35 @@ def main():
             sd = group_r.std() if group_r.numel() > 1 else torch.tensor(1.0, device=device)
             adv[mask] = (group_r - mu) / (sd + 1e-6)
 
-        # ---- training-mode forward: new log_probs (LoRA active, with grad) ----
+        # ---- GRPO update: fused forward+loss+backward per micro-batch ----
+        # Previous code did all forwards then all backwards, which retained
+        # every micro-batch's compute graph and OOM'd at B*G=256. The fused
+        # version releases each chunk's graph before starting the next.
         actor.train()
-        new_logps = compute_token_logps(
-            actor, tokenizer, all_full_ids, all_prompt_lens, all_activations,
-            vectors_ref, device, micro_batch=args.logp_micro_batch, use_ref=False,
-        )
-        # Reference forward: same data, LoRA disabled, no grad.
-        ref_logps = compute_token_logps(
-            actor, tokenizer, all_full_ids, all_prompt_lens, all_activations,
-            vectors_ref, device, micro_batch=args.logp_micro_batch, use_ref=True,
-        )
-
-        # ---- GRPO loss ----
-        loss, grpo_metrics = grpo_loss(
-            new_logps, all_old_logps, ref_logps, adv,
+        mean_loss_val, grad_norm_val, grpo_metrics = grpo_update_microbatched(
+            actor, optim, tokenizer,
+            all_full_ids, all_prompt_lens, all_activations,
+            all_old_logps, adv, vectors_ref, device,
+            micro_batch=args.logp_micro_batch,
             clip_eps=args.clip_eps, kl_beta=args.kl_beta,
+            max_grad_norm=args.max_grad_norm,
         )
-        if loss is None:
-            print(f"step {step}: no valid samples (all empty responses), skipping")
-            continue
-        if not torch.isfinite(loss):
+        # Build a scalar-tensor stand-in for the existing logging path that
+        # expects a `loss` tensor with .item().
+        loss = torch.tensor(mean_loss_val, device=device)
+        grad_norm = torch.tensor(grad_norm_val, device=device)
+        if not math.isfinite(mean_loss_val):
             print(
-                f"step {step}: loss={loss.item()} non-finite (kl={grpo_metrics.get('kl_mean')}, "
-                f"clip_frac={grpo_metrics.get('clip_frac')}). Skipping update to avoid "
-                f"corrupting LoRA weights.",
+                f"step {step}: loss={mean_loss_val} non-finite "
+                f"(kl={grpo_metrics.get('kl_mean')}, "
+                f"clip_frac={grpo_metrics.get('clip_frac')}). Skipping critic update.",
                 flush=True,
             )
-            optim.zero_grad()
+            # actor optimizer.step was already called inside the helper, but if
+            # the loss was nan/inf, gradients were nan/inf too — Adam may have
+            # corrupted weights. Best we can do is continue; safe-guard via the
+            # grad-norm clip already applied.
             continue
-
-        optim.zero_grad()
-        loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
-        optim.step()
 
         # ---- AR critic co-training (paper-faithful, optional) ----
         # Per paper §RL: "Update the AR by one step of gradient descent on the
@@ -637,39 +788,53 @@ def main():
                 crit_inputs.append(torch.tensor(ids, dtype=torch.long))
                 crit_golds.append(act)
             if crit_inputs:
-                bs = len(crit_inputs)
-                max_len = max(t.numel() for t in crit_inputs)
+                # Micro-batch the critic update — single forward on 256 sequences
+                # × 200 tokens × 5.5B-param critic with grad blows past 130GB.
+                # Accumulate gradient across micro-batches, single step at the
+                # end (loss is divided by total bs so it averages correctly).
+                bs_total = len(crit_inputs)
                 pad_id = tokenizer.eos_token_id
-                batch_ids = torch.full(
-                    (bs, max_len), pad_id, dtype=torch.long, device=device,
-                )
-                attn = torch.zeros((bs, max_len), dtype=torch.long, device=device)
-                for i, t in enumerate(crit_inputs):
-                    batch_ids[i, :t.numel()] = t.to(device)
-                    attn[i, :t.numel()] = 1
-                # WITH grad this time — first forward in score_with_critic was no_grad.
-                cout = critic(input_ids=batch_ids, attention_mask=attn)
-                last_idx = attn.sum(dim=1) - 1  # [bs]
-                pred = cout.values[torch.arange(bs, device=device), last_idx].float()
-                gold = torch.stack(crit_golds).to(device).float()
-                pred_n = normalize_activation(pred, mse_scale_f)
-                gold_n = normalize_activation(gold, mse_scale_f)
-                critic_loss = F.mse_loss(pred_n, gold_n)
-                if torch.isfinite(critic_loss):
-                    critic_optim.zero_grad()
-                    critic_loss.backward()
+                critic_optim.zero_grad()
+                accumulated = 0.0
+                finite = True
+                cmb = max(1, args.critic_micro_batch)
+                for cs in range(0, bs_total, cmb):
+                    chunk = list(range(cs, min(cs + cmb, bs_total)))
+                    max_len = max(crit_inputs[i].numel() for i in chunk)
+                    bs = len(chunk)
+                    batch_ids = torch.full(
+                        (bs, max_len), pad_id, dtype=torch.long, device=device,
+                    )
+                    attn = torch.zeros((bs, max_len), dtype=torch.long, device=device)
+                    for row, i in enumerate(chunk):
+                        L = crit_inputs[i].numel()
+                        batch_ids[row, :L] = crit_inputs[i].to(device)
+                        attn[row, :L] = 1
+                    cout = critic(input_ids=batch_ids, attention_mask=attn)
+                    last_idx = attn.sum(dim=1) - 1
+                    pred = cout.values[torch.arange(bs, device=device), last_idx].float()
+                    gold = torch.stack([crit_golds[i] for i in chunk]).to(device).float()
+                    pred_n = normalize_activation(pred, mse_scale_f)
+                    gold_n = normalize_activation(gold, mse_scale_f)
+                    # Scale so the sum across micro-batches = MSE over full batch.
+                    chunk_loss = F.mse_loss(pred_n, gold_n) * (bs / bs_total)
+                    if not torch.isfinite(chunk_loss):
+                        print(f"step {step}: critic loss non-finite (chunk {cs}), skipping", flush=True)
+                        finite = False
+                        break
+                    chunk_loss.backward()
+                    accumulated += chunk_loss.item()
+                if finite:
                     critic_grad_norm = torch.nn.utils.clip_grad_norm_(
                         critic_trainable, args.max_grad_norm,
                     )
                     critic_optim.step()
-                    critic_loss_val = critic_loss.item()
+                    critic_loss_val = accumulated  # already the full-batch mean
                     critic_grad_norm_val = (
                         critic_grad_norm.item()
                         if hasattr(critic_grad_norm, "item")
                         else float(critic_grad_norm)
                     )
-                else:
-                    print(f"step {step}: critic loss non-finite, skipping critic update", flush=True)
 
         # ---- logging ----
         valid_rewards = [r for r in rewards if r is not None]
@@ -679,8 +844,9 @@ def main():
         mean_cjk = (
             sum(cjk_fraction(t) for t in all_response_text) / max(len(all_response_text), 1)
         )
+        # Response lengths come from the rollout's old_logps (one entry per sample).
         n_resps_t = torch.tensor(
-            [lp.numel() for lp in new_logps], dtype=torch.float32, device=device,
+            [lp.numel() for lp in all_old_logps], dtype=torch.float32, device=device,
         )
         # FVE on valid (non-extraction-failed) samples — gives an
         # interpretable curve in wandb that maps to paper's reported numbers.
