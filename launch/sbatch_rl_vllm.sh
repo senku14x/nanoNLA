@@ -2,7 +2,7 @@
 #SBATCH --job-name=qwen3_rl_grpo_vllm
 #SBATCH --partition=general
 #SBATCH --qos=high
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --time=24:00:00
@@ -73,6 +73,7 @@ python -m nla.train_rl_vllm \
   --max-grad-norm 1.0 \
   --vllm-gpu-mem 0.35 \
   --vllm-max-len 1024 \
+  --vllm-tp 4 \
   --vllm-sync-every 20 \
   --tis-cap 2.0 \
   --wandb-project nla-qwen3-8b \

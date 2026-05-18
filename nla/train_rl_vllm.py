@@ -619,6 +619,10 @@ def main():
                    help="vLLM gpu_memory_utilization; trimmed to leave room for "
                         "HF actor+LoRA + critic + Adam states + activations.")
     p.add_argument("--vllm-max-len", type=int, default=1024)
+    p.add_argument("--vllm-tp", type=int, default=1,
+                   help="vLLM tensor_parallel_size. Set to 4 for 4-GPU runs to "
+                        "speed up rollout ~3-4×. Training-side HF actor stays on "
+                        "GPU 0 only (LoRA's 122M trainable params don't need FSDP).")
     p.add_argument("--vllm-sync-every", type=int, default=20,
                    help="Push HF→vLLM weights every N optimizer steps (TRL pattern).")
     p.add_argument("--tis-cap", type=float, default=2.0,
@@ -775,6 +779,7 @@ def main():
         dtype="bfloat16",
         gpu_memory_utilization=args.vllm_gpu_mem,
         max_model_len=args.vllm_max_len,
+        tensor_parallel_size=args.vllm_tp,
         enforce_eager=True,  # avoids CUDA graph capture conflicts with HF training
     )
     print(f"[vllm] ready", flush=True)
