@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
-#SBATCH --time=20:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=/workspace-vast/celeste/nla-experiments/logs/%x_%j.out
 
 # Long GRPO run: 1500 steps, ~13h at 33s/step, paper-faithful hparams.
@@ -29,10 +29,10 @@ python -m nla.train_rl_self_contained \
   --ar-ckpt /workspace-vast/celeste/nla-ckpts/qwen3_8b_L24_ar_sft_safe/iter_0001000/hf \
   --rl-parquet $DATA/rl_shuf.parquet \
   --sidecar $DATA/rl_shuf.parquet \
-  --save-dir /workspace-vast/celeste/nla-ckpts/qwen3_8b_L24_rl_grpo_long_v2 \
-  --num-steps 1500 \
+  --save-dir /workspace-vast/celeste/nla-ckpts/qwen3_8b_L24_rl_grpo_v3_b16g16 \
+  --num-steps 1000 \
   --batch-prompts 16 \
-  --group-size 4 \
+  --group-size 16 \
   --max-new-tokens 150 \
   --temperature 1.0 \
   --lr 1e-6 \
@@ -51,5 +51,5 @@ python -m nla.train_rl_self_contained \
   --eval-skip-rows 35000 \
   --max-grad-norm 1.0 \
   --wandb-project nla-qwen3-8b \
-  --wandb-name qwen3_8b_L24_rl_grpo_v2_rs128_cotrain_b16 \
+  --wandb-name qwen3_8b_L24_rl_grpo_v3_b16g16_cotrain_rs128 \
   --seed 0
