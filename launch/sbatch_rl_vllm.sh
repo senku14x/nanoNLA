@@ -30,6 +30,10 @@ set -euo pipefail
 #   with the SFT training env).
 VENV=/workspace-vast/celeste/envs/vllm-lens
 source "$VENV/bin/activate"
+# Allow pickle-based serialisation so we can pass a lambda to apply_model
+# (needed for weight-broadcast: `llm.apply_model(lambda m: m.load_weights(items))`).
+# msgpack can't serialise functions; pickle can. Single-tenant cluster — safe.
+export VLLM_ALLOW_INSECURE_SERIALIZATION=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HOME=/workspace-vast/pretrained_ckpts
 : "${HF_TOKEN:?set HF_TOKEN in your shell}"

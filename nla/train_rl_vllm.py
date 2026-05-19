@@ -265,6 +265,13 @@ def rollout_batch_vllm(
     return responses
 
 
+def _vllm_load_weights_chunk(model, chunk):
+    """Module-level helper for vLLM's apply_model — pickle can't serialise
+    local lambdas across worker processes, but it can pickle top-level fns.
+    Each worker calls this with the actual model + a list of (name, tensor)."""
+    model.load_weights(iter(chunk))
+
+
 def sync_actor_to_vllm(actor, llm):
     """TRL-style colocate weight sync: merge LoRA, push state_dict to vLLM, unmerge.
 
@@ -280,17 +287,40 @@ def sync_actor_to_vllm(actor, llm):
         # PEFT prepends "base_model.model." to every param name when wrapping;
         # strip that so the names match vLLM's HF-style state_dict.
         # Also drop the LoRA-A/B tensors themselves (they're tiny + already merged).
-        items = []
+        # Bucket params by layer — vLLM v1's msgspec serialiser caps a single
+        # encode at 2**32 bytes (~4 GB) and an 8B-param bf16 state_dict is
+        # ~16 GB. Push layer-by-layer matches prime-rl's NCCL broadcast
+        # pattern: "Yield non-layer weights first, then each layer's weights."
+        from collections import defaultdict
+        buckets = defaultdict(list)
         for k, v in actor.state_dict().items():
             if "lora_" in k or "modules_to_save" in k:
                 continue
             new_k = k
             if new_k.startswith("base_model.model."):
                 new_k = new_k[len("base_model.model."):]
-            items.append((new_k, v.detach()))
-        # Push into vLLM via collective_rpc — calls `load_weights` on every worker
-        # (our colocate setup has 1 worker, but the same call works for TP/PP too).
-        llm.collective_rpc("load_weights", args=(items,))
+            # PEFT wraps every adapted Linear with `.base_layer.weight`/bias;
+            # merge_adapter() folds LoRA into the base but keeps that nesting
+            # in the state_dict (only merge_and_unload destroys it). vLLM's
+            # qwen3 loader expects flat `model.layers.X.self_attn.qkv_proj.weight`.
+            new_k = new_k.replace(".base_layer.weight", ".weight")
+            new_k = new_k.replace(".base_layer.bias", ".bias")
+            # CPU detach before transport (msgspec can't serialise CUDA tensors).
+            t = v.detach().cpu()
+            # Layer params look like "model.layers.<N>.<...>". Non-layer params
+            # (embed, norm, lm_head) go to "_other".
+            if new_k.startswith("model.layers."):
+                layer_id = new_k.split(".", 3)[2]
+                buckets[f"layer_{int(layer_id):03d}"].append((new_k, t))
+            else:
+                buckets["_other"].append((new_k, t))
+        # Push _other first (small), then each layer in order.
+        import functools as _ft
+        for group_name in ["_other"] + sorted(k for k in buckets if k != "_other"):
+            chunk = buckets[group_name]
+            if not chunk:
+                continue
+            llm.apply_model(_ft.partial(_vllm_load_weights_chunk, chunk=chunk))
         # Prefix cache keys on token IDs; weights changed, cache is stale.
         try:
             llm.llm_engine.reset_prefix_cache()

@@ -76,6 +76,12 @@ class NLACriticModel(PreTrainedModel):
     PreTrainedModel machinery. Only the forward path + head are NLA-specific.
     """
 
+    # We never run attention ourselves; backbone does and validates its own
+    # attn_implementation. Advertise support so HF doesn't refuse construction.
+    _supports_sdpa = True
+    _supports_flash_attn_2 = True
+    _supports_flex_attn = True
+
     def __init__(self, config, backbone: PreTrainedModel):
         super().__init__(config)
         self.backbone = backbone
