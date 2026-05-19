@@ -1,13 +1,13 @@
 # open-NLAs
 
-Open-source training pipeline for **Natural Language Autoencoders** — a fork of
-[`kitft/natural_language_autoencoders`](https://github.com/kitft/natural_language_autoencoders)
-trimmed down to a minimal, single-GPU-friendly impl, with a self-contained GRPO
-RL trainer added. Original work:
+Open-source training pipeline for **Natural Language Autoencoders** — a
+minimal, self-contained fork of
+[`kitft/natural_language_autoencoders`](https://github.com/kitft/natural_language_autoencoders).
+Original work:
 **[Natural Language Autoencoders Produce Unsupervised Explanations of LLM Activations](https://transformer-circuits.pub/2026/nla/index.html)**
 (Fraser-Taliente et al., Transformer Circuits 2026).
 
-📄 [Blog post](https://www.anthropic.com/research/natural-language-autoencoders) · ▶ [Video walkthrough](https://www.youtube.com/watch?v=j2knrqAzYVY) · 🔬 [Released NLAs on Neuronpedia](https://www.neuronpedia.org/nla) · 🧪 [Qwen3-8B reproduction guide](docs/qwen3_8b_run.md)
+📄 [Blog post](https://www.anthropic.com/research/natural-language-autoencoders) · ▶ [Video walkthrough](https://www.youtube.com/watch?v=j2knrqAzYVY) · 🔬 [Released NLAs on Neuronpedia](https://www.neuronpedia.org/nla)
 
 ---
 
@@ -24,185 +24,195 @@ Both vectors are L2-normalised before comparison, so the round-trip
 Low MSE means the AR could recover the original direction from the AV's words
 alone, which implies the explanation captures the information in the vector.
 
-This is the **full training repo** — data generation, SFT, GRPO RL, and
-checkpoint conversion. For a lightweight inference-only package (just
-`NLAClient` + `NLACritic`, no training deps), see
-[`kitft/nla-inference`](https://github.com/kitft/nla-inference).
-
-> **A note on naming.** Public-facing names are **AV** / **AR**. Inside the
-> `nla/` package you will see **actor** / **critic** — those are the same two
-> models, named to map directly onto Miles' RL primitives (the AV *is* the
-> policy actor; the AR *is* the value critic). The codebase keeps actor/critic
-> so the Miles extension points read naturally; everywhere user-facing we use
-> AV/AR.
-
----
+**What's different from upstream**:
+- **No Miles dependency** — AV-SFT, AR-SFT, and GRPO RL each run from a
+  single self-contained file (`nla/train_sft.py`, `nla/train_rl_self_contained.py`).
+  Drops ~2,200 LOC of plugin-path wiring.
+- **Single-GPU first** — fits Qwen3-8B full FT on one H200 via
+  `bitsandbytes.AdamW8bit` + bf16 + gradient checkpointing. Multi-GPU and
+  vLLM-rollout paths exist as alternates.
+- **Karvonen-style injection** — ADD norm-matched residual injection on layer 1
+  (`h'_p = h_p + ‖h_p‖ · v/‖v‖`) instead of embedding-replace; better val NLL
+  and a much easier inference path (no `input_embeds` plumbing).
+- **Co-trained AR with `value_head(normalize(last_hidden))`** — bounds the
+  value-head's input norm so bf16+Adam can't blow up the output norm
+  (the failure mode that NaN'd AR SFT 8+ times in upstream).
 
 ## Released checkpoints
 
-All eight checkpoints are gathered in the
-**[`kitft/nla-models` collection](https://huggingface.co/collections/kitft/nla-models)**
-on the HF Hub — four base-model families, each with an AV and an AR. We extract
-from a layer roughly **two-thirds of the way through the model** in each case
-— deep enough that the residual stream carries rich semantic content, shallow
-enough that it hasn't yet collapsed toward the unembedding.
+This fork's primary target is **Qwen3-8B layer 24**:
+- AV-SFT (Karvonen injection): val NLL 1.82 (vs 1.86 baseline embedding-replace)
+- AR-SFT (frozen value-head identity init): trains stable for 1000 steps
+- **RL GRPO: peak held-out FVE 71.8%** on doc-disjoint eval set
+  (started from 35.9% — +35.9 pp).
 
-| base model | layer | d_model | AV | AR |
-|---|---|---|---|---|
-| Qwen2.5-7B-Instruct | 20 / 28 | 3584 | [`kitft/nla-qwen2.5-7b-L20-av`](https://huggingface.co/kitft/nla-qwen2.5-7b-L20-av) | [`kitft/nla-qwen2.5-7b-L20-ar`](https://huggingface.co/kitft/nla-qwen2.5-7b-L20-ar) |
-| Gemma-3-12B-IT | 32 / 48 | 3840 | [`kitft/nla-gemma3-12b-L32-av`](https://huggingface.co/kitft/nla-gemma3-12b-L32-av) | [`kitft/nla-gemma3-12b-L32-ar`](https://huggingface.co/kitft/nla-gemma3-12b-L32-ar) |
-| Gemma-3-27B-IT | 41 / 62 | 5376 | [`kitft/nla-gemma3-27b-L41-av`](https://huggingface.co/kitft/nla-gemma3-27b-L41-av) | [`kitft/nla-gemma3-27b-L41-ar`](https://huggingface.co/kitft/nla-gemma3-27b-L41-ar) |
-| Llama-3.3-70B-Instruct | 53 / 80 | 8192 | [`kitft/Llama-3.3-70B-NLA-L53-av`](https://huggingface.co/kitft/Llama-3.3-70B-NLA-L53-av) | [`kitft/Llama-3.3-70B-NLA-L53-ar`](https://huggingface.co/kitft/Llama-3.3-70B-NLA-L53-ar) |
-
-Each checkpoint ships an `nla_meta.yaml` sidecar with the prompt template,
-injection token IDs, and scale factors that the model was trained with — load
-those, never hardcode them.
-
----
-
-## How it fits together
-
-NLA training is built as a thin extension on top of two open-source projects:
-
-- **[Miles](https://github.com/radixark/miles)** — Ray-orchestrated RL training
-  (FSDP2 / Megatron backends, GRPO, async rollout). We used the FSDP backend
-  for the 7B/12B/27B runs and Megatron only for Llama-70B. NLA plugs in via Miles'
-  upstream `--custom-rm-path`, `--data-source-path`, and
-  `--custom-generate-function-path` extension points; the integration patch in
-  `nla/miles_patches/` adds `--custom-actor-cls-path` and `--force-use-critic`
-  on top (see [docs/design.md §2](docs/design.md)).
-- **[SGLang](https://github.com/sgl-project/sglang)** — rollout serving. We
-  send `input_embeds` (not `input_ids`) so the AV sees the injected vector;
-  SGLang serves it like any other request. The embed sequence is built on the
-  **trainer side** — we look up the prompt tokens in the actor's own embedding
-  table, splice the activation vector in at the injection slot, and ship the
-  finished `[seq, d]` tensor over HTTP. SGLang never needs to know what an
-  injection is. We don't apply any learned map to the injected vector in this
-  work — it goes in raw (after a fixed scalar `injection_scale`) — but this
-  design means a future affine `W·v + b` adapter would be a trainer-side-only
-  change: apply it before sending, no SGLang modification required. (vLLM also
-  supports `input_embeds` and would work as a drop-in alternative.)
-
-We chose this stack because it is **near-frontier training infrastructure**:
-Miles + Megatron is what production-scale RL post-training looks like, and
-hooking onto it cleanly is what let us scale to RL-ing a 70B-parameter AV — and
-likely further. The `nla/` package never modifies Miles or SGLang in place; it
-only subclasses and registers function-pointer hooks, so upstream updates pull
-in cleanly.
-
----
-
-## Quick start
-
-### Inference (use a released checkpoint)
-
-```bash
-uv pip install torch transformers safetensors httpx orjson pyyaml numpy
-uv pip install "sglang[all]>=0.5.6"
-
-python -m sglang.launch_server --model-path kitft/nla-qwen2.5-7b-L20-av \
-    --port 30000 --disable-radix-cache &
-
-python nla_inference.py kitft/nla-qwen2.5-7b-L20-av \
-    --sglang-url http://localhost:30000 \
-    --parquet path/to/activations.parquet
-```
-
-Don't have a parquet yet? Any file with an `activation_vector` column of
-`d_model`-wide float lists will do — here's a minimal one for Qwen layer 20:
-
-```python
-import torch, pyarrow as pa, pyarrow.parquet as pq
-from transformers import AutoModelForCausalLM, AutoTokenizer
-tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
-m = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-7B-Instruct",
-        torch_dtype=torch.bfloat16, device_map="cuda")
-ids = tok("The quick brown fox jumps over the lazy dog.", return_tensors="pt").to("cuda")
-hs = m(**ids, output_hidden_states=True).hidden_states[20][0]  # [seq, 3584]
-pq.write_table(pa.table({"activation_vector": hs.float().cpu().tolist()}), "demo.parquet")
-```
-
-(Or omit `--parquet` entirely for a smoke test on a random unit vector.)
-
-`nla_inference.py` is a single self-contained file. The full recipe —
-model-specific scale factors, the Gemma `√d` embed-scale gotcha, debugging the
-"output is in Chinese" failure mode, AR scoring — is in
-**[docs/inference.md](docs/inference.md)**.
-
-### Training (reproduce Qwen3-8B end-to-end)
-
-Install Miles + this package per **[docs/setup.md](docs/setup.md)**, then run
-the four stages. Full recipe + tuning notes in
-**[docs/qwen3_8b_run.md](docs/qwen3_8b_run.md)**.
-
-```bash
-# 0. Generate data — 100k FineFineWeb docs + Sonnet 4.6 judges via Anthropic Batches API
-sbatch launch/sbatch_datagen.sh
-
-# 1. AV SFT (Karvonen layer-1 ADD norm-matched injection, our preferred variant)
-sbatch launch/sbatch_av_sft_karvonen.sh
-
-# 2. AR SFT (frozen-value-head variant — fixes the bf16+Adam NaN that hit step ~29 8+ times)
-sbatch launch/sbatch_prepare_critic.sh
-sbatch launch/sbatch_ar_safe.sh
-
-# 3. RL: self-contained GRPO with co-trained AR, rsLoRA r=128 actor (single GPU, paper-faithful)
-sbatch launch/sbatch_rl_long.sh
-```
-
-The full design — data transport through Miles' `multimodal_train_inputs`, the
-injection forward-hook, simultaneous AV/AR scheduling — is in
-**[docs/design.md](docs/design.md)**. Profiling and hyperparameter notes are in
-[`configs/TRAINING_NOTES.md`](configs/TRAINING_NOTES.md) (Qwen2.5-7B reference)
-and [`docs/qwen3_8b_run.md`](docs/qwen3_8b_run.md) (Qwen3-8B, this fork).
-
----
+Upstream's four-model release (Qwen2.5-7B, Gemma-3-12B/27B, Llama-3.3-70B)
+lives at [`kitft/nla-models`](https://huggingface.co/collections/kitft/nla-models) on the HF Hub.
 
 ## Repo layout
 
 ```
-nla/                            core package
-  schema.py, config.py, models.py     — sidecar contract, NLACriticModel (AR)
-  injection.py                        — Karvonen ADD norm-matched residual injection
-  train_actor.py                      — NLAFSDPActor (Miles FSDP subclass, AV+AR SFT)
-  train_rl_self_contained.py          — single-GPU GRPO with co-trained AR (new in fork)
-  rollout/                            — SFT rollout helpers
-  loss.py                             — AR MSE loss
-  datagen/                            — 4-stage activation → parquet pipeline
-configs/                        training shell configs + datagen YAMLs
-  actor_sft.sh, critic_sft.sh         — Miles+FSDP SFT entry points
-  TRAINING_NOTES.md                   — Qwen2.5-7B profiling + LR scan
-launch/                         sbatch wrappers + repro scripts (Qwen3-8B path)
-scripts/                        multi-GPU launch wrappers (datagen)
-tools/                          FSDP-DCP → HF checkpoint converter
-docs/                           design.md, inference.md, qwen3_8b_run.md
-nla_inference.py                standalone single-file inference client
+nla/
+  train_sft.py                  ← --mode {av,ar} SFT trainer (single file, ~555 LOC)
+  train_rl_self_contained.py    ← GRPO with HF generate (primary RL path)
+  train_rl_vllm.py              ← GRPO with vLLM rollout + TRL-style weight broadcast (alternate)
+  injection.py                  ← Karvonen ADD norm-matched residual injection
+  models.py                     ← NLACriticModel (truncated K+1 + value_head)
+  schema.py, config.py          ← sidecar contract (token IDs, prompt templates, scales)
+  arch_adapters.py, storage.py
+  datagen/                      ← 5-stage activation → parquet pipeline (extract → split → judge → join → build)
+scripts/
+  sbatch_datagen.sh             ← Stage 0–3: build the SFT/RL parquets from FineFineWeb
+  sbatch_av_sft.sh, sbatch_ar_sft.sh   ← SFT entry points
+  sbatch_rl_long.sh             ← GRPO RL entry point
+  sbatch_rl_vllm.sh             ← alternate vLLM-rollout RL
+  sbatch_eval_post_rl.sh + eval_post_rl.py   ← held-out reconstruction reward
+  compute_fve_baseline.py       ← reward → FVE conversion (predict-the-mean baseline)
+  verify_lora_disable_eq_sft.py ← test: peft.disable_adapter() == fresh AV-SFT load
+  upload_dataset.py             ← publish Stage-3 parquets to HF Hub
+configs/datagen/                ← Qwen3-8B YAMLs (100k / 10k / quick-test)
+configs/TRAINING_NOTES.md       ← profiling + LR scan notes (mostly Qwen2.5-7B reference)
+nla_inference.py                ← standalone single-file inference client
+CLAUDE.md                       ← codebase-specific notes for AI assistants
+```
+
+## Reproduction (Qwen3-8B end-to-end)
+
+Assumes single H200 (141 GB) per stage. Cluster paths assume
+`/workspace-vast/celeste/nla-experiments/`.
+
+### 0. Data generation
+
+```bash
+sbatch scripts/sbatch_datagen.sh
+# 100k FineFineWeb docs → Stage 0 (Qwen3-8B layer 24 activations)
+# → Stage 1 (25% AV / 25% AR / 50% RL doc-level split)
+# → Stage 2 (Sonnet 4.6 judges via Anthropic Batches API)
+# → Stage 3 (av_train, av_val, ar_sft_shuf_clean, rl_shuf parquets)
+# ~12h, ~$80 in batch-API tokens (one-time)
+```
+
+### 1. AV (Activation Verbalizer) SFT
+
+```bash
+sbatch scripts/sbatch_av_sft.sh
+# Qwen3-8B base + Karvonen layer-1 injection hook.
+# bf16 + AdamW8bit + FA2 + gradient checkpointing, batch=64.
+# Cross-entropy on response tokens only. ~1.5h for 1000 steps on 1× H200.
+# Writes HF format directly to qwen3_8b_L24_av_sft/iter_NNNNNNN/.
+```
+
+### 2. AR (Activation Reconstructor) SFT
+
+```bash
+sbatch scripts/sbatch_ar_sft.sh
+# NLACriticModel = Qwen3-8B truncated to K+1=25 layers + Linear(d, d) value_head.
+# Truncation happens in-script; identity-init the value head (critical — see notes).
+# bf16 + AdamW8bit + SDPA, batch=64, no grad ckpt. ~50min on 1× H200.
+# pred = value_head(normalize(backbone_last_hidden, mse_scale)).
+# Loss = MSE on L2-normalised (pred, gold) at last token position.
+```
+
+### 3. GRPO RL
+
+```bash
+sbatch scripts/sbatch_rl_long.sh
+# Single GPU. B=16 prompts × G=16 group samples = 256 rollouts/step.
+# rsLoRA r=128 actor (122M trainable) on q/k/v/o; reference policy via
+# peft.disable_adapter() (verified bit-identical to fresh AV-SFT load).
+# Co-trained AR backbone+value_head (LR 5e-5).
+# KL β=0.01 against AV-SFT init, PPO clip 0.2, k3 KL estimator.
+# Reward = -mse_nrm on L2-normalised vectors (paper's monotonic-transform default).
+# ~25h for 1000 steps. Saves LoRA every 100 steps.
+```
+
+### 4. Post-RL evaluation
+
+```bash
+sbatch scripts/sbatch_eval_post_rl.sh
+# 128 prompts from rl_shuf rows past the training cursor (doc-disjoint
+# from av_train AND past the trainer's --max-rows). Pre-RL vs post-RL
+# reconstruction reward + extraction rate.
+# Convert reward to FVE: python scripts/compute_fve_baseline.py ...
 ```
 
 ## Datasets
 
-The Qwen3-8B pipeline in this fork uses:
-
 | stage | dataset | size | location |
 |---|---|---|---|
-| **Corpus** | [`m-a-p/FineFineWeb`](https://huggingface.co/datasets/m-a-p/FineFineWeb) (67 domains, ~10TB) | sample 100k docs | public on HF Hub |
-| **Stage 0 — activations** | 1.4M (doc, position, residual-stream activation @ Qwen3-8B layer 24) tuples | ~16 GB | regenerable via `launch/sbatch_datagen.sh` |
-| **Stage 3 — SFT/RL parquets** | `av_train`, `av_val`, `ar_sft_shuf_clean`, `rl_shuf` (with Sonnet 4.6 explanations) | ~4 GB | regenerable; upload script at `launch/upload_dataset.py` for HF publishing |
+| Corpus | [`m-a-p/FineFineWeb`](https://huggingface.co/datasets/m-a-p/FineFineWeb) | 100k docs sample | public HF Hub |
+| Stage 0 — activations | 1.4M (doc, position, Qwen3-8B layer-24 activation) tuples | ~16 GB | regenerable via `sbatch scripts/sbatch_datagen.sh` |
+| Stage 3 — SFT/RL parquets | `av_train`, `av_val`, `ar_sft_shuf_clean`, `rl_shuf` w/ Sonnet 4.6 explanations | ~4 GB | regenerable; `scripts/upload_dataset.py` to publish to HF |
 
-Stage 1 (doc-level 25/25/50 split into AV/AR/RL) and Stage 2 (Sonnet judging
-via the Anthropic Batches API) are deterministic given the corpus + seed.
-Regenerate from FineFineWeb with `launch/sbatch_datagen.sh` (requires
-`ANTHROPIC_API_KEY_BATCH`; ~12h, ~$80 in batch-API tokens). After Stage 3,
-`python launch/upload_dataset.py --repo <your-hf-org>/nla-qwen3-8b-stage3`
-publishes the SFT/RL parquets to HF Hub for re-use.
+## Paper-faithful invariants
 
----
+- **GRPO advantage**: per-prompt group baseline `A_ij = (r_ij − μ_j) / σ_j`
+- **Clipped surrogate**: `min(r·A, clip(r, 1±ε)·A)` with ε=0.2
+- **KL estimator**: Schulman k3 — `exp(δ) − δ − 1` where `δ = ref_lp − new_lp`
+- **KL anchor = AV-SFT init**: implemented via `peft.disable_adapter()` (verified
+  bit-identical to a freshly-loaded AV-SFT checkpoint — see
+  `scripts/verify_lora_disable_eq_sft.py`)
+- **Reward = `-MSE(normalize(pred), normalize(gold))`**: range `[-2.0, 0]`,
+  with `-2.0` as the FAILED-extraction floor (= MSE of orthogonal unit vectors)
+- **Per-doc keyed RNG** in stage 0 — `(seed, doc_id) → same sampled positions`
+  regardless of chunk boundaries or process count, so multi-GPU sharding is
+  bit-reproducible
+
+## Documented deviations from the paper
+
+1. **LoRA actor (rsLoRA r=128, α=16) instead of full 8B fine-tune** for RL.
+   Paper does full FT on 2× H100. Verified invariant: `disable_adapter()` is
+   bit-identical to a fresh AV-SFT load, so the KL anchor exactly equals
+   `D_KL(AV_φ ‖ AV_φ_init)`.
+
+2. **AR `value_head` sees normalised input.** Paper does
+   `pred = value_head(backbone_last_hidden)` directly. We do
+   `pred = value_head(normalize(backbone_last_hidden, mse_scale))`. At
+   identity init the two are equivalent. The normalize-before form bounds
+   value_head's input norm so bf16+Adam can't blow up its output. Upstream
+   works around the same numerical issue with FP32 master weights in Miles'
+   FSDP setup — we use AdamW8bit and need the architectural guard.
+
+3. **Smaller effective batch.** Paper RL: 128 × 4 = 512 / step. Ours: 16 × 16
+   = 256 / step. Larger G gives lower-variance per-prompt advantage.
+
+4. **HF `generate()` for rollout** (default) or vLLM with TRL-style colocate
+   weight broadcast (alternate). Paper uses SGLang `input_embeds`. We
+   benchmark vLLM at TP=4 with ~50% PPO clip frac at step 0 from kernel
+   mismatch — usable but not strictly better than HF generate here. The
+   HF-generate path is what produced our headline 71.8% FVE result.
+
+## Key invariants for future agents
+
+- **Data-gen NEVER normalises** — Stage 3 parquets store raw `activation_vector`
+  with `norm="none"` in the sidecar. Normalisation happens at injection time
+  (`injection_scale`) and at loss time (`mse_scale`). Never on data load.
+- **Stage-1 split is DOC-LEVEL** — partition by unique `doc_id`. Every row
+  from the same doc lands in the same bucket. Never split positions across
+  AV / AR / RL.
+- **Stage-0 `_MIN_POSITION = 50`** — earlier positions decode to noise.
+- **Critic extraction is suffix-anchored** — no scan, no marker token. The
+  critic prompt ends with a fixed suffix (e.g. `... <summary>`); training and
+  inference extract at `tokens[-1]`. The sidecar's `critic_suffix_ids` is for
+  sanity-checking only.
+- **Per-doc keyed RNG** — `(seed, doc_id)` → same sampled positions regardless
+  of process count or chunk boundaries. Bit-reproducible multi-GPU stage 0.
+- **`cp_size == 1` only.** Context-parallel splits each sample across ranks
+  and breaks the marker-neighbor check. NLA sequences are short; CP buys
+  nothing.
+- **Sidecar is the contract.** Token IDs, prompt templates, `injection_scale`,
+  `mse_scale`, `d_model` — all loaded from `nla_meta.yaml` and asserted
+  against the live tokenizer at startup. Never hardcode them.
+
+## Debugging
+
+If injection silently fails, the actor sees the literal CJK marker char (`㈎`)
+and free-associates Chinese. **Grep generated text for CJK** — loudest smoke
+test for the entire injection path.
 
 ## Citation
 
-For attribution in academic contexts, please cite this work as
-
-> Fraser-Taliente, Kantamneni, Ong et al., "Natural Language Autoencoders Produce Unsupervised Explanations of LLM Activations", Transformer Circuits, 2026.
+If you use this code or the released checkpoints, cite the original paper:
 
 ```bibtex
 @article{frasertaliente2026nla,
