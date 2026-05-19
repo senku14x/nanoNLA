@@ -9,4 +9,4 @@
 #SBATCH --output=/workspace-vast/celeste/nla-experiments/logs/%x_%j.out
 
 mkdir -p /workspace-vast/celeste/nla-experiments/logs
-bash /workspace-vast/celeste/nla-experiments/launch/run_datagen.sh
+bash /workspace-vast/celeste/nla-experiments/scripts/run_datagen.sh

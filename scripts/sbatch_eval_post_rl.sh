@@ -19,7 +19,7 @@ DATA=/workspace-vast/celeste/nla-data/qwen3_8b_finefineweb_100k
 
 cd /workspace-vast/celeste/nla-experiments
 
-python launch/eval_post_rl.py \
+python scripts/eval_post_rl.py \
   --av-ckpt /workspace-vast/celeste/nla-ckpts/qwen3_8b_L24_av_sft_karvonen/iter_0001000/hf \
   --ar-ckpt /workspace-vast/celeste/nla-ckpts/qwen3_8b_L24_ar_sft_safe/iter_0001000/hf \
   --rl-lora /workspace-vast/celeste/nla-ckpts/qwen3_8b_L24_rl_grpo_overnight/iter_000250 \
