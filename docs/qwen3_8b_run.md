@@ -126,6 +126,13 @@ algorithmic side:
    `peft.disable_adapter()` — no second model copy, no weight-sync.
    Actor LR bumped 1e-6 → 1e-5 (LoRA wants higher than full-FT).
 
+   **Verified invariant**: forward with `disable_adapter()` is bit-identical
+   to a freshly-loaded AV-SFT checkpoint (max abs diff over Qwen3-8B output
+   logits = 0.0, not noise-close — literally zero). Test script:
+   `launch/verify_lora_disable_eq_sft.py`. So `D_KL(AV_φ ‖ disable_adapter)`
+   is exactly the paper's `D_KL(AV_φ ‖ AV_φ_init)`. Re-run after any peft /
+   transformers version bump.
+
 2. **AR critic: `value_head` sees normalized input.** The paper does
    `pred = value_head(backbone_last_hidden)` directly. We do
    `pred = value_head(normalize(backbone_last_hidden, mse_scale))`. At
