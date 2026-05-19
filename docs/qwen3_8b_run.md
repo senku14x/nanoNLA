@@ -117,29 +117,49 @@ algorithmic side:
 | clipped surrogate (PPO-style) | `--clip-eps 0.2` + min(ratio·A, clip(ratio,1±ε)·A) | importance-ratio clip |
 | FAILED extraction → `-2.0` | `-2.0` for missing `<explanation>` | reward floor matches `nla/reward.py` |
 
-### Deviations (memory / single-GPU constraint)
+### Deviations from the paper
 
-1. **LoRA actor (r=16) instead of full 8B fine-tune.** Paper does full FT on
-   2× H100. We allocate 1× H200 here. Trainable params: 15.3M (0.19% of
-   total). The reference policy is the same model with the LoRA adapter
-   disabled via `peft`'s `disable_adapter()` context manager — no separate
-   model copy, no weight-sync.
+1. **LoRA actor (rsLoRA r=128, α=16) instead of full 8B fine-tune.** Paper
+   does full FT on 2× H100. We use LoRA with rsLoRA scaling on q/k/v/o
+   projections (~123M trainable, 1.48% of total). The reference policy for
+   the KL anchor is the same model with the LoRA adapter disabled via
+   `peft.disable_adapter()` — no second model copy, no weight-sync.
+   Actor LR bumped 1e-6 → 1e-5 (LoRA wants higher than full-FT).
 
-2. **Frozen AR critic instead of co-trained.** Paper co-trains the AR
-   alongside the actor so the reward model adapts to the new actor
-   distribution. Frozen AR is safer for a short run but risks the actor
-   finding adversarial explanations the static critic decodes well. We
-   mitigate with (a) a short run (~250 steps), and (b) a tighter KL leash
-   relative to a co-trained-AR setup.
+2. **AR critic: `value_head` sees normalized input.** The paper does
+   `pred = value_head(backbone_last_hidden)` directly. We do
+   `pred = value_head(normalize(backbone_last_hidden, mse_scale))`. At
+   identity init the two are equivalent (the loss re-normalizes anyway), but
+   our variant bounds value_head's input norm. Without it, the bf16+Adam
+   stack on a near-identity value_head NaN'd AR SFT 8+ times in a row
+   (tiny weight updates kicking pred-norm by 100×, breaking the
+   normalize-then-MSE pipeline). The paper repo uses FP32 master weights
+   in Miles' FSDP setup which works around the same issue differently —
+   we work in 8-bit Adam to fit on one GPU, so we need the architectural
+   guard.
 
-3. **Smaller effective batch.** Paper: 128 prompts × 4 samples = 512 / step.
-   Ours: 8 × 4 = 32 / step. More noise per step but quicker to iterate.
+3. **Co-trained AR (paper-faithful).** Earlier single-GPU runs froze the AR
+   to avoid complexity; current runs co-train it (per `configs/rl.sh`)
+   simultaneously with the AV on the same explanations. Backbone +
+   `value_head` both train against MSE; critic LR = 5e-5
+   (TRAINING_NOTES.md scan winner).
 
-4. **HF `generate()` for rollout instead of SGLang `input_embeds`.** Paper's
+4. **Smaller effective batch.** Paper: 128 prompts × 4 samples = 512 / step.
+   Ours: 16 × 16 = 256 / step. Larger G gives lower-variance per-prompt
+   advantage; smaller B per step → fewer prompts/sec.
+
+5. **HF `generate()` for rollout instead of SGLang `input_embeds`.** Paper's
    `rl.sh` uses a forked SGLang server for high-throughput batched rollout
    with injection. We use plain `transformers` `generate()` with the Karvonen
    hook registered on layer 1. ~5× slower per step but no infra to wire up,
-   no off-policy weight-sync drift.
+   no off-policy weight-sync drift. A vLLM-rollout variant
+   (`nla/train_rl_vllm.py`) exists with TRL-style colocate weight broadcast
+   + TIS, but kernel mismatch between vLLM and HF produced 41% PPO-clip
+   fraction at step 0 in practice — kept as documented alternate, not the
+   default.
+
+6. **Truncated Importance Sampling cap (vLLM path only).** Only relevant if
+   you use `nla/train_rl_vllm.py`. Standard path doesn't need it.
 
 ## What went wrong + the fixes
 
