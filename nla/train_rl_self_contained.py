@@ -550,6 +550,19 @@ def main():
     p.add_argument("--wandb-name", default=None)
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--external-evals", default="",
+        help="Comma-sep list of evals/ IDs to run every --eval-every step "
+             "(e.g. 'hallucination,karvonen_confusion'). Empty = none.",
+    )
+    p.add_argument("--eval-n-hallucination", type=int, default=40,
+                   help="N held-out prompts for hallucination eval.")
+    p.add_argument("--eval-n-karvonen", type=int, default=97,
+                   help="N records (out of 97 filtered) for karvonen_confusion eval.")
+    p.add_argument("--judge-key-env", default="ANTHROPIC_API_KEY_FALLBACK",
+                   help="Env var holding the judge API key (default: high-prio).")
+    p.add_argument("--judge-concurrency", type=int, default=32,
+                   help="Parallel judge calls (Anthropic sync, NOT batch API).")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -715,34 +728,102 @@ def main():
     rng.shuffle(pending_idxs)
     cursor = 0
 
-    # ---- Fixed held-out eval prompts (disjoint from training rows + doc-disjoint
-    # from av_train by construction of rl_shuf). Re-streams from parquet so it
-    # doesn't share memory with the train rows.
+    # ---- Fixed held-out eval prompts, DOC-DISJOINT from training rows.
+    # Stage-1 only guarantees disjointness BETWEEN av_sft/ar_sft/rl FILES;
+    # within rl_shuf.parquet, rows past --eval-skip-rows can share doc_id
+    # with rows before it (the file is row-shuffled, not doc-partitioned
+    # internally). Without explicit filtering we measured ~50% doc-overlap.
+    # Fix: scan training-window (rows 0..eval_skip_rows) to collect doc_ids,
+    # then take eval rows past the cursor whose doc_id is NOT in that set.
     eval_rows = []
     if args.eval_every > 0 and args.eval_n_prompts > 0:
         import pyarrow.parquet as _pq
         _pf = _pq.ParquetFile(args.rl_parquet)
+        # Pass 1: training-window doc_ids
+        _train_doc_ids: set = set()
+        _seen = 0
+        for _rg_idx in range(_pf.num_row_groups):
+            if _seen >= args.eval_skip_rows:
+                break
+            _rg = _pf.read_row_group(_rg_idx, columns=["doc_id"])
+            _ids = _rg.column("doc_id").to_pylist()
+            _nrg = len(_ids)
+            _take = min(_nrg, args.eval_skip_rows - _seen)
+            _train_doc_ids.update(_ids[:_take])
+            _seen += _nrg
+        # Pass 2: doc-disjoint rows past the cursor
         _seen = 0
         for _rg_idx in range(_pf.num_row_groups):
             if len(eval_rows) >= args.eval_n_prompts:
                 break
-            _rg = _pf.read_row_group(_rg_idx, columns=["prompt", "activation_vector"])
+            _rg = _pf.read_row_group(
+                _rg_idx, columns=["prompt", "activation_vector", "doc_id"],
+            )
             _n = _rg.num_rows
             if _seen + _n <= args.eval_skip_rows:
                 _seen += _n
                 continue
             _start = max(0, args.eval_skip_rows - _seen)
-            _seen += _start
-            _take = min(args.eval_n_prompts - len(eval_rows), _n - _start)
-            _rg = _rg.slice(_start, _take)
-            for _p, _a in zip(
-                _rg.column("prompt").to_pylist(),
-                _rg.column("activation_vector").to_pylist(),
-            ):
-                eval_rows.append({"prompt": _p, "activation": _a})
-        print(f"[eval] {len(eval_rows)} fixed prompts loaded (rows from "
-              f"{args.eval_skip_rows}, doc-disjoint from training)", flush=True)
+            _prompts = _rg.column("prompt").to_pylist()
+            _acts = _rg.column("activation_vector").to_pylist()
+            _dids = _rg.column("doc_id").to_pylist()
+            for _i in range(_start, _n):
+                if _dids[_i] in _train_doc_ids:
+                    continue
+                eval_rows.append({"prompt": _prompts[_i], "activation": _acts[_i]})
+                if len(eval_rows) >= args.eval_n_prompts:
+                    break
+            _seen += _n
+        print(f"[eval] {len(eval_rows)} doc-disjoint prompts loaded "
+              f"(rows past {args.eval_skip_rows}, excluding "
+              f"{len(_train_doc_ids)} training doc_ids)", flush=True)
     eval_table_data = []  # accumulates [step, idx, reward, fve, extracted, explanation]
+
+    # ---- External evals (evals/ pluggable, run every --eval-every step) ----
+    # Reuses the trainer's `vectors_ref` so each eval shares the injection hook
+    # already attached to the actor (no stacked hooks, no extra Qwen3-8B load).
+    # Judge calls go through ANTHROPIC_API_KEY_FALLBACK (high-prio) in a
+    # ThreadPoolExecutor — see evals/base.py.
+    external_evals = []
+    if args.external_evals.strip():
+        if not os.environ.get(args.judge_key_env):
+            raise RuntimeError(
+                f"--external-evals requires ${args.judge_key_env} to be set "
+                f"(judge API key for Sonnet 4.6). See CLAUDE.md."
+            )
+        # Side-effect imports register the eval classes via @register decorator.
+        import evals.hallucination  # noqa: F401
+        import evals.karvonen_confusion  # noqa: F401
+        from evals.base import EvalConfig
+        from evals.registry import get_eval
+
+        n_samples_for = {
+            "hallucination": args.eval_n_hallucination,
+            "karvonen_confusion": args.eval_n_karvonen,
+        }
+        for eid in [s.strip() for s in args.external_evals.split(",") if s.strip()]:
+            ev_cfg = EvalConfig(
+                output_dir=save_dir / "eval_runs",
+                n_samples=n_samples_for.get(eid, 40),
+                seed=args.seed,
+                eval_skip_rows=args.eval_skip_rows,
+                parquet_path=args.rl_parquet,
+                judge_model="claude-sonnet-4-6",
+                judge_temperature=0.0,
+                judge_max_concurrency=args.judge_concurrency,
+                anthropic_api_key_env=args.judge_key_env,
+            )
+            ev_cls = get_eval(eid)
+            ev = ev_cls(ev_cfg)
+            ev.setup(actor, critic, tokenizer, cfg, device,
+                     shared_vectors_ref=vectors_ref)
+            external_evals.append(ev)
+            print(f"[external eval] {eid} ready (n={ev_cfg.n_samples}, "
+                  f"judge={ev_cfg.judge_model}, key=${args.judge_key_env})",
+                  flush=True)
+
+    # History for the multi-line Pareto chart.
+    pareto_history: list[dict] = []
 
     for step in range(args.start_step, args.num_steps):
         t0 = time.time()
@@ -1044,6 +1125,54 @@ def main():
                         f"    [eval@{step} idx={_ei} r={_r['reward']:.3f}] {_expl}",
                         flush=True,
                     )
+
+            # ---- External evals (hallucination, karvonen_confusion, …) ----
+            # Each eval reuses `actor` + `vectors_ref`, so no extra GPU load.
+            # Judge calls are parallelised inside each eval's evaluate().
+            for ev in external_evals:
+                try:
+                    result = ev.evaluate(step)
+                    for k, v in result.metrics.items():
+                        log[f"eval/{ev.id}/{k}"] = v
+                    if not args.no_wandb and result.table_rows:
+                        cols = list(result.table_rows[0].keys())
+                        log[f"eval/{ev.id}/rollouts"] = wandb.Table(
+                            columns=cols,
+                            data=[[r[c] for c in cols] for r in result.table_rows],
+                        )
+                except Exception as _ev_err:
+                    print(f"[external eval {ev.id}@{step}] FAILED: "
+                          f"{type(_ev_err).__name__}: {_ev_err}", flush=True)
+
+            # ---- Pareto chart: FVE (capability) vs hallucinations (faithful-
+            # ness) vs Karvonen captures-quirk (depth) on a shared X-axis.
+            # Tells you at a glance whether RL is buying capability at the
+            # cost of faithfulness or whether it's Pareto-improving.
+            pareto_history.append({
+                "step": step,
+                "fve_pct": float(log.get("eval/fve_pct", float("nan"))),
+                "halluc_x10": float(log.get(
+                    "eval/hallucination/hallucinations_mean", float("nan"))) * 10.0,
+                "captures_quirk_pct": float(log.get(
+                    "eval/karvonen_confusion/captures_quirk_rate", float("nan"))) * 100.0,
+                "clean_rate_pct": float(log.get(
+                    "eval/hallucination/clean_rate", float("nan"))) * 100.0,
+            })
+            if not args.no_wandb and len(pareto_history) >= 2:
+                _xs = [h["step"] for h in pareto_history]
+                log["pareto/capability_vs_faithfulness"] = wandb.plot.line_series(
+                    xs=_xs,
+                    ys=[
+                        [h["fve_pct"] for h in pareto_history],
+                        [h["halluc_x10"] for h in pareto_history],
+                        [h["captures_quirk_pct"] for h in pareto_history],
+                        [h["clean_rate_pct"] for h in pareto_history],
+                    ],
+                    keys=["FVE %", "hallucinations × 10",
+                          "captures_quirk %", "clean_rate %"],
+                    title="Capability vs faithfulness (shared X = step)",
+                    xname="step",
+                )
 
         if not args.no_wandb:
             wandb.log(log, step=step)

@@ -30,6 +30,7 @@ from nla.config import load_nla_config
 from nla.injection import karvonen_inject_in_residual
 from nla.models import NLACriticModel
 from nla.schema import EXPLANATION_RE, normalize_activation, resolve_target_scale
+from nla.train_rl_self_contained import critic_predict
 
 
 def cjk_frac(text):
@@ -118,9 +119,12 @@ def generate_and_score(actor, critic, tokenizer, rows, cfg, mse_scale_f, device,
             crit_ids = tokenizer.encode(crit_text, add_special_tokens=False)
             if len(crit_ids) <= 1024:
                 x = torch.tensor([crit_ids], dtype=torch.long, device=device)
+                # MUST match how the critic was trained: normalize-before-value_head
+                # (`critic_predict()`). The earlier raw `critic(...).values[0, -1]`
+                # path bypasses the normalization and was reporting numbers off
+                # the surface the critic actually learned.
                 with torch.no_grad():
-                    cout = critic(input_ids=x)
-                pred = cout.values[0, -1].float()
+                    pred = critic_predict(critic, x, None, mse_scale_f)[0]
                 gold = activation[0].float()
                 pn = normalize_activation(pred.unsqueeze(0), mse_scale_f)[0]
                 gn = normalize_activation(gold.unsqueeze(0), mse_scale_f)[0]
