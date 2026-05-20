@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -108,15 +109,41 @@ def _build_filter_user(behavior: str, finding: str, rollouts: list[str]) -> str:
     return "\n".join(parts)
 
 
+def _anthropic_call_with_retry(client: Anthropic, *, retries: int = 5,
+                                 base_delay: float = 4.0, **kwargs):
+    """Retry on 529 overloaded / 429 rate-limit / transient network errors with
+    exponential backoff + jitter. Lets a transient API blip not silently drop
+    a real quirk."""
+    for attempt in range(retries + 1):
+        try:
+            return client.messages.create(**kwargs)
+        except Exception as e:
+            etype = type(e).__name__
+            # Retry on overload / rate-limit / 5xx; surface other errors.
+            retriable = etype in {
+                "OverloadedError", "RateLimitError", "APIStatusError",
+                "APITimeoutError", "APIConnectionError",
+            } or "429" in str(e) or "529" in str(e) or "overloaded" in str(e).lower()
+            if not retriable or attempt == retries:
+                raise
+            delay = base_delay * (2 ** attempt) + random.uniform(0, 2)
+            print(f"  [retry] {etype} on attempt {attempt+1}/{retries+1}, "
+                  f"sleeping {delay:.1f}s", flush=True)
+            time.sleep(delay)
+    raise RuntimeError("unreachable")  # for type-checker
+
+
 def _opus_filter(client: Anthropic, model_name: str,
                   behavior: str, finding: str, rollouts: list[str]) -> dict:
     """Stage 1 — single Opus call per prompt to decide keep/drop.
 
     Note: Opus 4.7 deprecated `temperature` (it's a reasoning model now),
     so we don't pass it. Default sampling is fine for a yes/no filter.
+    Retries on 529/429/transient to avoid losing real quirks to API blips.
     """
     try:
-        resp = client.messages.create(
+        resp = _anthropic_call_with_retry(
+            client,
             model=model_name, max_tokens=500,
             system=FILTER_SYSTEM,
             messages=[{"role": "user",
@@ -256,7 +283,8 @@ def _extract_layer_acts(model, tokenizer, full_ids: list[int], prompt_len: int,
 def _judge_one(client: Anthropic, model_name: str, temperature: float,
                user_msg: str, behavior: str, response: str) -> dict:
     try:
-        resp = client.messages.create(
+        resp = _anthropic_call_with_retry(
+            client,
             model=model_name, max_tokens=400, temperature=temperature,
             system=JUDGE_SYSTEM,
             messages=[{"role": "user",
