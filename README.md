@@ -1,5 +1,9 @@
 # nanoNLA
 
+<img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/2e6dc1c6-d998-4e57-807a-4ce4a5f288e2" />
+
+(enjoy gpt image 2.0 reading of this repo)
+
 This is a minimal reimplementatoin of [Natural Language Autoencoders Produce Unsupervised Explanations of LLM Activations](https://transformer-circuits.pub/2026/nla/index.html). 
 
 Starting from their [implementation](https://github.com/kitft/natural_language_autoencoders), I here share a minimal version that is sufficient to train NLAs on small models (no SGLang) and should lead to significantly reduced infra hassle.
