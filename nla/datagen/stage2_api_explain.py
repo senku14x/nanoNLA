@@ -14,6 +14,7 @@ chunk's API calls. At the end, chunks are concatenated into the output.
 """
 
 import argparse
+import json
 import re
 from dataclasses import replace
 from pathlib import Path
@@ -101,6 +102,39 @@ def _extract_and_clean(raw: str, pattern: str) -> str | None:
     return "\n\n".join(cleaned)
 
 
+def _check_chunks_fingerprint(chunks_dir: Path, fingerprint: dict) -> None:
+    """Guard chunk-resume against config/input drift.
+
+    Chunk files are keyed only by row offset, so resuming with a different
+    --chunk-size (rows silently dropped) or against a stale stage1 input
+    (mixed datasets) would corrupt the output without any error. The
+    fingerprint pins chunk_size + input identity; any mismatch is fatal.
+    """
+    fp_path = chunks_dir / "fingerprint.json"
+    if fp_path.exists():
+        existing = json.loads(fp_path.read_text())
+        mismatches = [
+            f"{k}: chunks dir was built with {existing.get(k)!r}, now {v!r}"
+            for k, v in fingerprint.items()
+            if existing.get(k) != v
+        ]
+        if mismatches:
+            raise RuntimeError(
+                f"{chunks_dir} does not match this run — resuming would silently "
+                "drop or mix rows:\n  " + "\n  ".join(mismatches)
+                + f"\nDelete {chunks_dir} to rebuild from scratch."
+            )
+        return
+    if any(chunks_dir.glob("chunk_*.parquet")):
+        print(
+            f"WARNING: {chunks_dir} contains chunk files but no fingerprint.json "
+            "(written by an older version) — cannot verify they match this run's "
+            f"--chunk-size and input. Delete {chunks_dir} if in doubt. Recording "
+            "fingerprint for future resumes."
+        )
+    fp_path.write_text(json.dumps(fingerprint, indent=2))
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--input", required=True, help="SL subset parquet from stage1")
@@ -141,6 +175,18 @@ def main() -> None:
     # restart; the API is never called twice for the same chunk.
     chunks_dir = Path(f"{args.output}.chunks")
     chunks_dir.mkdir(parents=True, exist_ok=True)
+
+    # Input size/mtime are cheap proxies for content identity. Local files
+    # only — under a non-local storage backend they stay None (path + row
+    # count are still checked).
+    input_stat = Path(args.input).stat() if Path(args.input).is_file() else None
+    _check_chunks_fingerprint(chunks_dir, {
+        "chunk_size": args.chunk_size,
+        "input": args.input,
+        "input_row_count": table.num_rows,
+        "input_size_bytes": input_stat.st_size if input_stat else None,
+        "input_mtime": input_stat.st_mtime if input_stat else None,
+    })
 
     def _process_chunk(chunk: pa.Table) -> tuple[pa.Table, int]:
         texts = chunk.column("detokenized_text_truncated").to_pylist()
