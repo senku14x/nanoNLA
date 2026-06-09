@@ -28,6 +28,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from nla.config import load_nla_config
 
 import evals.hallucination  # noqa: F401 — registers the eval
+import evals.karvonen_confusion  # noqa: F401 — registers the eval
 
 from .base import EvalConfig
 from .registry import REGISTRY, get_eval

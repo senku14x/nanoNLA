@@ -32,7 +32,7 @@ from anthropic import Anthropic
 from nla.injection import karvonen_inject_in_residual
 from nla.schema import EXPLANATION_RE, INJECT_PLACEHOLDER
 
-from ..base import Eval, EvalConfig, EvalResult, get_anthropic_key
+from ..base import Eval, EvalConfig, EvalResult, anthropic_call_with_retry, get_anthropic_key
 from ..registry import register
 
 
@@ -252,19 +252,35 @@ class HallucinationEval(Eval):
     def _judge_one(self, source: str, explanation: str) -> dict:
         """Returns {hallucinations: list[str], score: int|None, why: str}."""
         try:
-            resp = self._client.messages.create(
+            resp = anthropic_call_with_retry(
+                self._client,
                 model=self.cfg.judge_model,
-                max_tokens=600,  # higher to fit the hallucinations list
+                max_tokens=1000,  # truncation is the main cause of unparseable JSON
                 temperature=self.cfg.judge_temperature,
                 system=JUDGE_SYSTEM,
                 messages=[{"role": "user", "content": _build_judge_user(source, explanation)}],
             )
             text = resp.content[0].text.strip()
+            d = None
             try:
                 d = json.loads(text)
             except json.JSONDecodeError:
                 m = re.search(r"\{.*\}", text, re.DOTALL)
-                d = json.loads(m.group(0)) if m else {}
+                if m:
+                    try:
+                        d = json.loads(m.group(0))
+                    except json.JSONDecodeError:
+                        d = None
+            if not isinstance(d, dict) or "hallucinations" not in d:
+                # Unparseable / truncated judge output is a judge FAILURE
+                # (n_hallucinations=None → lands in judge_failed), not a clean
+                # sample — falling back to {} would count it as 0 hallucinations.
+                return {
+                    "hallucinations": [],
+                    "n_hallucinations": None,
+                    "score": None,
+                    "why": f"judge output unparseable: {text[:80]}",
+                }
             halluc = d.get("hallucinations", [])
             if not isinstance(halluc, list):
                 halluc = []

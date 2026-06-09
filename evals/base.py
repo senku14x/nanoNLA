@@ -13,10 +13,14 @@ under eval_runs/<run_id>/<step>/<eval_id>.json for reproducibility).
 from __future__ import annotations
 
 import os
+import random
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import anthropic
 
 
 @dataclass
@@ -70,6 +74,31 @@ class Eval(ABC):
 
     def teardown(self) -> None:
         return None
+
+
+def anthropic_call_with_retry(client, *, max_retries: int = 5,
+                              base_delay: float = 2.0, **create_kwargs):
+    """`client.messages.create(**create_kwargs)` with exponential backoff +
+    jitter on transient API errors: 429 rate-limit, 5xx (incl. 529 overloaded),
+    and connection/timeout errors. Other errors (4xx) raise immediately;
+    transient errors re-raise once `max_retries` retries are exhausted."""
+    for attempt in range(max_retries + 1):
+        try:
+            return client.messages.create(**create_kwargs)
+        except anthropic.APIError as e:
+            transient = isinstance(e, (
+                anthropic.RateLimitError,       # 429
+                anthropic.InternalServerError,  # 500-599
+                anthropic.APIConnectionError,   # network (incl. APITimeoutError)
+            )) or (isinstance(e, anthropic.APIStatusError) and e.status_code >= 500)
+            if not transient or attempt == max_retries:
+                raise
+            delay = base_delay * (2 ** attempt) + random.uniform(0, 2)
+            print(f"  [retry] {type(e).__name__} on attempt "
+                  f"{attempt + 1}/{max_retries + 1}, sleeping {delay:.1f}s",
+                  flush=True)
+            time.sleep(delay)
+    raise RuntimeError("unreachable")  # for the type-checker
 
 
 def get_anthropic_key(env_name: str = "ANTHROPIC_API_KEY") -> str:

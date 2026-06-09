@@ -43,7 +43,7 @@ from transformers import AutoModelForCausalLM
 from nla.injection import karvonen_inject_in_residual
 from nla.schema import EXPLANATION_RE, INJECT_PLACEHOLDER
 
-from ..base import Eval, EvalConfig, EvalResult, get_anthropic_key
+from ..base import Eval, EvalConfig, EvalResult, anthropic_call_with_retry, get_anthropic_key
 from ..registry import register
 
 
@@ -307,7 +307,8 @@ class KarvonenConfusionEval(Eval):
 
     def _judge(self, behavior_summary: str, finding: str, explanation: str) -> dict:
         try:
-            resp = self._client.messages.create(
+            resp = anthropic_call_with_retry(
+                self._client,
                 model=self.cfg.judge_model,
                 max_tokens=300,
                 temperature=self.cfg.judge_temperature,
@@ -403,6 +404,9 @@ class KarvonenConfusionEval(Eval):
 
         valid = [r for r in results if isinstance(r["score"], int)]
         extracted = [r for r in results if r["explanation"]]
+        # Judge attempts = rows with an extracted explanation; a failure is an
+        # attempt that produced no valid score (API error / unparseable JSON).
+        judge_failed = [r for r in extracted if not isinstance(r["score"], int)]
         if valid:
             scores = [r["score"] for r in valid]
             metrics = {
@@ -420,6 +424,8 @@ class KarvonenConfusionEval(Eval):
             ]}
         metrics.update({
             "n_samples": float(len(results)),
+            "n_judged": float(len(valid)),  # denominator of captures_quirk_rate
+            "judge_fail_rate": float(len(judge_failed)) / max(1, len(extracted)) if extracted else 0.0,
             "extraction_rate": float(len(extracted)) / max(1, len(results)),
             "wall_s": time.time() - t0,
         })
@@ -452,6 +458,7 @@ class KarvonenConfusionEval(Eval):
         sm = metrics.get("score_mean", float("nan"))
         print(f"[karvonen_confusion@{step}] captures_quirk={cm:.0%} "
               f"score_mean={sm:.2f} ext={metrics['extraction_rate']:.0%} "
+              f"judge_fail={metrics['judge_fail_rate']:.0%} "
               f"t={metrics['wall_s']:.1f}s → {out_path}", flush=True)
 
         return EvalResult(eval_id=self.id, step=step, metrics=metrics,

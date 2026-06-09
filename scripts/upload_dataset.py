@@ -45,7 +45,8 @@ Each row contains:
   — 100k documents sampled across 67 domain subdirs for diversity (~1500 per domain).
 - **Base model**: [`Qwen/Qwen3-8B`](https://huggingface.co/Qwen/Qwen3-8B), layer 24
   (2/3 of the 36 layers).
-- **Activations**: raw `hidden_states[24]` at 10 random positions per document
+- **Activations**: the output of transformer block 24 (= HF `output_hidden_states`
+  index 25) at 10 random positions per document
   (positions ≥ 50 from start; doc-keyed RNG for reproducibility).
 - **Explanations**: Anthropic Claude Sonnet 4.6 via the [Message Batches
   API](https://docs.anthropic.com/en/docs/build-with-claude/batch-processing).
@@ -55,7 +56,7 @@ Each row contains:
 Each parquet ships a `<name>.nla_meta.yaml` sidecar with injection token IDs,
 prompt templates, and scale factors. Load via
 `nla.config.load_nla_config(parquet_path)` from
-[ceselder/natural_language_autoencoders](https://github.com/ceselder/natural_language_autoencoders).
+[ceselder/nanoNLA](https://github.com/ceselder/nanoNLA).
 
 ## License
 
