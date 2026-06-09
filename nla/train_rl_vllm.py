@@ -201,8 +201,14 @@ def rollout_batch_vllm(
             f"prompt {pi}: expected 1 marker (inj_id={inj_id}), got {len(marker_positions)}"
         )
         marker_pos = marker_positions[0]
+        # SHAPE MATTERS: activations must be 3-D [n_layers, n_positions, d].
+        # vllm-lens only honors position_indices for 3-D tensors; a 2-D
+        # [n_layers, d] tensor takes the BROADCAST branch in _worker_ext.py
+        # (_apply_steering) and gets ADDed at EVERY prompt + decode token,
+        # silently ignoring position_indices — rollouts then come from a
+        # globally-steered model the training forward never sees.
         sv = SteeringVector(
-            activations=activation.unsqueeze(0).cpu().float(),  # [1, d]
+            activations=activation.view(1, 1, -1).cpu().float(),  # [1, 1, d]
             layer_indices=[injection_layer],
             scale=1.0,
             norm_match=True,
@@ -239,18 +245,20 @@ def rollout_batch_vllm(
         # logprob (sometimes the sampled is the top-1, sometimes not).
         old_lp = []
         for t, tok_id in enumerate(gen_token_ids):
-            if out0.logprobs is None or t >= len(out0.logprobs):
-                old_lp.append(0.0)
-                continue
+            # With logprobs=1 vLLM always returns the SAMPLED token's logprob
+            # (plus top-1). If either lookup fails, something structural broke
+            # (vLLM version drift) — substituting 0.0 or the top-1 token's
+            # logprob would silently corrupt the importance ratio, so crash.
+            assert out0.logprobs is not None and t < len(out0.logprobs), (
+                f"vLLM returned no logprob for generated step {t} "
+                f"(len={0 if out0.logprobs is None else len(out0.logprobs)})"
+            )
             d = out0.logprobs[t]
-            # d is dict[token_id → Logprob]. Look up the sampled token's logprob.
-            if tok_id in d:
-                old_lp.append(float(d[tok_id].logprob))
-            else:
-                # Rare: sampled token's logprob not returned (only top-1 if other).
-                # Fall back to using top-1 logprob (≈ correct since temp=1 was active).
-                top_lp = next(iter(d.values())).logprob
-                old_lp.append(float(top_lp))
+            assert tok_id in d, (
+                f"sampled token {tok_id} missing from vLLM logprobs dict at "
+                f"step {t} (keys={list(d)[:5]}…) — vLLM API drift?"
+            )
+            old_lp.append(float(d[tok_id].logprob))
         full_ids = torch.tensor(
             list(out.prompt_token_ids) + gen_token_ids, dtype=torch.long,
         )
@@ -500,13 +508,20 @@ def grpo_update_microbatched(
     grad_norm = torch.nn.utils.clip_grad_norm_(
         [p for p in actor.parameters() if p.requires_grad], max_grad_norm,
     )
-    optim.step()
+    gn = grad_norm.item() if hasattr(grad_norm, "item") else float(grad_norm)
+    # Guard BEFORE stepping: clip_grad_norm_ does not sanitize nan/inf.
+    # Stepping Adam on non-finite grads corrupts moments AND weights.
+    if math.isfinite(gn):
+        optim.step()
+    else:
+        optim.zero_grad(set_to_none=True)
+        print(f"[grpo] non-finite grad norm ({gn}) — skipping optimizer step",
+              flush=True)
     metrics = {
         "kl_mean": float(np.mean(sample_kls_log)) if sample_kls_log else 0.0,
         "clip_frac": float(np.mean(sample_clipfrac_log)) if sample_clipfrac_log else 0.0,
     }
     mean_loss = float(np.mean(sample_losses_log)) if sample_losses_log else 0.0
-    gn = grad_norm.item() if hasattr(grad_norm, "item") else float(grad_norm)
     return mean_loss, gn, metrics
 
 
@@ -628,7 +643,7 @@ def main():
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--lora-r", type=int, default=128)
     p.add_argument("--lora-alpha", type=int, default=16)
-    p.add_argument("--use-rslora", action="store_true", default=True,
+    p.add_argument("--use-rslora", action=argparse.BooleanOptionalAction, default=True,
                    help="Use rsLoRA scaling (alpha/sqrt(r) instead of alpha/r). "
                         "Default ON because we use r=128 where vanilla LoRA's "
                         "alpha/r=0.125 collapses the effective learning rate.")
@@ -691,8 +706,23 @@ def main():
     device = "cuda"
     os.environ.setdefault("HF_HOME", "/workspace-vast/pretrained_ckpts")
 
+    # old_logp comes from vLLM's raw logprobs; the importance ratio is only a
+    # valid behavior-policy correction at temperature 1.0.
+    assert args.temperature == 1.0, (
+        f"--temperature {args.temperature} != 1.0: old_logp semantics depend "
+        f"on vLLM's logprobs_mode and won't match the sampling distribution."
+    )
+    if args.eval_every > 0 and args.eval_n_prompts > 0:
+        assert args.max_rows is not None and args.max_rows <= args.eval_skip_rows, (
+            f"evals enabled but --max-rows ({args.max_rows}) is unset or exceeds "
+            f"--eval-skip-rows ({args.eval_skip_rows}) — training would include "
+            f"the eval rows themselves."
+        )
+
     # ---- tokenizer + nla config ----
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+    # From the AV ckpt (train_sft saves the tokenizer alongside the model),
+    # NOT hardcoded — the sidecar asserts catch wrong-family drift.
+    tokenizer = AutoTokenizer.from_pretrained(args.av_ckpt)
     cfg = load_nla_config(args.sidecar, tokenizer)
     inj_id = cfg.injection_token_id
     left_id = cfg.injection_left_neighbor_id
@@ -805,7 +835,7 @@ def main():
     from vllm import LLM as VLLM
     llm = VLLM(
         model=args.av_ckpt,
-        tokenizer="Qwen/Qwen3-8B",
+        tokenizer=args.av_ckpt,
         dtype="bfloat16",
         gpu_memory_utilization=args.vllm_gpu_mem,
         max_model_len=args.vllm_max_len,
@@ -826,20 +856,23 @@ def main():
     print(f"[data] {len(rows)} rows", flush=True)
 
     # ---- FVE baseline: predict-the-mean MSE on this dataset ----
-    # FVE = 1 - mse_actual / baseline_mse. baseline = MSE between
-    # normalize(μ) and normalize(v_i), where μ = mean of activations.
-    # 0% = no better than constant prediction; 100% = perfect reconstruction.
-    # Paper's Qwen2.5-7B critic-SL alone hit FVE ≈ 37.5%.
+    # FVE = 1 - mse_actual / baseline_mse, with the PAPER's baseline:
+    # E[||v_norm - μ||²] (raw variance of the normalized distribution, ≈0.72).
+    # NOTE: runs before 2026-06-09 used the looser "meannorm" baseline
+    # MSE(v_norm, normalize(μ)) ≈0.94, inflating FVE vs the paper — old wandb
+    # curves are not comparable. Both are logged; `fve` uses the paper def.
+    from nla.schema import compute_predict_mean_baselines
     _act_stack = torch.tensor(
         [r["activation"] for r in rows[: min(len(rows), 4000)]],
         dtype=torch.float32,
     )
-    _mu = _act_stack.mean(dim=0, keepdim=True)
-    _mu_n = normalize_activation(_mu, mse_scale_f)
-    _act_n = normalize_activation(_act_stack, mse_scale_f)
-    fve_baseline = ((_mu_n - _act_n) ** 2).mean(dim=-1).mean().item()
-    del _act_stack, _act_n, _mu, _mu_n
-    print(f"[fve] predict-the-mean baseline mse_nrm = {fve_baseline:.4f}", flush=True)
+    fve_baseline_meannorm, fve_baseline = compute_predict_mean_baselines(
+        _act_stack, mse_scale_f,
+    )
+    del _act_stack
+    print(f"[fve] predict-the-mean baseline mse_nrm = {fve_baseline:.4f} "
+          f"(paper def; meannorm baseline = {fve_baseline_meannorm:.4f})",
+          flush=True)
 
     # ---- optimizer ----
     # 8-bit Adam (bitsandbytes) for both actor LoRA and critic — block-wise
@@ -869,33 +902,53 @@ def main():
     rng.shuffle(pending_idxs)
     cursor = 0
 
-    # ---- Fixed held-out eval prompts (disjoint from training rows + doc-disjoint
-    # from av_train by construction of rl_shuf). Re-streams from parquet so it
-    # doesn't share memory with the train rows.
+    # ---- Fixed held-out eval prompts, DOC-DISJOINT from training rows.
+    # rl_shuf.parquet is row-shuffled, not doc-partitioned internally: rows
+    # past --eval-skip-rows share doc_id with earlier rows ~50% of the time
+    # (measured — see train_rl_self_contained.py). Pass 1 collects training-
+    # window doc_ids; pass 2 takes only eval rows whose doc_id is unseen.
     eval_rows = []
     if args.eval_every > 0 and args.eval_n_prompts > 0:
         import pyarrow.parquet as _pq
         _pf = _pq.ParquetFile(args.rl_parquet)
+        # Pass 1: training-window doc_ids
+        _train_doc_ids: set = set()
+        _seen = 0
+        for _rg_idx in range(_pf.num_row_groups):
+            if _seen >= args.eval_skip_rows:
+                break
+            _rg = _pf.read_row_group(_rg_idx, columns=["doc_id"])
+            _ids = _rg.column("doc_id").to_pylist()
+            _nrg = len(_ids)
+            _take = min(_nrg, args.eval_skip_rows - _seen)
+            _train_doc_ids.update(_ids[:_take])
+            _seen += _nrg
+        # Pass 2: doc-disjoint rows past the cursor
         _seen = 0
         for _rg_idx in range(_pf.num_row_groups):
             if len(eval_rows) >= args.eval_n_prompts:
                 break
-            _rg = _pf.read_row_group(_rg_idx, columns=["prompt", "activation_vector"])
+            _rg = _pf.read_row_group(
+                _rg_idx, columns=["prompt", "activation_vector", "doc_id"],
+            )
             _n = _rg.num_rows
             if _seen + _n <= args.eval_skip_rows:
                 _seen += _n
                 continue
             _start = max(0, args.eval_skip_rows - _seen)
-            _seen += _start
-            _take = min(args.eval_n_prompts - len(eval_rows), _n - _start)
-            _rg = _rg.slice(_start, _take)
-            for _p, _a in zip(
-                _rg.column("prompt").to_pylist(),
-                _rg.column("activation_vector").to_pylist(),
-            ):
-                eval_rows.append({"prompt": _p, "activation": _a})
-        print(f"[eval] {len(eval_rows)} fixed prompts loaded (rows from "
-              f"{args.eval_skip_rows}, doc-disjoint from training)", flush=True)
+            _prompts = _rg.column("prompt").to_pylist()
+            _acts = _rg.column("activation_vector").to_pylist()
+            _dids = _rg.column("doc_id").to_pylist()
+            for _i in range(_start, _n):
+                if _dids[_i] in _train_doc_ids:
+                    continue
+                eval_rows.append({"prompt": _prompts[_i], "activation": _acts[_i]})
+                if len(eval_rows) >= args.eval_n_prompts:
+                    break
+            _seen += _n
+        print(f"[eval] {len(eval_rows)} doc-disjoint prompts loaded "
+              f"(rows past {args.eval_skip_rows}, excluding "
+              f"{len(_train_doc_ids)} training doc_ids)", flush=True)
     eval_table_data = []  # accumulates [step, idx, reward, fve, extracted, explanation]
 
     for step in range(args.start_step, args.num_steps):
@@ -988,10 +1041,8 @@ def main():
                 f"clip_frac={grpo_metrics.get('clip_frac')}). Skipping critic update.",
                 flush=True,
             )
-            # actor optimizer.step was already called inside the helper, but if
-            # the loss was nan/inf, gradients were nan/inf too — Adam may have
-            # corrupted weights. Best we can do is continue; safe-guard via the
-            # grad-norm clip already applied.
+            # The helper already refused to optim.step() on a non-finite grad
+            # norm, so weights are intact; skip the critic update + logging.
             continue
 
         # ---- Push HF actor weights → vLLM every N steps (TRL colocate pattern) ----
@@ -1220,7 +1271,23 @@ def main():
             out_dir = save_dir / f"iter_{step + 1:06d}"
             out_dir.mkdir(parents=True, exist_ok=True)
             actor.save_pretrained(str(out_dir))
-            print(f"[save] LoRA → {out_dir}")
+            if args.train_critic:
+                # The co-trained critic is the reward model behind this run's
+                # FVE curve; without it, resume/eval scores against the stale
+                # SFT critic. Full-model save is ~11GB, so keep latest-only:
+                # write to a tmp dir then atomically swap into critic_latest/.
+                import shutil as _shutil
+                _crit_tmp = save_dir / "critic_latest.tmp"
+                _crit_dst = save_dir / "critic_latest"
+                if _crit_tmp.exists():
+                    _shutil.rmtree(_crit_tmp)
+                critic.save_pretrained(str(_crit_tmp))
+                (_crit_tmp / "saved_at_step.txt").write_text(str(step + 1))
+                if _crit_dst.exists():
+                    _shutil.rmtree(_crit_dst)
+                os.rename(_crit_tmp, _crit_dst)
+            print(f"[save] LoRA → {out_dir}"
+                  + (f" (+ critic_latest @ step {step + 1})" if args.train_critic else ""))
 
     print("done.")
     if not args.no_wandb:

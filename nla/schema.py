@@ -217,11 +217,14 @@ def compute_canonical_neighbors(
     (<concept>㊗</concept>) so the trailing chat-template scaffolding is identical.
     """
     content = actor_template.format(injection_char=injection_char)
-    ids = tokenizer.apply_chat_template(
+    enc = tokenizer.apply_chat_template(
         [{"role": "user", "content": content}],
         tokenize=True,
         add_generation_prompt=True,
     )
+    # transformers v5 returns a BatchEncoding (dict-like) here; v4 returned a
+    # plain list[int]. Normalise so `enumerate` walks token ids, not dict keys.
+    ids = enc["input_ids"] if hasattr(enc, "keys") else enc
     matches = [i for i, tid in enumerate(ids) if tid == injection_token_id]
     assert len(matches) == 1, (
         f"injection token id {injection_token_id} ({injection_char!r}) appears "

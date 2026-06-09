@@ -23,6 +23,7 @@ Saves HF format checkpoints directly — no DCP→HF conversion step.
 """
 
 import argparse
+import json
 import math
 import os
 import re
@@ -35,7 +36,8 @@ import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
 import wandb
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 from nla.config import load_nla_config
 from nla.injection import karvonen_inject_in_residual
@@ -90,17 +92,22 @@ def _register_karvonen_hook(model, vectors_ref, inj_id, left_id, right_id, layer
         v = vectors_ref[0]
         if v is None or v.shape[0] == 0:
             return output
-        if (input_ids == inj_id).sum().item() == 0:
+        # Under device_map="auto" this layer can live on a different GPU than
+        # where the caller staged input_ids / the injection vector. Align both
+        # to the residual's device before injecting.
+        ids = input_ids.to(resid.device)
+        if (ids == inj_id).sum().item() == 0:
             return output
         injected = karvonen_inject_in_residual(
-            input_ids, resid, v, inj_id, left_id, right_id,
+            ids, resid, v.to(resid.device), inj_id, left_id, right_id,
         )
         if rest is None:
             return injected
         return (injected, *rest)
 
     model.get_input_embeddings().register_forward_hook(embed_hook, with_kwargs=True)
-    target = model
+    # PEFT-aware: under get_peft_model the layers live below .base_model.
+    target = model.base_model if hasattr(model, "base_model") else model
     while hasattr(target, "model") and not hasattr(target, "layers"):
         target = target.model
     target.layers[layer_idx].register_forward_hook(layer_hook)
@@ -150,9 +157,18 @@ def load_sft_dataset(parquet_path, n_max=None, *, mode):
         n_in_rg = rg.num_rows
         take = n_in_rg if n_max is None else min(n_max - len(rows), n_in_rg)
         rg = rg.slice(0, take)
-        rg_cols = {c: rg.column(c).to_pylist() for c in cols}
+        # activation_vector via flatten→numpy (zero-copy) — ~100× faster than
+        # to_pylist() on 4096-float lists, which builds ~1B PyFloats at 250k rows
+        # (GPUs sit idle for 10-20 min otherwise). Same pattern as schema.py.
+        acts_col = rg.column("activation_vector").combine_chunks()  # ChunkedArray→Array
+        acts_np = (acts_col.flatten().to_numpy(zero_copy_only=False)
+                   .astype(np.float32).reshape(len(acts_col), -1))
+        prompts = rg.column("prompt").to_pylist()
+        responses = rg.column("response").to_pylist() if mode == "av" else None
         for i in range(take):
-            row = {c: rg_cols[c][i] for c in cols}
+            row = {"prompt": prompts[i], "activation_vector": acts_np[i]}
+            if mode == "av":
+                row["response"] = responses[i]
             rows.append(row)
     return rows
 
@@ -162,7 +178,29 @@ def load_sft_dataset(parquet_path, n_max=None, *, mode):
 # identity-init the head. Replaces nla/scripts/prepare_critic_checkpoint.py.
 # ----------------------------------------------------------------------------
 
-def init_critic_from_base(base_ckpt: str, num_layers: int, dtype):
+def _resolve_device_map(device_map_mode, max_gpu_mem, quant_config):
+    """Return (device_map, max_memory) for from_pretrained.
+
+    'single' → whole 4-bit model on GPU0 (bf16: None, caller does .to(device)).
+    'auto'   → accelerate splits weights across visible GPUs (naive MP). A
+               positive max_gpu_mem (GiB/GPU) forces a split — used to validate
+               the 397B sharding path on a small model that would otherwise fit
+               on one GPU.
+    """
+    if quant_config is None:
+        return None, None
+    if device_map_mode == "auto":
+        max_memory = None
+        if max_gpu_mem and max_gpu_mem > 0:
+            max_memory = {
+                i: f"{max_gpu_mem}GiB" for i in range(torch.cuda.device_count())
+            }
+        return "auto", max_memory
+    return {"": 0}, None
+
+
+def init_critic_from_base(base_ckpt: str, num_layers: int, dtype, quant_config=None,
+                          device_map=None, max_memory=None, strip_final_norm=True):
     """Truncate base to first `num_layers` transformer blocks, attach an
     identity-init Linear(d, d) value_head. NLACriticModel handles the wrapping.
 
@@ -170,12 +208,17 @@ def init_critic_from_base(base_ckpt: str, num_layers: int, dtype):
     when value_head = I, so the initial reconstruction loss starts at the
     backbone's own representational ceiling instead of `kaiming_uniform`'s
     1/√3 scaling which would crush pred_norm. See TRAINING_NOTES.md.
+
+    quant_config (BitsAndBytesConfig) loads the backbone in 4-bit (QLoRA); the
+    value_head stays full-precision (tiny, fully trainable).
     """
     # First load the full base, truncate the layers list, then construct
     # NLACriticModel around it.
     from copy import deepcopy
     base = AutoModelForCausalLM.from_pretrained(
         base_ckpt, torch_dtype=dtype, attn_implementation="sdpa",
+        quantization_config=quant_config,
+        device_map=device_map, max_memory=max_memory,
     )
     cfg = deepcopy(base.config)
     cfg.num_hidden_layers = num_layers
@@ -187,13 +230,37 @@ def init_critic_from_base(base_ckpt: str, num_layers: int, dtype):
         inner = inner.model
     # Keep only the first num_layers blocks
     inner.layers = torch.nn.ModuleList(list(inner.layers)[:num_layers])
+    if strip_final_norm:
+        # Design §4: RAW residual stream → value head. The full model's final
+        # RMSNorm was trained for the LAST layer's output; applying it to the
+        # layer-K stream bakes a per-channel γ reweighting into every critic
+        # prediction. NLACriticModel.from_pretrained already strips it — this
+        # makes the fresh-truncation path consistent. ar_meta.json records the
+        # choice so RL reloads match (pre-2026-06 ckpts trained with norm kept).
+        for _attr in ("norm", "final_layernorm", "ln_f"):
+            if hasattr(inner, _attr):
+                setattr(inner, _attr, torch.nn.Identity())
+                break
+        else:
+            raise AssertionError(
+                f"could not find final layernorm on {type(inner).__name__}"
+            )
+    # lm_head is never used by the critic — drop it (frees ~1.2GB on 8B-class).
+    if hasattr(base, "lm_head"):
+        base.lm_head = torch.nn.Identity()
     d_model = cfg.hidden_size
     # NLACriticModel wraps backbone + value_head. Constructor takes both.
     critic = NLACriticModel(cfg, base)
     # Identity init the value head (Linear has bias=False per models.py:82)
     with torch.no_grad():
         critic.value_head.weight.copy_(torch.eye(d_model, dtype=dtype))
-    critic = critic.to(dtype)
+    if quant_config is None:
+        critic = critic.to(dtype)
+    else:
+        # 4-bit backbone already placed (device_map); align value_head to the
+        # LAST layer's device so forward's value_head(last_hidden) matches.
+        last_dev = next(inner.layers[-1].parameters()).device
+        critic.value_head.to(device=last_dev, dtype=dtype)
     print(f"[critic] truncated to {num_layers} layers, value_head identity-init "
           f"(weight norm = {critic.value_head.weight.float().norm().item():.3f})")
     return critic
@@ -274,12 +341,26 @@ def _av_prepare_chunk(rows, tokenizer, inject_char, device, max_len=1024):
 
 def _ar_prepare_chunk(rows, tokenizer, device, max_len=1024):
     full_ids_list = []
+    kept_rows = []
+    n_skipped = 0
     for row in rows:
         # AR's prompt is the already-filled critic template string.
-        ids = tokenizer.encode(row["prompt"], add_special_tokens=True)
+        # add_special_tokens=False matches RL-time critic scoring and stage-3's
+        # build-time suffix verification (True is a no-op on Qwen but prepends
+        # BOS on Llama/Gemma-family tokenizers → train/reward token mismatch).
+        ids = tokenizer.encode(row["prompt"], add_special_tokens=False)
         if len(ids) > max_len:
-            ids = ids[:max_len]
+            # Right-truncating would cut the "</text> <summary>" suffix and the
+            # last-token extraction would land mid-explanation — silently wrong.
+            # Skip the row instead (RL-side rejects over-length the same way).
+            n_skipped += 1
+            continue
         full_ids_list.append(torch.tensor(ids, dtype=torch.long))
+        kept_rows.append(row)
+    if n_skipped:
+        print(f"[ar] skipped {n_skipped}/{len(rows)} rows with critic prompt "
+              f"> {max_len} tokens (suffix anchor would be truncated)")
+    assert full_ids_list, f"all {len(rows)} rows exceeded max_len={max_len}"
     bs = len(full_ids_list)
     T = max(t.numel() for t in full_ids_list)
     pad_id = tokenizer.eos_token_id
@@ -290,7 +371,7 @@ def _ar_prepare_chunk(rows, tokenizer, device, max_len=1024):
         batch_ids[i, :L] = t.to(device)
         attn[i, :L] = 1
     gold = torch.tensor(
-        np.stack([r["activation_vector"] for r in rows]),
+        np.stack([r["activation_vector"] for r in kept_rows]),
         dtype=torch.float32, device=device,
     )
     return batch_ids, attn, gold
@@ -317,6 +398,13 @@ def main():
     p.add_argument("--gradient-accumulation-steps", type=int, default=1)
     p.add_argument("--ar-num-layers", type=int, default=25,
                    help="K+1 for AR mode — truncate base to this many transformer blocks")
+    p.add_argument("--strip-final-norm", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="AR mode: replace the backbone's final RMSNorm with "
+                        "Identity so the value head sees the raw layer-K "
+                        "residual (design §4, matches NLACriticModel."
+                        "from_pretrained). --no-strip-final-norm reproduces "
+                        "pre-2026-06 checkpoints. Recorded in ar_meta.json.")
     p.add_argument("--max-len", type=int, default=1024)
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--min-lr", type=float, default=2e-6)
@@ -328,6 +416,22 @@ def main():
                         "OFF for AR (smaller model + shorter seq fits comfortably).")
     p.add_argument("--attn-implementation", default="sdpa",
                    choices=["sdpa", "flash_attention_2", "eager"])
+    p.add_argument("--quant", choices=["none", "4bit"], default="none",
+                   help="4bit = bitsandbytes nf4 (QLoRA). Required for models too "
+                        "big for bf16; validates the GLM-5 path on Qwen3-8B.")
+    p.add_argument("--use-lora", action="store_true", default=False,
+                   help="Train a LoRA adapter on a frozen base instead of full-FT. "
+                        "Mandatory for 4bit. (AR value_head stays fully trainable.)")
+    p.add_argument("--lora-r", type=int, default=128)
+    p.add_argument("--lora-alpha", type=int, default=16)
+    p.add_argument("--device-map", choices=["single", "auto"], default="single",
+                   help="single = whole 4-bit model on GPU0 (fits up to ~70B on "
+                        "a B200). auto = accelerate splits weights across all "
+                        "visible GPUs (naive MP) — required for 397B-class bases.")
+    p.add_argument("--max-gpu-mem", type=int, default=0,
+                   help="GiB/GPU cap for device_map=auto weight placement. >0 "
+                        "forces a multi-GPU split (used to validate sharding on a "
+                        "small model). 0 = use full GPU memory.")
     p.add_argument("--max-rows", type=int, default=None,
                    help="Cap training rows (smoke runs)")
     p.add_argument("--save-every", type=int, default=500)
@@ -347,18 +451,46 @@ def main():
         args.sidecar = args.parquet
 
     # ---- tokenizer + nla config ----
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+    # From --base-ckpt, NOT hardcoded — the sidecar asserts below catch a
+    # wrong-family tokenizer, but only if we load the one the run targets.
+    tokenizer = AutoTokenizer.from_pretrained(args.base_ckpt)
     cfg = load_nla_config(args.sidecar, tokenizer)
     mse_scale_f = resolve_target_scale(cfg.mse_scale, cfg.d_model)
     print(f"[cfg] mode={args.mode} d_model={cfg.d_model} mse_scale={mse_scale_f}")
 
     # ---- model ----
     if args.mode == "av":
-        print(f"[av] loading {args.base_ckpt}")
+        print(f"[av] loading {args.base_ckpt} (quant={args.quant}, lora={args.use_lora})")
+        quant_config = None
+        if args.quant == "4bit":
+            quant_config = BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=dtype, bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_storage=dtype,  # FSDP-friendly storage (harmless single-GPU)
+            )
+        dmap, max_mem = _resolve_device_map(args.device_map, args.max_gpu_mem, quant_config)
         model = AutoModelForCausalLM.from_pretrained(
             args.base_ckpt, torch_dtype=dtype,
             attn_implementation=args.attn_implementation,
-        ).to(device)
+            quantization_config=quant_config,
+            device_map=dmap, max_memory=max_mem,
+        )
+        if dmap is None:
+            model = model.to(device)
+        elif args.device_map == "auto" and hasattr(model, "hf_device_map"):
+            print(f"[av] device_map=auto → GPUs used: "
+                  f"{sorted({d for d in model.hf_device_map.values() if isinstance(d, int)})}")
+        if args.use_lora:
+            if quant_config is not None:
+                model = prepare_model_for_kbit_training(
+                    model, use_gradient_checkpointing=args.gradient_checkpointing,
+                )
+            model = get_peft_model(model, LoraConfig(
+                r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.0,
+                bias="none", task_type="CAUSAL_LM", use_rslora=True,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            ))
+            model.print_trainable_parameters()
         vectors_ref = [None]
         _register_karvonen_hook(
             model, vectors_ref,
@@ -371,6 +503,14 @@ def main():
             model.enable_input_require_grads()
             print("[av] gradient_checkpointing ENABLED")
     else:  # ar
+        quant_config = None
+        if args.quant == "4bit":
+            quant_config = BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=dtype, bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_storage=dtype,
+            )
+        dmap, max_mem = _resolve_device_map(args.device_map, args.max_gpu_mem, quant_config)
         # Check if --base-ckpt is already a critic ckpt (has value_head.safetensors)
         is_prepared_critic = (Path(args.base_ckpt) / "value_head.safetensors").exists()
         if is_prepared_critic:
@@ -378,13 +518,45 @@ def main():
             model = NLACriticModel.from_pretrained(
                 args.base_ckpt, torch_dtype=dtype,
                 attn_implementation=args.attn_implementation,
-            ).to(device)
+                quantization_config=quant_config,
+                device_map=dmap, max_memory=max_mem,
+            )
+            if dmap is None:
+                model = model.to(device)
         else:
-            print(f"[ar] truncating base {args.base_ckpt} to {args.ar_num_layers} layers")
-            model = init_critic_from_base(args.base_ckpt, args.ar_num_layers, dtype).to(device)
+            print(f"[ar] truncating base {args.base_ckpt} to {args.ar_num_layers} "
+                  f"layers (quant={args.quant})")
+            model = init_critic_from_base(
+                args.base_ckpt, args.ar_num_layers, dtype, quant_config,
+                device_map=dmap, max_memory=max_mem,
+                strip_final_norm=args.strip_final_norm,
+            )
+            if dmap is None:
+                model = model.to(device)
+        if args.use_lora:
+            # Inject LoRA IN-PLACE into the backbone's attn projections. Unlike
+            # get_peft_model this does NOT wrap the backbone in a PeftModel, so
+            # NLACriticModel.forward (which calls the inner transformer directly)
+            # is unchanged and the value_head stays a plain trainable module.
+            from peft import inject_adapter_in_model
+            if quant_config is not None:
+                model.backbone = prepare_model_for_kbit_training(
+                    model.backbone, use_gradient_checkpointing=args.gradient_checkpointing,
+                )
+            inject_adapter_in_model(LoraConfig(
+                r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.0,
+                bias="none", task_type="CAUSAL_LM", use_rslora=True,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            ), model.backbone)
+            # Train ONLY the LoRA adapters + the value_head; freeze the rest.
+            for n_, p_ in model.named_parameters():
+                p_.requires_grad_(("lora_" in n_) or n_.startswith("value_head"))
+            n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"[ar] LoRA-injected; trainable={n_tr/1e6:.1f}M (lora + value_head)")
         vectors_ref = None
-        if args.gradient_checkpointing:
+        if args.gradient_checkpointing and not args.use_lora:
             # NLACriticModel wraps backbone; enable on inner module
+            # (use_lora+4bit path already enabled it via prepare_model_for_kbit_training)
             if hasattr(model.backbone, "gradient_checkpointing_enable"):
                 model.backbone.gradient_checkpointing_enable()
                 print("[ar] gradient_checkpointing ENABLED (backbone)")
@@ -414,17 +586,19 @@ def main():
     print(f"[optim] trainable params: {n_trainable / 1e9:.2f} B")
 
     # ---- AR-only: predict-the-mean baseline for FVE logging ----
+    # Paper definition: baseline = E[||v_norm - μ||²] (raw variance of the
+    # normalized distribution, ≈0.72), NOT MSE against normalize(μ) (≈0.94)
+    # which runs before 2026-06-09 used and which inflates FVE.
     fve_baseline = None
     if args.mode == "ar":
+        from nla.schema import compute_predict_mean_baselines
         _act = torch.tensor(
-            [r["activation_vector"] for r in rows[: min(len(rows), 4000)]],
+            np.stack([r["activation_vector"] for r in rows[: min(len(rows), 4000)]]),
             dtype=torch.float32,
         )
-        _mu = _act.mean(dim=0, keepdim=True)
-        _mu_n = normalize_activation(_mu, mse_scale_f)
-        _act_n = normalize_activation(_act, mse_scale_f)
-        fve_baseline = ((_mu_n - _act_n) ** 2).mean(dim=-1).mean().item()
-        print(f"[ar] predict-the-mean MSE baseline = {fve_baseline:.4f}")
+        _bl_meannorm, fve_baseline = compute_predict_mean_baselines(_act, mse_scale_f)
+        print(f"[ar] predict-the-mean MSE baseline = {fve_baseline:.4f} "
+              f"(paper def; meannorm baseline = {_bl_meannorm:.4f})")
 
     # ---- wandb ----
     if not args.no_wandb:
@@ -474,8 +648,9 @@ def main():
                 # logits[:, t]. Mask is in TARGET space (positions of tokens
                 # to predict), so mask[:, 1:] aligned with logits[:, :-1].
                 shift_logits = logits[:, :-1].contiguous()
-                shift_targets = ids[:, 1:].contiguous()
-                shift_mask = loss_mask[:, 1:].contiguous()
+                # device_map=auto can return logits on a non-zero GPU; align.
+                shift_targets = ids[:, 1:].to(shift_logits.device).contiguous()
+                shift_mask = loss_mask[:, 1:].to(shift_logits.device).contiguous()
                 V = shift_logits.size(-1)
                 per_tok = F.cross_entropy(
                     shift_logits.view(-1, V),
@@ -534,6 +709,25 @@ def main():
             print(f"[save] → {out_dir}", flush=True)
             if args.mode == "av":
                 model.save_pretrained(str(out_dir))
+                tokenizer.save_pretrained(str(out_dir))
+            elif args.use_lora:
+                # AR + LoRA: save just the adapter weights + value_head (NOT the
+                # 4-bit backbone). RL reloads via init_critic_from_base + inject.
+                from safetensors.torch import save_file
+                sd = {n: p.detach().cpu().contiguous()
+                      for n, p in model.named_parameters()
+                      if ("lora_" in n) or n.startswith("value_head")}
+                save_file(sd, str(out_dir / "ar_lora_value_head.safetensors"))
+                (out_dir / "ar_meta.json").write_text(json.dumps({
+                    "ar_num_layers": args.ar_num_layers,
+                    "lora_r": args.lora_r, "lora_alpha": args.lora_alpha,
+                    "quant": args.quant,
+                    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+                    # Whether the backbone's final RMSNorm was stripped at init.
+                    # RL must rebuild the critic the same way or predictions
+                    # silently shift (pre-2026-06 ckpts: norm kept = False).
+                    "final_norm_stripped": args.strip_final_norm,
+                }, indent=2))
                 tokenizer.save_pretrained(str(out_dir))
             else:
                 model.save_pretrained(str(out_dir))

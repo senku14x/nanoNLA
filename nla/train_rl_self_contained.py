@@ -43,8 +43,9 @@ import numpy as np
 import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
-from peft import LoraConfig, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import (LoraConfig, PeftModel, get_peft_model,
+                  inject_adapter_in_model, prepare_model_for_kbit_training)
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 import wandb
 
@@ -53,10 +54,12 @@ from nla.injection import karvonen_inject_in_residual
 from nla.models import NLACriticModel
 from nla.schema import (
     EXPLANATION_RE,
+    compute_predict_mean_baselines,
     extract_explanation,
     normalize_activation,
     resolve_target_scale,
 )
+from nla.train_sft import _resolve_device_map, init_critic_from_base
 
 
 def cjk_fraction(text: str) -> float:
@@ -198,20 +201,31 @@ def rollout_one_prompt(
     # as LoRA weights update).
     scores = gen_out.logits  # tuple of [G, V]
     prompt_len = prompt_t.shape[1]
+    eos_id = tokenizer.eos_token_id
     responses = []
     for g in range(group_size):
         resp_ids = full_ids[g, prompt_len:].tolist()
+        # Trim at the first EOS (inclusive). Batched generate() pads samples
+        # that finish early to the group max with pad(=eos) tokens; those
+        # positions were never sampled from the policy. Without trimming,
+        # old_logp/new_logp cover the pads too and the GRPO surrogate + KL
+        # get gradient on garbage positions (diluting real tokens).
+        if eos_id in resp_ids:
+            n_real = resp_ids.index(eos_id) + 1  # keep the terminating EOS
+        else:
+            n_real = len(resp_ids)
+        resp_ids = resp_ids[:n_real]
         text = tokenizer.decode(resp_ids, skip_special_tokens=True)
-        # Collect old log_p for each generated token.
+        # Collect old log_p for each REAL generated token.
         old_logp = []
         for t, step_logits in enumerate(scores):
-            if t >= len(resp_ids):
+            if t >= n_real:
                 break
             lp = F.log_softmax(step_logits[g].float(), dim=-1)
             old_logp.append(lp[resp_ids[t]].item())
         responses.append({
             "text": text,
-            "full_ids": full_ids[g],
+            "full_ids": full_ids[g, : prompt_len + n_real],
             "prompt_len": prompt_len,
             "old_logp": torch.tensor(old_logp, dtype=torch.float32),
             "n_resp": len(old_logp),
@@ -325,12 +339,16 @@ def grpo_update_microbatched(
         finally:
             vectors_ref[0] = None
         new_logp = F.log_softmax(new_logits.float(), dim=-1)
-        # --- ref_logp (no grad, LoRA off) ---
+        # --- ref_logp: switch to the frozen "reference" adapter (= AV-SFT init).
+        #     Not disable_adapter() — the policy is a LoRA, so that would anchor
+        #     KL to the bare base instead of the SFT init. ---
         vectors_ref[0] = v_batch
         try:
-            with torch.no_grad(), actor.disable_adapter():
+            with torch.no_grad():
+                actor.set_adapter("reference")
                 ref_logits = actor(input_ids=batch_ids, attention_mask=attn).logits
         finally:
+            actor.set_adapter("default")
             vectors_ref[0] = None
         ref_logp = F.log_softmax(ref_logits.float(), dim=-1)
         del ref_logits
@@ -381,13 +399,21 @@ def grpo_update_microbatched(
     grad_norm = torch.nn.utils.clip_grad_norm_(
         [p for p in actor.parameters() if p.requires_grad], max_grad_norm,
     )
-    optim.step()
+    gn = grad_norm.item() if hasattr(grad_norm, "item") else float(grad_norm)
+    # Guard BEFORE stepping: clip_grad_norm_ does not sanitize nan/inf (it
+    # scales by max_norm/total_norm, and nan propagates). Stepping Adam on
+    # non-finite grads corrupts the moment estimates AND the weights.
+    if math.isfinite(gn):
+        optim.step()
+    else:
+        optim.zero_grad(set_to_none=True)
+        print(f"[grpo] non-finite grad norm ({gn}) — skipping optimizer step",
+              flush=True)
     metrics = {
         "kl_mean": float(np.mean(sample_kls_log)) if sample_kls_log else 0.0,
         "clip_frac": float(np.mean(sample_clipfrac_log)) if sample_clipfrac_log else 0.0,
     }
     mean_loss = float(np.mean(sample_losses_log)) if sample_losses_log else 0.0
-    gn = grad_norm.item() if hasattr(grad_norm, "item") else float(grad_norm)
     return mean_loss, gn, metrics
 
 
@@ -493,8 +519,15 @@ def grpo_loss(
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--av-ckpt", required=True)
-    p.add_argument("--ar-ckpt", required=True)
+    p.add_argument("--av-ckpt", required=True,
+                   help="AV-SFT LoRA adapter dir (sits on --base-ckpt).")
+    p.add_argument("--ar-ckpt", required=True,
+                   help="AR-LoRA dir (ar_lora_value_head.safetensors + ar_meta.json).")
+    p.add_argument("--base-ckpt", default="Qwen/Qwen3-8B",
+                   help="Base the AV/AR LoRA adapters sit on (4-bit if --quant 4bit).")
+    p.add_argument("--quant", choices=["none", "4bit"], default="4bit")
+    p.add_argument("--device-map", choices=["single", "auto"], default="single")
+    p.add_argument("--max-gpu-mem", type=int, default=0)
     p.add_argument("--rl-parquet", required=True)
     p.add_argument("--sidecar", required=True)
     p.add_argument("--save-dir", required=True)
@@ -509,7 +542,7 @@ def main():
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--lora-r", type=int, default=128)
     p.add_argument("--lora-alpha", type=int, default=16)
-    p.add_argument("--use-rslora", action="store_true", default=True,
+    p.add_argument("--use-rslora", action=argparse.BooleanOptionalAction, default=True,
                    help="Use rsLoRA scaling (alpha/sqrt(r) instead of alpha/r). "
                         "Default ON because we use r=128 where vanilla LoRA's "
                         "alpha/r=0.125 collapses the effective learning rate.")
@@ -529,8 +562,10 @@ def main():
     p.add_argument("--save-every", type=int, default=50)
     p.add_argument("--resume-from-lora", type=str, default=None,
                    help="Directory containing a saved LoRA adapter (iter_NNNNNN); "
-                        "loaded onto the AV-SFT base so training continues "
-                        "from those weights.")
+                        "loaded as the policy adapter so training continues from "
+                        "those weights (KL reference stays the AV-SFT init). If "
+                        "the dir has a critic/ subdir, the co-trained critic is "
+                        "resumed too.")
     p.add_argument("--start-step", type=int, default=0,
                    help="Initial step counter — useful when resuming so wandb "
                         "x-axis lines up with the previous run.")
@@ -571,8 +606,28 @@ def main():
     device = "cuda"
     os.environ.setdefault("HF_HOME", "/workspace-vast/pretrained_ckpts")
 
+    # old_logp is computed from generate's RAW logits (output_logits). At
+    # temperature 1.0 that IS the sampling distribution; at any other
+    # temperature the importance ratio no longer corrects for the actual
+    # behavior policy and the surrogate is silently biased.
+    assert args.temperature == 1.0, (
+        f"--temperature {args.temperature} != 1.0: old_logp comes from raw "
+        f"logits, so the GRPO importance ratio is only valid at T=1. "
+        f"Remove this assert only if you also temperature-scale old/new logp."
+    )
+    # Eval rows are taken past --eval-skip-rows; training samples rows[:max_rows].
+    # Without this cap the training pool contains the literal eval rows.
+    if args.eval_every > 0 and (args.eval_n_prompts > 0 or args.external_evals.strip()):
+        assert args.max_rows is not None and args.max_rows <= args.eval_skip_rows, (
+            f"evals enabled but --max-rows ({args.max_rows}) is unset or exceeds "
+            f"--eval-skip-rows ({args.eval_skip_rows}) — training would include "
+            f"the eval rows themselves."
+        )
+
     # ---- tokenizer + nla config ----
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+    # From --base-ckpt, NOT hardcoded — the sidecar asserts below catch a
+    # wrong-family tokenizer, but only if we load the one the run targets.
+    tokenizer = AutoTokenizer.from_pretrained(args.base_ckpt)
     cfg = load_nla_config(args.sidecar, tokenizer)
     inj_id = cfg.injection_token_id
     left_id = cfg.injection_left_neighbor_id
@@ -583,63 +638,102 @@ def main():
     assert template is not None, "critic_prompt_template missing"
     print(f"[cfg] inj_id={inj_id} mse_scale_f={mse_scale_f} d_model={cfg.d_model}")
 
-    # ---- actor (LoRA-wrapped) ----
-    print(f"[actor] loading {args.av_ckpt}")
-    actor = AutoModelForCausalLM.from_pretrained(
-        args.av_ckpt, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
-    ).to(device)
-    lora_cfg = LoraConfig(
-        r=args.lora_r, lora_alpha=args.lora_alpha,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        lora_dropout=0.0, bias="none", task_type="CAUSAL_LM",
-        use_rslora=args.use_rslora,
+    # ---- actor: (4-bit) base + AV-SFT LoRA ("default", trainable) + frozen
+    #      "reference" adapter (= AV-SFT init) for the KL anchor.
+    #      The policy is now a LoRA *on* the frozen base, so disable_adapter()
+    #      would anchor KL to the bare base, not the SFT init — hence a second
+    #      frozen adapter. (See feedback_rl_ref_policy.)
+    quant_config = None
+    if args.quant == "4bit":
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_storage=torch.bfloat16,
+        )
+    dmap, max_mem = _resolve_device_map(args.device_map, args.max_gpu_mem, quant_config)
+    print(f"[actor] base={args.base_ckpt} + AV-LoRA={args.av_ckpt} "
+          f"(quant={args.quant}, device_map={args.device_map})")
+    base = AutoModelForCausalLM.from_pretrained(
+        args.base_ckpt, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
+        quantization_config=quant_config, device_map=dmap, max_memory=max_mem,
     )
-    # CRITICAL for LoRA + gradient_checkpointing: the base model has no
-    # requires_grad params, so gradient_checkpointing's input-grad check
-    # fails ("element 0 of tensors does not require grad"). This hook
-    # forces input embeddings to require grad, propagating grad to LoRA.
-    if args.gradient_checkpointing:
-        actor.enable_input_require_grads()
-    if args.resume_from_lora is not None:
-        # Resume: load a previously-saved LoRA adapter onto the base.
-        # peft.PeftModel.from_pretrained handles attaching the LoRA layers and
-        # copying weights. Skips the get_peft_model wrapping flow.
-        from peft import PeftModel
-        print(f"[actor] RESUMING from LoRA {args.resume_from_lora}")
-        actor = PeftModel.from_pretrained(actor, args.resume_from_lora, is_trainable=True)
-        # Sanity check we got non-zero LoRA weights (not a freshly-init adapter)
-        _lora_norm = 0.0
-        for n, p_ in actor.named_parameters():
-            if "lora_" in n:
-                _lora_norm += p_.detach().float().pow(2).sum().item()
-        print(f"[actor] resumed; sum(lora_param²) = {_lora_norm:.2e}")
-    else:
-        actor = get_peft_model(actor, lora_cfg)
+    if dmap is None:
+        base = base.to(device)
+    if quant_config is not None:
+        base = prepare_model_for_kbit_training(
+            base, use_gradient_checkpointing=args.gradient_checkpointing,
+        )
+    # Policy adapter: AV-SFT init, or a saved RL LoRA when resuming. The KL
+    # "reference" adapter ALWAYS comes from the AV-SFT ckpt — resuming must
+    # not move the KL anchor.
+    policy_ckpt = args.resume_from_lora or args.av_ckpt
+    if args.resume_from_lora:
+        print(f"[actor] RESUMING policy LoRA from {args.resume_from_lora} "
+              f"(KL reference stays {args.av_ckpt})")
+    actor = PeftModel.from_pretrained(
+        base, policy_ckpt, adapter_name="default", is_trainable=True,
+    )
+    actor.load_adapter(args.av_ckpt, adapter_name="reference")  # frozen KL ref
+    actor.set_adapter("default")
+    if args.resume_from_lora:
+        # Loud sanity check: a resumed adapter must have non-trivially-different
+        # weights from the reference (a fresh/zero adapter here means the resume
+        # path silently loaded nothing — the bug this block replaces).
+        _diff = 0.0
+        _sd = actor.state_dict()
+        for n in list(_sd):
+            if ".default." in n and "lora_" in n:
+                _ref = _sd.get(n.replace(".default.", ".reference."))
+                if _ref is not None:
+                    _diff += (_sd[n].float() - _ref.float()).pow(2).sum().item()
+        print(f"[actor] resumed; sum((lora_default - lora_reference)²) = {_diff:.3e}")
+        assert _diff > 0.0, (
+            f"resume-from-lora loaded weights identical to the AV-SFT reference "
+            f"— {args.resume_from_lora} is not a trained RL adapter?"
+        )
     actor.print_trainable_parameters()
     actor.train()
     if args.gradient_checkpointing:
         actor.gradient_checkpointing_enable()
-        # PEFT wraps the model; the inner module's gradient_checkpointing flag
-        # must be set explicitly or HF silently no-ops.
-        if hasattr(actor, "base_model"):
-            inner = actor.base_model
-            while hasattr(inner, "model"):
-                inner = inner.model
-                if hasattr(inner, "gradient_checkpointing"):
-                    inner.gradient_checkpointing = True
-        # NOTE: do NOT set config.use_cache=False globally — that breaks
-        # generate() in rollout (autoregressive without KV cache is O(T²)).
-        # HF auto-disables use_cache per-forward when gradient_checkpointing
-        # fires AND there are gradients; rollout (.eval() + no_grad) is unaffected.
+        actor.enable_input_require_grads()
         print(f"[actor] gradient_checkpointing ENABLED")
 
-    # ---- critic (frozen or co-trained) ----
-    print(f"[critic] loading {args.ar_ckpt}")
-    critic = NLACriticModel.from_pretrained(
-        args.ar_ckpt, torch_dtype=torch.bfloat16,
-    ).to(device)
-    # NLACriticModel.from_pretrained returns params with requires_grad=True by
-    # default. Freeze everything first, then conditionally unfreeze backbone.
+    # ---- critic: AR-LoRA (4-bit base + injected LoRA + value_head). Rebuild
+    #      the exact structure train_sft saved, then load the adapter + head. ----
+    import json as _json
+    from safetensors.torch import load_file as _load_file
+    # When resuming and the resume dir has a saved co-trained critic, load
+    # that instead of the AR-SFT init — otherwise the reward model snaps back
+    # to its SFT state and the reward scale is discontinuous across the resume.
+    ar_src = Path(args.ar_ckpt)
+    if args.resume_from_lora is not None:
+        _resumed_critic = Path(args.resume_from_lora) / "critic"
+        if (_resumed_critic / "ar_lora_value_head.safetensors").exists():
+            ar_src = _resumed_critic
+            print(f"[critic] RESUMING co-trained critic from {ar_src}")
+    ar_meta = _json.loads((ar_src / "ar_meta.json").read_text())
+    print(f"[critic] AR-LoRA from {ar_src}: {ar_meta}")
+    ar_quant = quant_config if ar_meta.get("quant") == "4bit" else None
+    ar_dmap, ar_maxmem = _resolve_device_map(args.device_map, args.max_gpu_mem, ar_quant)
+    critic = init_critic_from_base(
+        args.base_ckpt, ar_meta["ar_num_layers"], torch.bfloat16,
+        ar_quant, device_map=ar_dmap, max_memory=ar_maxmem,
+        # Checkpoints record whether their backbone ran with the final RMSNorm
+        # stripped (design §4) or kept (pre-2026-06 ckpts). Must match training.
+        strip_final_norm=ar_meta.get("final_norm_stripped", False),
+    )
+    if ar_dmap is None:
+        critic = critic.to(device)
+    inject_adapter_in_model(LoraConfig(
+        r=ar_meta["lora_r"], lora_alpha=ar_meta["lora_alpha"], lora_dropout=0.0,
+        bias="none", task_type="CAUSAL_LM", use_rslora=True,
+        target_modules=ar_meta["target_modules"],
+    ), critic.backbone)
+    _ar_sd = _load_file(str(ar_src / "ar_lora_value_head.safetensors"))
+    _miss, _unexp = critic.load_state_dict(_ar_sd, strict=False)
+    print(f"[critic] loaded {len(_ar_sd)} AR tensors "
+          f"(missing={len(_miss)} unexpected={len(_unexp)})")
+    # Freeze everything; conditionally unfreeze LoRA + value_head for co-training.
     for p_ in critic.parameters():
         p_.requires_grad_(False)
     critic_optim = None
@@ -651,10 +745,10 @@ def main():
         # automatically). Both backbone AND value_head train; the bf16+Adam
         # blow-up that NaN'd AR SFT is now neutralised by critic_predict's
         # normalize-before-value_head trick (bounds value_head input norm).
-        for p_ in critic.backbone.parameters():
-            p_.requires_grad_(True)
-        for p_ in critic.value_head.parameters():
-            p_.requires_grad_(True)
+        # Co-train only the AR LoRA adapters + value_head (4-bit base frozen).
+        for n_, p_ in critic.named_parameters():
+            if ("lora_" in n_) or n_.startswith("value_head"):
+                p_.requires_grad_(True)
         critic_trainable = [p for p in critic.parameters() if p.requires_grad]
         try:
             import bitsandbytes as _bnb
@@ -685,20 +779,23 @@ def main():
     print(f"[data] {len(rows)} rows", flush=True)
 
     # ---- FVE baseline: predict-the-mean MSE on this dataset ----
-    # FVE = 1 - mse_actual / baseline_mse. baseline = MSE between
-    # normalize(μ) and normalize(v_i), where μ = mean of activations.
-    # 0% = no better than constant prediction; 100% = perfect reconstruction.
-    # Paper's Qwen2.5-7B critic-SL alone hit FVE ≈ 37.5%.
+    # FVE = 1 - mse_actual / baseline_mse, with the PAPER's baseline:
+    # E[||v_norm - μ||²], the raw variance of the normalized distribution
+    # (≈0.72 on Qwen 7B-class). NOTE: runs before 2026-06-09 used the looser
+    # "meannorm" baseline MSE(v_norm, normalize(μ)) (≈0.94), which inflates
+    # FVE vs the paper's definition — old wandb curves are not comparable.
+    # Both are logged; `fve` uses the paper definition.
     _act_stack = torch.tensor(
         [r["activation"] for r in rows[: min(len(rows), 4000)]],
         dtype=torch.float32,
     )
-    _mu = _act_stack.mean(dim=0, keepdim=True)
-    _mu_n = normalize_activation(_mu, mse_scale_f)
-    _act_n = normalize_activation(_act_stack, mse_scale_f)
-    fve_baseline = ((_mu_n - _act_n) ** 2).mean(dim=-1).mean().item()
-    del _act_stack, _act_n, _mu, _mu_n
-    print(f"[fve] predict-the-mean baseline mse_nrm = {fve_baseline:.4f}", flush=True)
+    fve_baseline_meannorm, fve_baseline = compute_predict_mean_baselines(
+        _act_stack, mse_scale_f,
+    )
+    del _act_stack
+    print(f"[fve] predict-the-mean baseline mse_nrm = {fve_baseline:.4f} "
+          f"(paper def; meannorm baseline = {fve_baseline_meannorm:.4f})",
+          flush=True)
 
     # ---- optimizer ----
     # 8-bit Adam (bitsandbytes) for both actor LoRA and critic — block-wise
@@ -908,10 +1005,8 @@ def main():
                 f"clip_frac={grpo_metrics.get('clip_frac')}). Skipping critic update.",
                 flush=True,
             )
-            # actor optimizer.step was already called inside the helper, but if
-            # the loss was nan/inf, gradients were nan/inf too — Adam may have
-            # corrupted weights. Best we can do is continue; safe-guard via the
-            # grad-norm clip already applied.
+            # The helper already refused to optim.step() on a non-finite grad
+            # norm, so weights are intact; skip the critic update + logging.
             continue
 
         # ---- AR critic co-training (paper-faithful, optional) ----
@@ -1010,6 +1105,13 @@ def main():
             "fve": fve,
             "fve_pct": fve * 100.0,
             "fve_baseline": fve_baseline,
+            "fve_baseline_meannorm": fve_baseline_meannorm,
+            # FVE under the old (pre-2026-06-09) meannorm baseline, for
+            # comparing against historical wandb curves only.
+            "fve_pct_meannorm": (
+                (1.0 - (-float(np.mean(valid_rewards))) / fve_baseline_meannorm) * 100.0
+                if valid_rewards else float("nan")
+            ),
             "advantage_mean": adv.mean().item(),
             "advantage_std": adv.std().item(),
             "extraction_rate": extraction_rate,
@@ -1182,7 +1284,20 @@ def main():
             out_dir = save_dir / f"iter_{step + 1:06d}"
             out_dir.mkdir(parents=True, exist_ok=True)
             actor.save_pretrained(str(out_dir))
-            print(f"[save] LoRA → {out_dir}")
+            if args.train_critic:
+                # Save the co-trained critic alongside the actor (LoRA + head,
+                # ~100MB) — it's the reward model behind this run's FVE curve,
+                # and resume needs it to avoid a reward discontinuity.
+                from safetensors.torch import save_file as _save_file
+                crit_dir = out_dir / "critic"
+                crit_dir.mkdir(exist_ok=True)
+                _crit_sd = {n: p_.detach().cpu().contiguous()
+                            for n, p_ in critic.named_parameters()
+                            if ("lora_" in n) or n.startswith("value_head")}
+                _save_file(_crit_sd, str(crit_dir / "ar_lora_value_head.safetensors"))
+                (crit_dir / "ar_meta.json").write_text(_json.dumps(ar_meta, indent=2))
+            print(f"[save] LoRA → {out_dir}"
+                  + (" (+ co-trained critic)" if args.train_critic else ""))
 
     print("done.")
     if not args.no_wandb:
