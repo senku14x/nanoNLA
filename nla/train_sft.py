@@ -45,6 +45,7 @@ from nla.models import NLACriticModel
 from nla.schema import (
     INJECT_PLACEHOLDER,
     EXPLANATION_RE,
+    extract_explanation,
     normalize_activation,
     resolve_target_scale,
 )
@@ -171,6 +172,71 @@ def load_sft_dataset(parquet_path, n_max=None, *, mode):
                 row["response"] = responses[i]
             rows.append(row)
     return rows
+
+
+def load_heldout_explanation_pairs(parquet_path, n_rows):
+    """(explanation, activation) pairs from an AV-split parquet (has `response`).
+
+    The AV split is DOC-DISJOINT from the AR training data by stage-1
+    construction, so FVE on these pairs is a genuine held-out number —
+    training-batch FVE overstates quality once the data is multi-epoch.
+    """
+    pf = pq.ParquetFile(parquet_path)
+    pairs = []
+    for rg_idx in range(pf.num_row_groups):
+        if len(pairs) >= n_rows:
+            break
+        rg = pf.read_row_group(rg_idx, columns=["response", "activation_vector"])
+        responses = rg.column("response").to_pylist()
+        acts_col = rg.column("activation_vector").combine_chunks()
+        acts = (acts_col.flatten().to_numpy(zero_copy_only=False)
+                .astype(np.float32).reshape(len(acts_col), -1))
+        for resp, act in zip(responses, acts):
+            expl = extract_explanation(resp)
+            if expl is None:
+                continue
+            pairs.append((expl, act))
+            if len(pairs) >= n_rows:
+                break
+    return pairs
+
+
+@torch.no_grad()
+def heldout_fve_mse(critic, tokenizer, pairs, template, mse_scale_f, device,
+                    micro_batch=16, max_len=1024):
+    """Mean per-sample MSE on normalized (pred, gold) over held-out pairs.
+
+    Returns (mean_mse, n_scored). Caller divides by a predict-the-mean
+    baseline for FVE. Skips pairs whose critic prompt exceeds max_len
+    (would truncate the suffix anchor).
+    """
+    mses = []
+    for cs in range(0, len(pairs), micro_batch):
+        chunk = pairs[cs:cs + micro_batch]
+        ids_list, golds = [], []
+        for expl, act in chunk:
+            ids = tokenizer.encode(template.format(explanation=expl),
+                                   add_special_tokens=False)
+            if not 0 < len(ids) <= max_len:
+                continue
+            ids_list.append(torch.tensor(ids, dtype=torch.long))
+            golds.append(act)
+        if not ids_list:
+            continue
+        bs = len(ids_list)
+        T = max(t.numel() for t in ids_list)
+        batch_ids = torch.full((bs, T), tokenizer.eos_token_id,
+                               dtype=torch.long, device=device)
+        attn = torch.zeros((bs, T), dtype=torch.long, device=device)
+        for i, t in enumerate(ids_list):
+            batch_ids[i, : t.numel()] = t.to(device)
+            attn[i, : t.numel()] = 1
+        pred = critic_predict(critic, batch_ids, attn, mse_scale_f)
+        gold = torch.tensor(np.stack(golds), dtype=torch.float32, device=device)
+        pred_n = normalize_activation(pred, mse_scale_f)
+        gold_n = normalize_activation(gold, mse_scale_f)
+        mses.extend(((pred_n - gold_n) ** 2).mean(dim=-1).tolist())
+    return float(np.mean(mses)) if mses else float("nan"), len(mses)
 
 
 # ----------------------------------------------------------------------------
@@ -398,6 +464,12 @@ def main():
     p.add_argument("--gradient-accumulation-steps", type=int, default=1)
     p.add_argument("--ar-num-layers", type=int, default=25,
                    help="K+1 for AR mode — truncate base to this many transformer blocks")
+    p.add_argument("--heldout-parquet", default=None,
+                   help="AR mode: AV-split parquet for held-out FVE (doc-disjoint "
+                        "from AR training data by stage-1 construction). "
+                        "Evaluated every --heldout-every steps.")
+    p.add_argument("--heldout-rows", type=int, default=1000)
+    p.add_argument("--heldout-every", type=int, default=100)
     p.add_argument("--strip-final-norm", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="AR mode: replace the backbone's final RMSNorm with "
@@ -600,6 +672,24 @@ def main():
         print(f"[ar] predict-the-mean MSE baseline = {fve_baseline:.4f} "
               f"(paper def; meannorm baseline = {_bl_meannorm:.4f})")
 
+    # ---- AR-only: held-out FVE pairs (doc-disjoint AV split) ----
+    heldout_pairs = None
+    heldout_baseline = None
+    if args.mode == "ar" and args.heldout_parquet:
+        assert cfg.critic_prompt_template is not None, (
+            "--heldout-parquet needs critic_prompt_template in the sidecar"
+        )
+        heldout_pairs = load_heldout_explanation_pairs(
+            args.heldout_parquet, args.heldout_rows,
+        )
+        _h_acts = torch.tensor(
+            np.stack([a for _, a in heldout_pairs]), dtype=torch.float32,
+        )
+        _, heldout_baseline = compute_predict_mean_baselines(_h_acts, mse_scale_f)
+        del _h_acts
+        print(f"[ar] {len(heldout_pairs)} held-out pairs from "
+              f"{args.heldout_parquet}; baseline (paper def) = {heldout_baseline:.4f}")
+
     # ---- wandb ----
     if not args.no_wandb:
         wandb.init(project=args.wandb_project, name=args.wandb_name, config=vars(args))
@@ -699,6 +789,22 @@ def main():
             log["resp_tokens"] = accum_resp_tokens
             line += f" | resp_toks {accum_resp_tokens}"
         print(line, flush=True)
+
+        # ---- held-out FVE (AR mode, doc-disjoint) ----
+        if heldout_pairs is not None and (
+            (step + 1) % args.heldout_every == 0 or (step + 1) == args.num_steps
+        ):
+            model.eval()
+            h_mse, h_n = heldout_fve_mse(
+                model, tokenizer, heldout_pairs, cfg.critic_prompt_template,
+                mse_scale_f, device, max_len=args.max_len,
+            )
+            model.train()
+            h_fve = (1.0 - h_mse / heldout_baseline) * 100.0
+            log["heldout_fve_pct"] = h_fve
+            log["heldout_mse"] = h_mse
+            print(f"  [heldout@{step}] mse {h_mse:.4f} | FVE {h_fve:.1f}% "
+                  f"(n={h_n})", flush=True)
         if not args.no_wandb:
             wandb.log(log, step=step)
 
