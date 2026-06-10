@@ -5,8 +5,11 @@ which stage-1 partitions DOC-DISJOINT from the AR-SFT training data — so this
 is a clean held-out number, unlike the training-batch FVE train_sft prints.
 
 Also runs a shuffled-pairing control (explanations re-paired with random
-activations): real FVE >> 0 with shuffled FVE ~ 0 demonstrates the critic is
-actually reading the explanation, mirroring the paper's shuffled-pair control.
+activations). Expected: strongly NEGATIVE FVE (~ -(1 - mse/baseline) with
+mse ~ 2x variance) — a critic that reads the explanation predicts a specific
+wrong direction for a mismatched pair, which is worse than predicting the
+mean. FVE ~ 0 on shuffled pairs would mean the critic ignores the explanation
+and outputs the dataset mean.
 
 Usage:
   python -m scripts.eval_ar_heldout \
@@ -116,7 +119,8 @@ def main():
     )
     fve_s = 1.0 - mse_s / bl_rawvar
     print(f"[control] shuffled-pair mse = {mse_s:.4f} over {n_s} → "
-          f"FVE = {fve_s * 100:.1f}%  (should be ~0)")
+          f"FVE = {fve_s * 100:.1f}%  (strongly negative = critic reads the explanation; "
+          f"~0 = critic ignores it)")
     print(f"RESULT heldout_fve_pct={fve * 100:.2f} shuffled_fve_pct={fve_s * 100:.2f} "
           f"n={n} baseline_rawvar={bl_rawvar:.4f}")
 
