@@ -44,7 +44,6 @@ from nla.injection import karvonen_inject_in_residual
 from nla.models import NLACriticModel
 from nla.schema import (
     INJECT_PLACEHOLDER,
-    EXPLANATION_RE,
     extract_explanation,
     normalize_activation,
     resolve_target_scale,
@@ -296,6 +295,14 @@ def init_critic_from_base(base_ckpt: str, num_layers: int, dtype, quant_config=N
         inner = inner.model
     # Keep only the first num_layers blocks
     inner.layers = torch.nn.ModuleList(list(inner.layers)[:num_layers])
+    # Truncate the BACKBONE's own config too — NLACriticModel.save_pretrained
+    # delegates to backbone.save_pretrained, which writes backbone.config.
+    # Leaving it at the full depth makes a full (non-LoRA) AR save claim 36
+    # layers with weights for 25; a later from_pretrained would then randomly
+    # initialize the missing blocks and silently predict garbage.
+    base.config.num_hidden_layers = num_layers
+    if getattr(base.config, "layer_types", None) is not None:
+        base.config.layer_types = list(base.config.layer_types)[:num_layers]
     if strip_final_norm:
         # Design §4: RAW residual stream → value head. The full model's final
         # RMSNorm was trained for the LAST layer's output; applying it to the
@@ -595,6 +602,14 @@ def main():
             )
             if dmap is None:
                 model = model.to(device)
+            # from_pretrained ALWAYS strips the final norm, regardless of the
+            # CLI flag — record what actually happened, or RL would rebuild
+            # the critic differently than it was trained.
+            if not args.strip_final_norm:
+                print("[ar] NOTE: --no-strip-final-norm ignored on the "
+                      "prepared-critic path (from_pretrained always strips); "
+                      "recording final_norm_stripped=true")
+            args.strip_final_norm = True
         else:
             print(f"[ar] truncating base {args.base_ckpt} to {args.ar_num_layers} "
                   f"layers (quant={args.quant})")
@@ -638,6 +653,15 @@ def main():
     print(f"[data] loading {args.parquet} (max_rows={args.max_rows})", flush=True)
     rows = load_sft_dataset(args.parquet, n_max=args.max_rows, mode=args.mode)
     print(f"[data] {len(rows)} rows", flush=True)
+    if args.mode == "ar" and cfg.critic_suffix_ids:
+        # One-time suffix-anchor sanity check (the sidecar field's stated
+        # purpose): the tokenized critic prompt must end with the expected
+        # "</text> <summary>" ids, or last-token extraction trains on the
+        # wrong position. Row 0 suffices — template drift hits every row.
+        from nla.config import verify_critic_suffix
+        _row0_ids = tokenizer.encode(rows[0]["prompt"], add_special_tokens=False)
+        verify_critic_suffix(_row0_ids, cfg.critic_suffix_ids, context="ar row 0")
+        print(f"[ar] critic suffix anchor verified (row 0)")
 
     # ---- optimizer + LR schedule ----
     try:

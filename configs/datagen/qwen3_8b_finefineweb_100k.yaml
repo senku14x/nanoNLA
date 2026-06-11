@@ -1,6 +1,6 @@
 # NLA datagen — Qwen3-8B over m-a-p/FineFineWeb (100k docs, diverse across 67 domains).
 # 100k × 10 positions = 1M activations, split 25/25/50 → 250k AV-SFT / 250k AR-SFT / 500k RL.
-# Matches the released-checkpoint scale (paper used 100k UltraFineWeb docs × 10 positions).
+# Matches the released-checkpoint scale (paper's open-model runs used 100k UltraFineWeb docs × 5 positions; we use × 10 for more pairs).
 #
 # Stage 2 explanations via Anthropic Message Batches API (Sonnet 4.6, 50% cheaper).
 # Expected batch wallclock: minutes-to-hours per sub-batch, depending on Anthropic queue.

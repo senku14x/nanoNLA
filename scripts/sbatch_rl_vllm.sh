@@ -24,10 +24,12 @@ set -euo pipefail
 # Use the existing vllm-lens venv (has torch 2.9.1+cu128 matching cluster's
 # CUDA 12.8 driver). The auto-bootstrapped nla_vllm venv pulled torch
 # 2.11.0+cu130 which failed at runtime; pinning torch + vllm + peft together
-# in the existing venv is the working combo. Required pkgs:
-#   torch=2.9.1+cu128 cuda=12.8 vllm=0.16.0 vllm_lens=1.1.0
-#   peft=0.13.0 bnb=0.49.2 transformers=4.57.1 (pinned for BPE-merge compat
-#   with the SFT training env).
+# in the existing venv is the working combo. Build the venv with
+# launch/install_vllm_lens.sh — current validated combo (see that script):
+#   vllm==0.19.0 (cu128) + vllm_lens==1.1.0 + transformers==4.57.1
+#   + peft + bitsandbytes + wandb.
+# (An earlier combo used vllm 0.16.0; 0.19.0 is what install_vllm_lens.sh
+# pins now — the hook breaks on vLLM >= 0.22.)
 VENV=/workspace-vast/celeste/envs/vllm-lens
 source "$VENV/bin/activate"
 # Allow pickle-based serialisation so we can pass a lambda to apply_model

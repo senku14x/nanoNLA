@@ -20,6 +20,16 @@ LAST=$(ls -d $SAVE/iter_* 2>/dev/null | sort | tail -1)
 START=$((10#$(basename $LAST | sed "s/iter_0*//")))
 echo "leg starting from $LAST (step $START, target $TARGET)"
 [ "$START" -ge "$TARGET" ] && { echo "already complete"; exit 0; }
+# Circuit breaker: if the PREVIOUS leg started from this same checkpoint, it
+# made zero progress (instant crash, bad config, repeated NaN) — submitting
+# another identical leg would brick-loop the queue until someone notices.
+STATE=$SAVE/.leg_state
+if [ -f "$STATE" ] && [ "$(cat $STATE)" = "$START" ]; then
+  echo "CIRCUIT BREAKER: previous leg also started at step $START and saved no"
+  echo "new checkpoint. Not submitting a successor; investigate before resuming."
+  exit 1
+fi
+echo "$START" > $STATE
 # Submit successor BEFORE training (this script dies unceremoniously at the
 # time limit, so the tail of the script never runs).
 sbatch --dependency=afterany:$SLURM_JOB_ID "$0"

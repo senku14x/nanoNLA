@@ -1,10 +1,13 @@
 """NLACriticModel: truncated transformer + vector value head.
 
-Architecture per docs/design.md §4:
+Architecture:
   - First K transformer layers only (K = extraction layer, set via config override)
   - No final layernorm — raw residual stream goes to head
-  - Linear(d_model, d_model) head, no bias
-  - Forward returns .values at every position; extract at PM-token position for MSE
+  - Linear(d_model, d_model) head, no bias (the paper says "affine"; we drop
+    the bias deliberately — predictions are L2-normalized in the loss anyway,
+    and identity-init is cleaner without an offset term)
+  - Forward returns .values at every position; training extracts at the LAST
+    real token of the critic prompt (suffix-anchored) for the MSE
 
 Layer truncation: set config.num_hidden_layers BEFORE from_pretrained so the
 weight loader only reads K layers. Do NOT slice nn.ModuleList post-hoc — breaks

@@ -34,6 +34,12 @@ def main() -> None:
     p.add_argument("--base-model", required=True, help="HF base model, e.g. Qwen/Qwen3-8B")
     p.add_argument("--chunk-size", type=int, default=512, help="rows per write (bounds memory)")
     p.add_argument("--batch-size", type=int, default=16, help="model forward batch size")
+    p.add_argument("--max-length", type=int, default=4096,
+                   help="extractor context cap — MUST match the original stage-0 "
+                        "extraction (4096 for the published datasets; "
+                        "HFExtractor's bare default is 2048, which would "
+                        "right-truncate long rows and silently regenerate the "
+                        "activation at the wrong position)")
     args = p.parse_args()
 
     pf = pq.ParquetFile(args.inp)
@@ -44,7 +50,8 @@ def main() -> None:
         "input lacks detokenized_text_truncated — cannot regenerate without the source text"
     )
 
-    ext = HFExtractor(model_name=args.base_model, batch_size=args.batch_size)
+    ext = HFExtractor(model_name=args.base_model, batch_size=args.batch_size,
+                      max_length=args.max_length)
     vec_type = pa.list_(pa.float32(), ext.d_model)
 
     writer = None
@@ -57,6 +64,22 @@ def main() -> None:
         layer = layers.pop()
 
         results = ext.extract(texts, layer)
+        # Round-trip check: re-encoding decode(token_ids[:pos+1]) must
+        # reproduce the original token count, or the final token (= the
+        # extraction position) is not the one the explanation describes.
+        # n_raw_tokens ships in the slim parquet exactly for this.
+        if "n_raw_tokens" in tbl.schema.names:
+            n_raw = tbl.column("n_raw_tokens").to_pylist()
+            bad = [(done + i, len(r.token_ids), n)
+                   for i, (r, n) in enumerate(zip(results, n_raw))
+                   if len(r.token_ids) != n]
+            assert not bad, (
+                f"{len(bad)} rows fail the tokenization round-trip "
+                f"(first: row {bad[0][0]} re-encoded to {bad[0][1]} tokens, "
+                f"stage-0 had {bad[0][2]}). These rows are not faithfully "
+                f"regenerable — check --max-length matches the original "
+                f"extraction, or filter the offending rows."
+            )
         # the prefix ends exactly at the extraction token -> it is the last token
         vecs = [r.hidden_states[-1].tolist() for r in results]
         tbl = tbl.append_column("activation_vector", pa.array(vecs, type=vec_type))

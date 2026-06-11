@@ -11,7 +11,9 @@ requires-python = ">=3.10"
 license = {file = "LICENSE"}
 dependencies = [
     "torch",
-    "transformers",
+    # ==4.57.1: transformers v5's apply_chat_template API break crashes the
+    # trainers; the marker tokenization itself is stable across versions.
+    "transformers==4.57.1",
     "safetensors",
     "httpx",
     "orjson",
@@ -20,20 +22,25 @@ dependencies = [
     "pyarrow",
     "datasets",
     "anthropic",
+    "peft",
+    "wandb",
+    "tqdm",
+    "huggingface_hub",
 ]
-# NOT pip-installable here — install separately per docs/setup.md:
-#   miles    : git clone radixark/miles, build_conda.sh, then git apply nla/miles_patches/*.patch
-#   sglang   : pip install "sglang[all]>=0.5.6", then bash patches/apply_sglang_patches.sh /path/to/sglang
-#   megatron : optional, only for the Megatron backend (70B+)
+# Optional, installed separately:
+#   bitsandbytes : 4-bit (QLoRA) loading + 8-bit Adam — trainers fall back to
+#                  fp32 Adam without it, but --quant 4bit requires it
+#   vllm + vllm-lens : fast RL rollout backend, own venv — see
+#                  launch/install_vllm_lens.sh (pins vllm==0.19.0)
 
 [project.urls]
-Homepage = "https://github.com/kitft/natural_language_autoencoders"
+Homepage = "https://github.com/ceselder/nanoNLA"
 
 [tool.setuptools.packages.find]
 include = ["nla*"]
 
 [tool.setuptools.package-data]
-nla = ["miles_patches/*", "datagen/*.yaml"]
+nla = ["datagen/*.yaml"]
 
 [tool.ruff]
 line-length = 119

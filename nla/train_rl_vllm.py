@@ -63,7 +63,6 @@ from nla.config import load_nla_config
 from nla.injection import karvonen_inject_in_residual
 from nla.models import NLACriticModel
 from nla.schema import (
-    EXPLANATION_RE,
     extract_explanation,
     normalize_activation,
     resolve_target_scale,
@@ -784,9 +783,18 @@ def main():
         print(f"[actor] gradient_checkpointing ENABLED")
 
     # ---- critic (frozen or co-trained) ----
-    print(f"[critic] loading {args.ar_ckpt}")
+    # When resuming and a co-trained critic snapshot exists, load it instead
+    # of the SFT init — otherwise the reward model snaps back and the reward
+    # scale is discontinuous across the resume (same fix as the HF twin).
+    ar_src = args.ar_ckpt
+    if args.resume_from_lora is not None:
+        _crit_latest = Path(args.save_dir) / "critic_latest"
+        if (_crit_latest / "value_head.safetensors").exists():
+            ar_src = str(_crit_latest)
+            print(f"[critic] RESUMING co-trained critic from {ar_src}")
+    print(f"[critic] loading {ar_src}")
     critic = NLACriticModel.from_pretrained(
-        args.ar_ckpt, torch_dtype=torch.bfloat16,
+        ar_src, torch_dtype=torch.bfloat16,
     ).to(device)
     # NLACriticModel.from_pretrained returns params with requires_grad=True by
     # default. Freeze everything first, then conditionally unfreeze backbone.

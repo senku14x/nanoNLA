@@ -34,15 +34,20 @@ def main():
     marker_pos = [i for i, t in enumerate(ids) if t == inj[0]][0]
 
     torch.manual_seed(0)
-    act = torch.randn(1, d_model, dtype=torch.float32)
+    # SHAPE MATTERS: must be 3-D [n_layers, n_positions, d]. vllm-lens only
+    # honors position_indices for 3-D tensors; a 2-D [n_layers, d] tensor takes
+    # _worker_ext.py's broadcast branch and ADDs the vector at EVERY prompt +
+    # decode token, silently ignoring position_indices — which still "diverges
+    # from baseline", so a divergence-only check cannot catch it.
+    act = torch.randn(1, 1, d_model, dtype=torch.float32)
 
-    def gen(scale):
+    def gen(scale, pos=None):
         if scale is None:
             sp = SamplingParams(temperature=0.0, max_tokens=50)
         else:
             sv = SteeringVector(activations=act, layer_indices=[args.layer],
                                 scale=float(scale), norm_match=True,
-                                position_indices=[marker_pos])
+                                position_indices=[marker_pos if pos is None else pos])
             sp = SamplingParams(temperature=0.0, max_tokens=50,
                                 extra_args={"apply_steering_vectors": [sv]})
         return llm.generate([prompt], sp)[0].outputs[0].text
@@ -54,11 +59,19 @@ def main():
         out = gen(s)
         results[s] = out
         print(f"scale={s:>4}  differs_from_baseline={out != base}  : {out[:130]!r}", flush=True)
+    # Positional discrimination: injecting the same vector at a DIFFERENT
+    # position must change the output. Broadcast-bugged injection (position
+    # ignored) produces identical text for both → fails this check.
+    at_pos0 = gen(8.0, pos=0)
+    positional = at_pos0 != results[8.0]
+    print(f"scale=8 @pos0  differs_from_@marker={positional}  : {at_pos0[:130]!r}", flush=True)
 
     control_ok = results[0.0] == base          # scale 0 must equal baseline
     injects = results[8.0] != base             # strong scale must diverge
-    print(f"\nCONTROL(scale0==baseline)={control_ok}  STRONG_INJECT_DIVERGES={injects}", flush=True)
-    print("VERDICT: INJECTION_WORKS" if (control_ok and injects) else "VERDICT: INJECTION_NO_EFFECT", flush=True)
+    print(f"\nCONTROL(scale0==baseline)={control_ok}  STRONG_INJECT_DIVERGES={injects}  "
+          f"POSITIONAL_TARGETING={positional}", flush=True)
+    ok = control_ok and injects and positional
+    print("VERDICT: INJECTION_WORKS" if ok else "VERDICT: INJECTION_BROKEN", flush=True)
 
 
 if __name__ == "__main__":

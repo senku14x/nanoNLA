@@ -53,7 +53,6 @@ from nla.config import load_nla_config
 from nla.injection import karvonen_inject_in_residual
 from nla.models import NLACriticModel
 from nla.schema import (
-    EXPLANATION_RE,
     compute_predict_mean_baselines,
     extract_explanation,
     normalize_activation,
@@ -165,6 +164,7 @@ def build_prompt_text(prompt_msgs, inject_char, tokenizer):
 def rollout_one_prompt(
     actor, tokenizer, prompt_text, activation, vectors_ref,
     inj_id, group_size, max_new_tokens, temperature, device,
+    eos_ids=None,
 ):
     """Generate `group_size` samples for one prompt; capture old log-probs per response token."""
     prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
@@ -201,19 +201,24 @@ def rollout_one_prompt(
     # as LoRA weights update).
     scores = gen_out.logits  # tuple of [G, V]
     prompt_len = prompt_t.shape[1]
-    eos_id = tokenizer.eos_token_id
+    # Trim at ANY stop id, not just tokenizer.eos_token_id: Qwen3's
+    # generation_config lists two ([151645 <|im_end|>, 151643 <|endoftext|>]);
+    # a sample terminating via the second would otherwise keep one forced-pad
+    # token in the loss.
+    if eos_ids is None:
+        eos_ids = {tokenizer.eos_token_id}
     responses = []
     for g in range(group_size):
         resp_ids = full_ids[g, prompt_len:].tolist()
-        # Trim at the first EOS (inclusive). Batched generate() pads samples
-        # that finish early to the group max with pad(=eos) tokens; those
-        # positions were never sampled from the policy. Without trimming,
-        # old_logp/new_logp cover the pads too and the GRPO surrogate + KL
-        # get gradient on garbage positions (diluting real tokens).
-        if eos_id in resp_ids:
-            n_real = resp_ids.index(eos_id) + 1  # keep the terminating EOS
-        else:
-            n_real = len(resp_ids)
+        # Trim at the first stop token (inclusive). Batched generate() pads
+        # samples that finish early to the group max with pad(=eos) tokens;
+        # those positions were never sampled from the policy. Without
+        # trimming, old_logp/new_logp cover the pads too and the GRPO
+        # surrogate + KL get gradient on garbage positions.
+        n_real = next(
+            (i + 1 for i, t in enumerate(resp_ids) if t in eos_ids),
+            len(resp_ids),
+        )
         resp_ids = resp_ids[:n_real]
         text = tokenizer.decode(resp_ids, skip_special_tokens=True)
         # Collect old log_p for each REAL generated token.
@@ -536,7 +541,7 @@ def main():
                    help="prompts per step")
     p.add_argument("--group-size", type=int, default=4,
                    help="samples per prompt (for group baseline)")
-    p.add_argument("--max-new-tokens", type=int, default=160)
+    p.add_argument("--max-new-tokens", type=int, default=150)  # paper's rollout cap
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--lr", type=float, default=5e-6)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
@@ -676,9 +681,13 @@ def main():
     actor.load_adapter(args.av_ckpt, adapter_name="reference")  # frozen KL ref
     actor.set_adapter("default")
     if args.resume_from_lora:
-        # Loud sanity check: a resumed adapter must have non-trivially-different
-        # weights from the reference (a fresh/zero adapter here means the resume
-        # path silently loaded nothing — the bug this block replaces).
+        # Sanity check: a resumed adapter should differ from the reference.
+        # diff == 0 is either the historical resume-ignored bug OR a genuinely
+        # zero-update leg (e.g. all extractions failed → adv ≡ 0); a hard
+        # assert here would brick-loop the self-chaining sbatch on the latter,
+        # so warn loudly instead. NOTE: this does NOT catch a partial adapter
+        # load (PEFT load_adapter never raises on missing keys) — fresh-init
+        # tensors also differ from the reference.
         _diff = 0.0
         _sd = actor.state_dict()
         for n in list(_sd):
@@ -687,10 +696,18 @@ def main():
                 if _ref is not None:
                     _diff += (_sd[n].float() - _ref.float()).pow(2).sum().item()
         print(f"[actor] resumed; sum((lora_default - lora_reference)²) = {_diff:.3e}")
-        assert _diff > 0.0, (
-            f"resume-from-lora loaded weights identical to the AV-SFT reference "
-            f"— {args.resume_from_lora} is not a trained RL adapter?"
-        )
+        if _diff == 0.0:
+            print(f"[actor] WARNING: resumed adapter is IDENTICAL to the AV-SFT "
+                  f"reference — either {args.resume_from_lora} is untrained or "
+                  f"the resume load silently failed.", flush=True)
+    # The reference adapter is the frozen KL anchor — pin requires_grad False
+    # explicitly. (PEFT's set_adapter toggles trainability when switching
+    # adapters during the update loop; the optimizer snapshot taken below
+    # protects against drift today, but be explicit so a future optimizer
+    # rebuild can't silently start training the anchor.)
+    for _n, _p in actor.named_parameters():
+        if ".reference." in _n:
+            _p.requires_grad_(False)
     actor.print_trainable_parameters()
     actor.train()
     if args.gradient_checkpointing:
@@ -713,6 +730,11 @@ def main():
             print(f"[critic] RESUMING co-trained critic from {ar_src}")
     ar_meta = _json.loads((ar_src / "ar_meta.json").read_text())
     print(f"[critic] AR-LoRA from {ar_src}: {ar_meta}")
+    assert ar_meta.get("quant") != "4bit" or quant_config is not None, (
+        f"AR-LoRA was trained on a 4-bit backbone (ar_meta quant=4bit) but this "
+        f"run uses --quant {args.quant}: the LoRA's baked-in quantization-error "
+        f"compensation would silently mismatch a bf16 backbone."
+    )
     ar_quant = quant_config if ar_meta.get("quant") == "4bit" else None
     ar_dmap, ar_maxmem = _resolve_device_map(args.device_map, args.max_gpu_mem, ar_quant)
     critic = init_critic_from_base(
@@ -731,8 +753,16 @@ def main():
     ), critic.backbone)
     _ar_sd = _load_file(str(ar_src / "ar_lora_value_head.safetensors"))
     _miss, _unexp = critic.load_state_dict(_ar_sd, strict=False)
+    # `missing` is always the whole frozen backbone (uninformative);
+    # `unexpected` non-empty means a key-schema drift left the reward model
+    # at init — fail loudly, not via a print nobody reads.
+    _n_lora = sum(1 for k in _ar_sd if "lora_" in k)
+    assert _n_lora > 0 and not _unexp, (
+        f"AR weights load mismatch: {_n_lora} lora tensors in file, "
+        f"unexpected={_unexp[:3]} — PEFT key-schema drift?"
+    )
     print(f"[critic] loaded {len(_ar_sd)} AR tensors "
-          f"(missing={len(_miss)} unexpected={len(_unexp)})")
+          f"(missing={len(_miss)} backbone keys, unexpected=0)")
     # Freeze everything; conditionally unfreeze LoRA + value_head for co-training.
     for p_ in critic.parameters():
         p_.requires_grad_(False)
@@ -772,6 +802,16 @@ def main():
     # ---- karvonen hook on actor ----
     vectors_ref = [None]
     _register_karvonen_hook(actor, vectors_ref, inj_id, left_id, right_id, layer_idx=1)
+
+    # All stop ids for rollout EOS-trimming (Qwen3 lists two in its
+    # generation_config; trimming on tokenizer.eos_token_id alone would leave
+    # one forced-pad token in the loss for sequences stopping on the other).
+    eos_ids = {tokenizer.eos_token_id}
+    _gc_eos = getattr(getattr(actor, "generation_config", None), "eos_token_id", None)
+    if _gc_eos is not None:
+        eos_ids.update(_gc_eos if isinstance(_gc_eos, (list, tuple)) else [_gc_eos])
+    eos_ids.discard(None)
+    print(f"[rollout] EOS-trim ids: {sorted(eos_ids)}")
 
     # ---- dataset ----
     print(f"[data] loading {args.rl_parquet} (max_rows={args.max_rows})", flush=True)
@@ -947,6 +987,7 @@ def main():
             responses = rollout_one_prompt(
                 actor, tokenizer, prompt_text, activation, vectors_ref,
                 inj_id, args.group_size, args.max_new_tokens, args.temperature, device,
+                eos_ids=eos_ids,
             )
             for r in responses:
                 expl = extract_explanation(r["text"])
@@ -1283,11 +1324,11 @@ def main():
         if (step + 1) % args.save_every == 0:
             out_dir = save_dir / f"iter_{step + 1:06d}"
             out_dir.mkdir(parents=True, exist_ok=True)
-            actor.save_pretrained(str(out_dir))
+            # Critic FIRST: resume keys off the actor's adapter_config.json,
+            # so a crash between the two saves must leave critic-without-actor
+            # (resume fails loudly) rather than actor-without-critic (resume
+            # silently falls back to the SFT critic → reward discontinuity).
             if args.train_critic:
-                # Save the co-trained critic alongside the actor (LoRA + head,
-                # ~100MB) — it's the reward model behind this run's FVE curve,
-                # and resume needs it to avoid a reward discontinuity.
                 from safetensors.torch import save_file as _save_file
                 crit_dir = out_dir / "critic"
                 crit_dir.mkdir(exist_ok=True)
@@ -1296,6 +1337,7 @@ def main():
                             if ("lora_" in n) or n.startswith("value_head")}
                 _save_file(_crit_sd, str(crit_dir / "ar_lora_value_head.safetensors"))
                 (crit_dir / "ar_meta.json").write_text(_json.dumps(ar_meta, indent=2))
+            actor.save_pretrained(str(out_dir))
             print(f"[save] LoRA → {out_dir}"
                   + (" (+ co-trained critic)" if args.train_critic else ""))
 

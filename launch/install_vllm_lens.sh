@@ -29,7 +29,15 @@ set -euo pipefail
 VENV=${1:-/workspace-vast/celeste/envs/vllm-lens}
 
 uv venv "$VENV" --python 3.12
-uv pip install --python "$VENV/bin/python" "vllm==0.19.0" "vllm-lens==1.1.0" --torch-backend=cu128
+# transformers MUST stay <5 (==4.57.1, the repo-wide pin): vllm's resolver
+# otherwise pulls v5, whose apply_chat_template API break crashes the
+# trainers. peft/bitsandbytes/wandb are required by nla.train_rl_vllm itself
+# (this venv is what scripts/sbatch_rl_vllm.sh sources — vllm alone can
+# import vllm_lens but cannot run the trainer).
+uv pip install --python "$VENV/bin/python" \
+  "vllm==0.19.0" "vllm-lens==1.1.0" \
+  "transformers==4.57.1" "peft" "bitsandbytes" "wandb" \
+  --torch-backend=cu128
 
 echo "=== verify (imports vllm._C -> exercises libcudart) ==="
 "$VENV/bin/python" - <<'PY'
