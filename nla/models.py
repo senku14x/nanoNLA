@@ -76,6 +76,12 @@ class NLACriticModel(PreTrainedModel):
     PreTrainedModel machinery. Only the forward path + head are NLA-specific.
     """
 
+    # We never run attention ourselves; backbone does and validates its own
+    # attn_implementation. Advertise support so HF doesn't refuse construction.
+    _supports_sdpa = True
+    _supports_flash_attn_2 = True
+    _supports_flex_attn = True
+
     def __init__(self, config, backbone: PreTrainedModel):
         super().__init__(config)
         self.backbone = backbone
@@ -198,7 +204,13 @@ class NLACriticModel(PreTrainedModel):
         # out.last_hidden_state: [B, T, d_model] — post last-kept transformer block,
         # pre-final-LN (norm was replaced with Identity in from_pretrained).
         h = out.last_hidden_state
-        return NLACriticOutput(values=self.value_head(h), backbone_last_hidden=h)
+        # Align dtype before the value_head matmul: under 4-bit QLoRA,
+        # prepare_model_for_kbit_training casts the backbone's final norm to
+        # fp32, so h may be fp32 while value_head is bf16 (or vice-versa).
+        return NLACriticOutput(
+            values=self.value_head(h.to(self.value_head.weight.dtype)),
+            backbone_last_hidden=h,
+        )
 
     def get_input_embeddings(self):
         return self.backbone.get_input_embeddings()

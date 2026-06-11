@@ -1,16 +1,27 @@
-"""Self-contained NLA GRPO training: Karvonen injection, LoRA actor.
+"""NLA GRPO with vLLM rollouts (TRL/prime-rl-style weight broadcast + TIS).
 
-Architecture:
-  - Actor: Qwen3-8B + Karvonen layer-1 ADD injection (from AV-SFT ckpt).
-           Wrapped with LoRA so backbone stays frozen (memory: 16GB base + ~100MB
-           LoRA + small Adam states + activations all fit on one H200).
-  - Reference policy: same model with LoRA adapter disabled (PEFT context manager).
-           No second model copy.
-  - Critic: NLACriticModel (truncated K+1-layer backbone + value head). Frozen,
-            bf16, eval-only — produces predicted activation given the actor's
-            explanation. Reward = -MSE(pred, gold).
-  - Rollout: HF model.generate() with the same Karvonen hook used in training.
-             Slower than vLLM but no weight-sync complexity. On-policy.
+Same skeleton as train_rl_self_contained.py, but rollout uses vLLM via
+vllm-lens's SteeringVector for ~5-10× faster batched generation. After each
+optimizer step (configurable via --vllm-sync-every) the LoRA-merged actor
+weights get pushed into vLLM in-place, keeping the rollout policy on-policy.
+
+The pattern is exactly how TRL's GRPOTrainer colocate mode does it:
+  1. actor.merge_adapter()              # LoRA → base, in-place
+  2. llm.collective_rpc("load_weights", args=(list(state_dict.items()),))
+  3. actor.unmerge_adapter()            # restore LoRA for training
+
+Residual mismatch from vLLM/HF kernel + precision differences is corrected
+in the GRPO loss via Truncated Importance Sampling (TIS): clip the importance
+ratio at a fixed cap C (default 2.0). Without weight sync, TIS alone is
+insufficient (policy drift unbounded) — but with periodic full-state sync,
+TIS just handles the kernel-level residual which is small.
+
+Memory budget on H200 (141GB):
+  - vLLM-lens LLM (gpu_memory_utilization=0.35): ~49GB
+  - HF actor + LoRA (bf16): ~17GB
+  - HF critic + 8-bit Adam: ~17GB
+  - Activations during per-microbatch fused train forward: ~30GB peak
+  - Total: ~115GB peak. Fits.
 
 GRPO objective (DeepSeekMath / DeepSeek-R1):
   L = -E[min(r * A, clip(r, 1-eps, 1+eps) * A)] + beta * KL(pi || pi_ref)
@@ -43,9 +54,8 @@ import numpy as np
 import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
-from peft import (LoraConfig, PeftModel, get_peft_model,
-                  inject_adapter_in_model, prepare_model_for_kbit_training)
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import wandb
 
@@ -54,12 +64,10 @@ from nla.injection import karvonen_inject_in_residual
 from nla.models import NLACriticModel
 from nla.schema import (
     EXPLANATION_RE,
-    compute_predict_mean_baselines,
     extract_explanation,
     normalize_activation,
     resolve_target_scale,
 )
-from nla.train_sft import _resolve_device_map, init_critic_from_base
 
 
 def cjk_fraction(text: str) -> float:
@@ -162,75 +170,174 @@ def build_prompt_text(prompt_msgs, inject_char, tokenizer):
 
 
 @torch.no_grad()
-def rollout_one_prompt(
-    actor, tokenizer, prompt_text, activation, vectors_ref,
-    inj_id, group_size, max_new_tokens, temperature, device,
+def rollout_batch_vllm(
+    llm, tokenizer, prompts_with_activations,
+    inj_id, group_size, max_new_tokens, temperature, injection_layer=1,
 ):
-    """Generate `group_size` samples for one prompt; capture old log-probs per response token."""
-    prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
-    prompt_t = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-    batched = prompt_t.expand(group_size, -1).contiguous()
-    v_batch = activation.unsqueeze(0).expand(group_size, -1).contiguous().to(device).float()
-    vectors_ref[0] = v_batch
-    try:
-        gen_out = actor.generate(
-            input_ids=batched,
-            attention_mask=torch.ones_like(batched),
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=temperature,
-            # Explicitly override sampler — Qwen3's generation_config.json may
-            # set top_p<1.0 / top_k>0 / repetition_penalty by default. Any of
-            # these introduce -inf in the sampler logits, breaking the
-            # importance ratio (exp(new_lp - old_lp) → inf).
-            top_p=1.0,
-            top_k=0,
-            repetition_penalty=1.0,
-            pad_token_id=tokenizer.eos_token_id,
-            return_dict_in_generate=True,
-            output_logits=True,  # RAW pre-processor logits — scores are post-top_p
-                                 # and assign -inf to filtered tokens, which would
-                                 # make exp(new_lp - old_lp) = inf in GRPO loss.
+    """Batched rollout via vLLM. ALL prompts × ALL group samples in one call.
+
+    `prompts_with_activations`: list of (prompt_text, activation_tensor_[d]) pairs.
+                                Each prompt gets `group_size` samples.
+
+    Returns list of dicts (one per sample, length = len(prompts) * group_size):
+        {text, full_ids, prompt_len, old_logp, n_resp, prompt_idx}
+
+    Each sample carries `prompt_idx` so the GRPO loop can group samples by prompt
+    for advantage normalisation.
+    """
+    from vllm import SamplingParams
+    from vllm_lens import SteeringVector
+
+    # Pre-tokenize every prompt so we know prompt_len for each sample and can
+    # locate the marker position for the steering vector.
+    flat_prompts = []
+    flat_steering = []
+    flat_meta = []  # (prompt_idx, group_idx, prompt_len)
+    for pi, (prompt_text, activation) in enumerate(prompts_with_activations):
+        prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+        # Find the SINGLE marker token position (asserted by injection module too).
+        marker_positions = [i for i, t in enumerate(prompt_ids) if t == inj_id]
+        assert len(marker_positions) == 1, (
+            f"prompt {pi}: expected 1 marker (inj_id={inj_id}), got {len(marker_positions)}"
         )
-    finally:
-        vectors_ref[0] = None
-    full_ids = gen_out.sequences  # [G, prompt_len + new_len]
-    # gen_out.logits: tuple of [G, V], RAW pre-softmax model logits at each step.
-    # Captured under the SAME hook-applied forward used for training, so old_lp
-    # and new_lp come from the same model snapshot at step 0 (then drift only
-    # as LoRA weights update).
-    scores = gen_out.logits  # tuple of [G, V]
-    prompt_len = prompt_t.shape[1]
-    eos_id = tokenizer.eos_token_id
+        marker_pos = marker_positions[0]
+        # SHAPE MATTERS: activations must be 3-D [n_layers, n_positions, d].
+        # vllm-lens only honors position_indices for 3-D tensors; a 2-D
+        # [n_layers, d] tensor takes the BROADCAST branch in _worker_ext.py
+        # (_apply_steering) and gets ADDed at EVERY prompt + decode token,
+        # silently ignoring position_indices — rollouts then come from a
+        # globally-steered model the training forward never sees.
+        sv = SteeringVector(
+            activations=activation.view(1, 1, -1).cpu().float(),  # [1, 1, d]
+            layer_indices=[injection_layer],
+            scale=1.0,
+            norm_match=True,
+            position_indices=[marker_pos],
+        )
+        for gi in range(group_size):
+            flat_prompts.append(prompt_text)
+            flat_steering.append(sv)
+            flat_meta.append((pi, gi, len(prompt_ids)))
+
+    sampling_params_list = [
+        SamplingParams(
+            temperature=temperature,
+            max_tokens=max_new_tokens,
+            top_p=1.0, top_k=-1,
+            logprobs=1,  # capture logprob of the sampled token (off-by-one corrected below)
+            extra_args={"apply_steering_vectors": [sv]},
+        )
+        for sv in flat_steering
+    ]
+
+    outputs = llm.generate(flat_prompts, sampling_params_list)
+    assert len(outputs) == len(flat_prompts)
+
     responses = []
-    for g in range(group_size):
-        resp_ids = full_ids[g, prompt_len:].tolist()
-        # Trim at the first EOS (inclusive). Batched generate() pads samples
-        # that finish early to the group max with pad(=eos) tokens; those
-        # positions were never sampled from the policy. Without trimming,
-        # old_logp/new_logp cover the pads too and the GRPO surrogate + KL
-        # get gradient on garbage positions (diluting real tokens).
-        if eos_id in resp_ids:
-            n_real = resp_ids.index(eos_id) + 1  # keep the terminating EOS
-        else:
-            n_real = len(resp_ids)
-        resp_ids = resp_ids[:n_real]
-        text = tokenizer.decode(resp_ids, skip_special_tokens=True)
-        # Collect old log_p for each REAL generated token.
-        old_logp = []
-        for t, step_logits in enumerate(scores):
-            if t >= n_real:
-                break
-            lp = F.log_softmax(step_logits[g].float(), dim=-1)
-            old_logp.append(lp[resp_ids[t]].item())
+    for out, sv, (prompt_idx, group_idx, prompt_len) in zip(outputs, flat_steering, flat_meta):
+        out0 = out.outputs[0]
+        text = out0.text
+        # Token IDs of the generated continuation.
+        gen_token_ids = list(out0.token_ids)
+        # vLLM's `logprobs` is a list of dict[token_id → Logprob] per generated step.
+        # Logprob.logprob is the log-prob of THAT token from the model's softmax.
+        # When sampling_params.logprobs=1, vLLM returns the top-1 + the sampled token's
+        # logprob (sometimes the sampled is the top-1, sometimes not).
+        old_lp = []
+        for t, tok_id in enumerate(gen_token_ids):
+            # With logprobs=1 vLLM always returns the SAMPLED token's logprob
+            # (plus top-1). If either lookup fails, something structural broke
+            # (vLLM version drift) — substituting 0.0 or the top-1 token's
+            # logprob would silently corrupt the importance ratio, so crash.
+            assert out0.logprobs is not None and t < len(out0.logprobs), (
+                f"vLLM returned no logprob for generated step {t} "
+                f"(len={0 if out0.logprobs is None else len(out0.logprobs)})"
+            )
+            d = out0.logprobs[t]
+            assert tok_id in d, (
+                f"sampled token {tok_id} missing from vLLM logprobs dict at "
+                f"step {t} (keys={list(d)[:5]}…) — vLLM API drift?"
+            )
+            old_lp.append(float(d[tok_id].logprob))
+        full_ids = torch.tensor(
+            list(out.prompt_token_ids) + gen_token_ids, dtype=torch.long,
+        )
         responses.append({
             "text": text,
-            "full_ids": full_ids[g, : prompt_len + n_real],
+            "full_ids": full_ids,
             "prompt_len": prompt_len,
-            "old_logp": torch.tensor(old_logp, dtype=torch.float32),
-            "n_resp": len(old_logp),
+            "old_logp": torch.tensor(old_lp, dtype=torch.float32),
+            "n_resp": len(old_lp),
+            "prompt_idx": prompt_idx,
         })
     return responses
+
+
+def _vllm_load_weights_chunk(model, chunk):
+    """Module-level helper for vLLM's apply_model — pickle can't serialise
+    local lambdas across worker processes, but it can pickle top-level fns.
+    Each worker calls this with the actual model + a list of (name, tensor)."""
+    model.load_weights(iter(chunk))
+
+
+def sync_actor_to_vllm(actor, llm):
+    """TRL-style colocate weight sync: merge LoRA, push state_dict to vLLM, unmerge.
+
+    Matches `trl/generation/vllm_generation.py:sync_weights` for the PEFT path:
+      gather_if_zero3("model.merge_adapter()") → push name/param pairs →
+      reset_prefix_cache → unmerge.
+
+    Returns wall-time in seconds.
+    """
+    t0 = time.time()
+    actor.merge_adapter()
+    try:
+        # PEFT prepends "base_model.model." to every param name when wrapping;
+        # strip that so the names match vLLM's HF-style state_dict.
+        # Also drop the LoRA-A/B tensors themselves (they're tiny + already merged).
+        # Bucket params by layer — vLLM v1's msgspec serialiser caps a single
+        # encode at 2**32 bytes (~4 GB) and an 8B-param bf16 state_dict is
+        # ~16 GB. Push layer-by-layer matches prime-rl's NCCL broadcast
+        # pattern: "Yield non-layer weights first, then each layer's weights."
+        from collections import defaultdict
+        buckets = defaultdict(list)
+        for k, v in actor.state_dict().items():
+            if "lora_" in k or "modules_to_save" in k:
+                continue
+            new_k = k
+            if new_k.startswith("base_model.model."):
+                new_k = new_k[len("base_model.model."):]
+            # PEFT wraps every adapted Linear with `.base_layer.weight`/bias;
+            # merge_adapter() folds LoRA into the base but keeps that nesting
+            # in the state_dict (only merge_and_unload destroys it). vLLM's
+            # qwen3 loader expects flat `model.layers.X.self_attn.qkv_proj.weight`.
+            new_k = new_k.replace(".base_layer.weight", ".weight")
+            new_k = new_k.replace(".base_layer.bias", ".bias")
+            # CPU detach before transport (msgspec can't serialise CUDA tensors).
+            t = v.detach().cpu()
+            # Layer params look like "model.layers.<N>.<...>". Non-layer params
+            # (embed, norm, lm_head) go to "_other".
+            if new_k.startswith("model.layers."):
+                layer_id = new_k.split(".", 3)[2]
+                buckets[f"layer_{int(layer_id):03d}"].append((new_k, t))
+            else:
+                buckets["_other"].append((new_k, t))
+        # Push _other first (small), then each layer in order.
+        import functools as _ft
+        for group_name in ["_other"] + sorted(k for k in buckets if k != "_other"):
+            chunk = buckets[group_name]
+            if not chunk:
+                continue
+            llm.apply_model(_ft.partial(_vllm_load_weights_chunk, chunk=chunk))
+        # Prefix cache keys on token IDs; weights changed, cache is stale.
+        try:
+            llm.llm_engine.reset_prefix_cache()
+        except AttributeError:
+            # Older vLLM versions: reset via apply_model
+            pass
+    finally:
+        actor.unmerge_adapter()
+    return time.time() - t0
 
 
 def critic_predict(critic, input_ids, attention_mask, mse_scale_f):
@@ -302,6 +409,7 @@ def grpo_update_microbatched(
     actor, optim, tokenizer, full_ids_list, prompt_lens, activations,
     old_logps_list, advantages, vectors_ref, device,
     micro_batch=2, clip_eps=0.2, kl_beta=0.04, max_grad_norm=1.0,
+    tis_cap=None,
 ):
     """Fused micro-batched forward+loss+backward for GRPO.
 
@@ -339,16 +447,12 @@ def grpo_update_microbatched(
         finally:
             vectors_ref[0] = None
         new_logp = F.log_softmax(new_logits.float(), dim=-1)
-        # --- ref_logp: switch to the frozen "reference" adapter (= AV-SFT init).
-        #     Not disable_adapter() — the policy is a LoRA, so that would anchor
-        #     KL to the bare base instead of the SFT init. ---
+        # --- ref_logp (no grad, LoRA off) ---
         vectors_ref[0] = v_batch
         try:
-            with torch.no_grad():
-                actor.set_adapter("reference")
+            with torch.no_grad(), actor.disable_adapter():
                 ref_logits = actor(input_ids=batch_ids, attention_mask=attn).logits
         finally:
-            actor.set_adapter("default")
             vectors_ref[0] = None
         ref_logp = F.log_softmax(ref_logits.float(), dim=-1)
         del ref_logits
@@ -374,6 +478,11 @@ def grpo_update_microbatched(
             if new_lp.numel() == 0 or old_lp.numel() != new_lp.numel():
                 continue
             ratio = torch.exp(new_lp - old_lp)
+            # TIS clip — bound the residual off-policy bias from vLLM/HF
+            # kernel + precision mismatch (TRL's vllm_importance_sampling_correction).
+            # Cap-only (not lower bound) per TIS spec: keep ratio < C, leave low end alone.
+            if tis_cap is not None:
+                ratio = torch.clamp(ratio, max=tis_cap)
             clipped = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
             A = advantages[i]
             surrogate = torch.minimum(ratio * A, clipped * A)
@@ -400,9 +509,8 @@ def grpo_update_microbatched(
         [p for p in actor.parameters() if p.requires_grad], max_grad_norm,
     )
     gn = grad_norm.item() if hasattr(grad_norm, "item") else float(grad_norm)
-    # Guard BEFORE stepping: clip_grad_norm_ does not sanitize nan/inf (it
-    # scales by max_norm/total_norm, and nan propagates). Stepping Adam on
-    # non-finite grads corrupts the moment estimates AND the weights.
+    # Guard BEFORE stepping: clip_grad_norm_ does not sanitize nan/inf.
+    # Stepping Adam on non-finite grads corrupts moments AND weights.
     if math.isfinite(gn):
         optim.step()
     else:
@@ -519,15 +627,8 @@ def grpo_loss(
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--av-ckpt", required=True,
-                   help="AV-SFT LoRA adapter dir (sits on --base-ckpt).")
-    p.add_argument("--ar-ckpt", required=True,
-                   help="AR-LoRA dir (ar_lora_value_head.safetensors + ar_meta.json).")
-    p.add_argument("--base-ckpt", default="Qwen/Qwen3-8B",
-                   help="Base the AV/AR LoRA adapters sit on (4-bit if --quant 4bit).")
-    p.add_argument("--quant", choices=["none", "4bit"], default="4bit")
-    p.add_argument("--device-map", choices=["single", "auto"], default="single")
-    p.add_argument("--max-gpu-mem", type=int, default=0)
+    p.add_argument("--av-ckpt", required=True)
+    p.add_argument("--ar-ckpt", required=True)
     p.add_argument("--rl-parquet", required=True)
     p.add_argument("--sidecar", required=True)
     p.add_argument("--save-dir", required=True)
@@ -559,13 +660,25 @@ def main():
                    help="Micro-batch size for the critic's training-time forward. "
                         "Single full-batch forward OOMs at B*G=256.")
     p.add_argument("--logp-micro-batch", type=int, default=2)
+    p.add_argument("--vllm-gpu-mem", type=float, default=0.35,
+                   help="vLLM gpu_memory_utilization; trimmed to leave room for "
+                        "HF actor+LoRA + critic + Adam states + activations.")
+    p.add_argument("--vllm-max-len", type=int, default=1024)
+    p.add_argument("--vllm-tp", type=int, default=1,
+                   help="vLLM tensor_parallel_size. Set to 4 for 4-GPU runs to "
+                        "speed up rollout ~3-4×. Training-side HF actor stays on "
+                        "GPU 0 only (LoRA's 122M trainable params don't need FSDP).")
+    p.add_argument("--vllm-sync-every", type=int, default=20,
+                   help="Push HF→vLLM weights every N optimizer steps (TRL pattern).")
+    p.add_argument("--tis-cap", type=float, default=2.0,
+                   help="Truncated Importance Sampling clip cap C: "
+                        "ratio = min(exp(new_lp - old_lp_vllm), C). Bounds residual "
+                        "engine-mismatch bias.")
     p.add_argument("--save-every", type=int, default=50)
     p.add_argument("--resume-from-lora", type=str, default=None,
                    help="Directory containing a saved LoRA adapter (iter_NNNNNN); "
-                        "loaded as the policy adapter so training continues from "
-                        "those weights (KL reference stays the AV-SFT init). If "
-                        "the dir has a critic/ subdir, the co-trained critic is "
-                        "resumed too.")
+                        "loaded onto the AV-SFT base so training continues "
+                        "from those weights.")
     p.add_argument("--start-step", type=int, default=0,
                    help="Initial step counter — useful when resuming so wandb "
                         "x-axis lines up with the previous run.")
@@ -585,19 +698,6 @@ def main():
     p.add_argument("--wandb-name", default=None)
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument(
-        "--external-evals", default="",
-        help="Comma-sep list of evals/ IDs to run every --eval-every step "
-             "(e.g. 'hallucination,karvonen_confusion'). Empty = none.",
-    )
-    p.add_argument("--eval-n-hallucination", type=int, default=40,
-                   help="N held-out prompts for hallucination eval.")
-    p.add_argument("--eval-n-karvonen", type=int, default=97,
-                   help="N records (out of 97 filtered) for karvonen_confusion eval.")
-    p.add_argument("--judge-key-env", default="ANTHROPIC_API_KEY_FALLBACK",
-                   help="Env var holding the judge API key (default: high-prio).")
-    p.add_argument("--judge-concurrency", type=int, default=32,
-                   help="Parallel judge calls (Anthropic sync, NOT batch API).")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -606,18 +706,13 @@ def main():
     device = "cuda"
     os.environ.setdefault("HF_HOME", "/workspace-vast/pretrained_ckpts")
 
-    # old_logp is computed from generate's RAW logits (output_logits). At
-    # temperature 1.0 that IS the sampling distribution; at any other
-    # temperature the importance ratio no longer corrects for the actual
-    # behavior policy and the surrogate is silently biased.
+    # old_logp comes from vLLM's raw logprobs; the importance ratio is only a
+    # valid behavior-policy correction at temperature 1.0.
     assert args.temperature == 1.0, (
-        f"--temperature {args.temperature} != 1.0: old_logp comes from raw "
-        f"logits, so the GRPO importance ratio is only valid at T=1. "
-        f"Remove this assert only if you also temperature-scale old/new logp."
+        f"--temperature {args.temperature} != 1.0: old_logp semantics depend "
+        f"on vLLM's logprobs_mode and won't match the sampling distribution."
     )
-    # Eval rows are taken past --eval-skip-rows; training samples rows[:max_rows].
-    # Without this cap the training pool contains the literal eval rows.
-    if args.eval_every > 0 and (args.eval_n_prompts > 0 or args.external_evals.strip()):
+    if args.eval_every > 0 and args.eval_n_prompts > 0:
         assert args.max_rows is not None and args.max_rows <= args.eval_skip_rows, (
             f"evals enabled but --max-rows ({args.max_rows}) is unset or exceeds "
             f"--eval-skip-rows ({args.eval_skip_rows}) — training would include "
@@ -625,9 +720,9 @@ def main():
         )
 
     # ---- tokenizer + nla config ----
-    # From --base-ckpt, NOT hardcoded — the sidecar asserts below catch a
-    # wrong-family tokenizer, but only if we load the one the run targets.
-    tokenizer = AutoTokenizer.from_pretrained(args.base_ckpt)
+    # From the AV ckpt (train_sft saves the tokenizer alongside the model),
+    # NOT hardcoded — the sidecar asserts catch wrong-family drift.
+    tokenizer = AutoTokenizer.from_pretrained(args.av_ckpt)
     cfg = load_nla_config(args.sidecar, tokenizer)
     inj_id = cfg.injection_token_id
     left_id = cfg.injection_left_neighbor_id
@@ -638,102 +733,63 @@ def main():
     assert template is not None, "critic_prompt_template missing"
     print(f"[cfg] inj_id={inj_id} mse_scale_f={mse_scale_f} d_model={cfg.d_model}")
 
-    # ---- actor: (4-bit) base + AV-SFT LoRA ("default", trainable) + frozen
-    #      "reference" adapter (= AV-SFT init) for the KL anchor.
-    #      The policy is now a LoRA *on* the frozen base, so disable_adapter()
-    #      would anchor KL to the bare base, not the SFT init — hence a second
-    #      frozen adapter. (See feedback_rl_ref_policy.)
-    quant_config = None
-    if args.quant == "4bit":
-        quant_config = BitsAndBytesConfig(
-            load_in_4bit=True, bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_storage=torch.bfloat16,
-        )
-    dmap, max_mem = _resolve_device_map(args.device_map, args.max_gpu_mem, quant_config)
-    print(f"[actor] base={args.base_ckpt} + AV-LoRA={args.av_ckpt} "
-          f"(quant={args.quant}, device_map={args.device_map})")
-    base = AutoModelForCausalLM.from_pretrained(
-        args.base_ckpt, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
-        quantization_config=quant_config, device_map=dmap, max_memory=max_mem,
+    # ---- actor (LoRA-wrapped) ----
+    print(f"[actor] loading {args.av_ckpt}")
+    actor = AutoModelForCausalLM.from_pretrained(
+        args.av_ckpt, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
+    ).to(device)
+    lora_cfg = LoraConfig(
+        r=args.lora_r, lora_alpha=args.lora_alpha,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        lora_dropout=0.0, bias="none", task_type="CAUSAL_LM",
+        use_rslora=args.use_rslora,
     )
-    if dmap is None:
-        base = base.to(device)
-    if quant_config is not None:
-        base = prepare_model_for_kbit_training(
-            base, use_gradient_checkpointing=args.gradient_checkpointing,
-        )
-    # Policy adapter: AV-SFT init, or a saved RL LoRA when resuming. The KL
-    # "reference" adapter ALWAYS comes from the AV-SFT ckpt — resuming must
-    # not move the KL anchor.
-    policy_ckpt = args.resume_from_lora or args.av_ckpt
-    if args.resume_from_lora:
-        print(f"[actor] RESUMING policy LoRA from {args.resume_from_lora} "
-              f"(KL reference stays {args.av_ckpt})")
-    actor = PeftModel.from_pretrained(
-        base, policy_ckpt, adapter_name="default", is_trainable=True,
-    )
-    actor.load_adapter(args.av_ckpt, adapter_name="reference")  # frozen KL ref
-    actor.set_adapter("default")
-    if args.resume_from_lora:
-        # Loud sanity check: a resumed adapter must have non-trivially-different
-        # weights from the reference (a fresh/zero adapter here means the resume
-        # path silently loaded nothing — the bug this block replaces).
-        _diff = 0.0
-        _sd = actor.state_dict()
-        for n in list(_sd):
-            if ".default." in n and "lora_" in n:
-                _ref = _sd.get(n.replace(".default.", ".reference."))
-                if _ref is not None:
-                    _diff += (_sd[n].float() - _ref.float()).pow(2).sum().item()
-        print(f"[actor] resumed; sum((lora_default - lora_reference)²) = {_diff:.3e}")
-        assert _diff > 0.0, (
-            f"resume-from-lora loaded weights identical to the AV-SFT reference "
-            f"— {args.resume_from_lora} is not a trained RL adapter?"
-        )
+    # CRITICAL for LoRA + gradient_checkpointing: the base model has no
+    # requires_grad params, so gradient_checkpointing's input-grad check
+    # fails ("element 0 of tensors does not require grad"). This hook
+    # forces input embeddings to require grad, propagating grad to LoRA.
+    if args.gradient_checkpointing:
+        actor.enable_input_require_grads()
+    if args.resume_from_lora is not None:
+        # Resume: load a previously-saved LoRA adapter onto the base.
+        # peft.PeftModel.from_pretrained handles attaching the LoRA layers and
+        # copying weights. Skips the get_peft_model wrapping flow.
+        from peft import PeftModel
+        print(f"[actor] RESUMING from LoRA {args.resume_from_lora}")
+        actor = PeftModel.from_pretrained(actor, args.resume_from_lora, is_trainable=True)
+        # Sanity check we got non-zero LoRA weights (not a freshly-init adapter)
+        _lora_norm = 0.0
+        for n, p_ in actor.named_parameters():
+            if "lora_" in n:
+                _lora_norm += p_.detach().float().pow(2).sum().item()
+        print(f"[actor] resumed; sum(lora_param²) = {_lora_norm:.2e}")
+    else:
+        actor = get_peft_model(actor, lora_cfg)
     actor.print_trainable_parameters()
     actor.train()
     if args.gradient_checkpointing:
         actor.gradient_checkpointing_enable()
-        actor.enable_input_require_grads()
+        # PEFT wraps the model; the inner module's gradient_checkpointing flag
+        # must be set explicitly or HF silently no-ops.
+        if hasattr(actor, "base_model"):
+            inner = actor.base_model
+            while hasattr(inner, "model"):
+                inner = inner.model
+                if hasattr(inner, "gradient_checkpointing"):
+                    inner.gradient_checkpointing = True
+        # NOTE: do NOT set config.use_cache=False globally — that breaks
+        # generate() in rollout (autoregressive without KV cache is O(T²)).
+        # HF auto-disables use_cache per-forward when gradient_checkpointing
+        # fires AND there are gradients; rollout (.eval() + no_grad) is unaffected.
         print(f"[actor] gradient_checkpointing ENABLED")
 
-    # ---- critic: AR-LoRA (4-bit base + injected LoRA + value_head). Rebuild
-    #      the exact structure train_sft saved, then load the adapter + head. ----
-    import json as _json
-    from safetensors.torch import load_file as _load_file
-    # When resuming and the resume dir has a saved co-trained critic, load
-    # that instead of the AR-SFT init — otherwise the reward model snaps back
-    # to its SFT state and the reward scale is discontinuous across the resume.
-    ar_src = Path(args.ar_ckpt)
-    if args.resume_from_lora is not None:
-        _resumed_critic = Path(args.resume_from_lora) / "critic"
-        if (_resumed_critic / "ar_lora_value_head.safetensors").exists():
-            ar_src = _resumed_critic
-            print(f"[critic] RESUMING co-trained critic from {ar_src}")
-    ar_meta = _json.loads((ar_src / "ar_meta.json").read_text())
-    print(f"[critic] AR-LoRA from {ar_src}: {ar_meta}")
-    ar_quant = quant_config if ar_meta.get("quant") == "4bit" else None
-    ar_dmap, ar_maxmem = _resolve_device_map(args.device_map, args.max_gpu_mem, ar_quant)
-    critic = init_critic_from_base(
-        args.base_ckpt, ar_meta["ar_num_layers"], torch.bfloat16,
-        ar_quant, device_map=ar_dmap, max_memory=ar_maxmem,
-        # Checkpoints record whether their backbone ran with the final RMSNorm
-        # stripped (design §4) or kept (pre-2026-06 ckpts). Must match training.
-        strip_final_norm=ar_meta.get("final_norm_stripped", False),
-    )
-    if ar_dmap is None:
-        critic = critic.to(device)
-    inject_adapter_in_model(LoraConfig(
-        r=ar_meta["lora_r"], lora_alpha=ar_meta["lora_alpha"], lora_dropout=0.0,
-        bias="none", task_type="CAUSAL_LM", use_rslora=True,
-        target_modules=ar_meta["target_modules"],
-    ), critic.backbone)
-    _ar_sd = _load_file(str(ar_src / "ar_lora_value_head.safetensors"))
-    _miss, _unexp = critic.load_state_dict(_ar_sd, strict=False)
-    print(f"[critic] loaded {len(_ar_sd)} AR tensors "
-          f"(missing={len(_miss)} unexpected={len(_unexp)})")
-    # Freeze everything; conditionally unfreeze LoRA + value_head for co-training.
+    # ---- critic (frozen or co-trained) ----
+    print(f"[critic] loading {args.ar_ckpt}")
+    critic = NLACriticModel.from_pretrained(
+        args.ar_ckpt, torch_dtype=torch.bfloat16,
+    ).to(device)
+    # NLACriticModel.from_pretrained returns params with requires_grad=True by
+    # default. Freeze everything first, then conditionally unfreeze backbone.
     for p_ in critic.parameters():
         p_.requires_grad_(False)
     critic_optim = None
@@ -745,10 +801,10 @@ def main():
         # automatically). Both backbone AND value_head train; the bf16+Adam
         # blow-up that NaN'd AR SFT is now neutralised by critic_predict's
         # normalize-before-value_head trick (bounds value_head input norm).
-        # Co-train only the AR LoRA adapters + value_head (4-bit base frozen).
-        for n_, p_ in critic.named_parameters():
-            if ("lora_" in n_) or n_.startswith("value_head"):
-                p_.requires_grad_(True)
+        for p_ in critic.backbone.parameters():
+            p_.requires_grad_(True)
+        for p_ in critic.value_head.parameters():
+            p_.requires_grad_(True)
         critic_trainable = [p for p in critic.parameters() if p.requires_grad]
         try:
             import bitsandbytes as _bnb
@@ -769,9 +825,30 @@ def main():
     critic.eval()  # Qwen3 has no dropout — eval mode is fine for both grad/no-grad
     print(f"[critic] value_head shape={tuple(critic.value_head.weight.shape)}")
 
-    # ---- karvonen hook on actor ----
+    # ---- karvonen hook on actor (for training-time forward only; rollout uses vLLM) ----
     vectors_ref = [None]
     _register_karvonen_hook(actor, vectors_ref, inj_id, left_id, right_id, layer_idx=1)
+
+    # ---- vLLM engine for fast rollout (Karvonen injection via vllm-lens) ----
+    print(f"[vllm] loading {args.av_ckpt} (gpu_memory_utilization={args.vllm_gpu_mem})",
+          flush=True)
+    from vllm import LLM as VLLM
+    llm = VLLM(
+        model=args.av_ckpt,
+        tokenizer=args.av_ckpt,
+        dtype="bfloat16",
+        gpu_memory_utilization=args.vllm_gpu_mem,
+        max_model_len=args.vllm_max_len,
+        tensor_parallel_size=args.vllm_tp,
+        enforce_eager=True,  # avoids CUDA graph capture conflicts with HF training
+    )
+    print(f"[vllm] ready", flush=True)
+    # Initial weight sync: push the (fresh) LoRA-merged actor into vLLM.
+    # At step 0 the LoRA is zero so this is a no-op, but the warmup also exercises
+    # the sync path so failures surface early.
+    print(f"[vllm] initial weight sync warm-up", flush=True)
+    sync_secs = sync_actor_to_vllm(actor, llm)
+    print(f"[vllm] initial sync done in {sync_secs:.1f}s", flush=True)
 
     # ---- dataset ----
     print(f"[data] loading {args.rl_parquet} (max_rows={args.max_rows})", flush=True)
@@ -780,11 +857,11 @@ def main():
 
     # ---- FVE baseline: predict-the-mean MSE on this dataset ----
     # FVE = 1 - mse_actual / baseline_mse, with the PAPER's baseline:
-    # E[||v_norm - μ||²], the raw variance of the normalized distribution
-    # (≈0.72 on Qwen 7B-class). NOTE: runs before 2026-06-09 used the looser
-    # "meannorm" baseline MSE(v_norm, normalize(μ)) (≈0.94), which inflates
-    # FVE vs the paper's definition — old wandb curves are not comparable.
-    # Both are logged; `fve` uses the paper definition.
+    # E[||v_norm - μ||²] (raw variance of the normalized distribution, ≈0.72).
+    # NOTE: runs before 2026-06-09 used the looser "meannorm" baseline
+    # MSE(v_norm, normalize(μ)) ≈0.94, inflating FVE vs the paper — old wandb
+    # curves are not comparable. Both are logged; `fve` uses the paper def.
+    from nla.schema import compute_predict_mean_baselines
     _act_stack = torch.tensor(
         [r["activation"] for r in rows[: min(len(rows), 4000)]],
         dtype=torch.float32,
@@ -826,12 +903,10 @@ def main():
     cursor = 0
 
     # ---- Fixed held-out eval prompts, DOC-DISJOINT from training rows.
-    # Stage-1 only guarantees disjointness BETWEEN av_sft/ar_sft/rl FILES;
-    # within rl_shuf.parquet, rows past --eval-skip-rows can share doc_id
-    # with rows before it (the file is row-shuffled, not doc-partitioned
-    # internally). Without explicit filtering we measured ~50% doc-overlap.
-    # Fix: scan training-window (rows 0..eval_skip_rows) to collect doc_ids,
-    # then take eval rows past the cursor whose doc_id is NOT in that set.
+    # rl_shuf.parquet is row-shuffled, not doc-partitioned internally: rows
+    # past --eval-skip-rows share doc_id with earlier rows ~50% of the time
+    # (measured — see train_rl_self_contained.py). Pass 1 collects training-
+    # window doc_ids; pass 2 takes only eval rows whose doc_id is unseen.
     eval_rows = []
     if args.eval_every > 0 and args.eval_n_prompts > 0:
         import pyarrow.parquet as _pq
@@ -876,52 +951,6 @@ def main():
               f"{len(_train_doc_ids)} training doc_ids)", flush=True)
     eval_table_data = []  # accumulates [step, idx, reward, fve, extracted, explanation]
 
-    # ---- External evals (evals/ pluggable, run every --eval-every step) ----
-    # Reuses the trainer's `vectors_ref` so each eval shares the injection hook
-    # already attached to the actor (no stacked hooks, no extra Qwen3-8B load).
-    # Judge calls go through ANTHROPIC_API_KEY_FALLBACK (high-prio) in a
-    # ThreadPoolExecutor — see evals/base.py.
-    external_evals = []
-    if args.external_evals.strip():
-        if not os.environ.get(args.judge_key_env):
-            raise RuntimeError(
-                f"--external-evals requires ${args.judge_key_env} to be set "
-                f"(judge API key for Sonnet 4.6). See CLAUDE.md."
-            )
-        # Side-effect imports register the eval classes via @register decorator.
-        import evals.hallucination  # noqa: F401
-        import evals.karvonen_confusion  # noqa: F401
-        from evals.base import EvalConfig
-        from evals.registry import get_eval
-
-        n_samples_for = {
-            "hallucination": args.eval_n_hallucination,
-            "karvonen_confusion": args.eval_n_karvonen,
-        }
-        for eid in [s.strip() for s in args.external_evals.split(",") if s.strip()]:
-            ev_cfg = EvalConfig(
-                output_dir=save_dir / "eval_runs",
-                n_samples=n_samples_for.get(eid, 40),
-                seed=args.seed,
-                eval_skip_rows=args.eval_skip_rows,
-                parquet_path=args.rl_parquet,
-                judge_model="claude-sonnet-4-6",
-                judge_temperature=0.0,
-                judge_max_concurrency=args.judge_concurrency,
-                anthropic_api_key_env=args.judge_key_env,
-            )
-            ev_cls = get_eval(eid)
-            ev = ev_cls(ev_cfg)
-            ev.setup(actor, critic, tokenizer, cfg, device,
-                     shared_vectors_ref=vectors_ref)
-            external_evals.append(ev)
-            print(f"[external eval] {eid} ready (n={ev_cfg.n_samples}, "
-                  f"judge={ev_cfg.judge_model}, key=${args.judge_key_env})",
-                  flush=True)
-
-    # History for the multi-line Pareto chart.
-    pareto_history: list[dict] = []
-
     for step in range(args.start_step, args.num_steps):
         t0 = time.time()
         # ---- batch select ----
@@ -931,32 +960,38 @@ def main():
         batch_idxs = pending_idxs[cursor : cursor + args.batch_prompts]
         cursor += args.batch_prompts
 
-        # ---- rollouts ----
+        # ---- rollouts (vLLM batch) ----
         actor.eval()
+        # Build prompt texts + per-prompt activations for this step.
+        prompts_with_acts = []
+        for row_idx in batch_idxs:
+            row = rows[row_idx]
+            prompt_text = build_prompt_text(row["prompt"], inject_char, tokenizer)
+            activation = torch.tensor(row["activation"], dtype=torch.float32)
+            prompts_with_acts.append((prompt_text, activation))
+        # ONE vLLM batch covers all B prompts × G group samples → ~5-10× faster
+        # than the HF per-prompt loop.
+        responses = rollout_batch_vllm(
+            llm, tokenizer, prompts_with_acts,
+            inj_id, args.group_size, args.max_new_tokens, args.temperature,
+        )
         all_full_ids = []
         all_prompt_lens = []
         all_activations = []
         all_explanations = []
         all_response_text = []
         all_prompt_group = []
-        all_old_logps = []  # 1-D tensor per sample
-        for gi, row_idx in enumerate(batch_idxs):
-            row = rows[row_idx]
-            prompt_text = build_prompt_text(row["prompt"], inject_char, tokenizer)
-            activation = torch.tensor(row["activation"], dtype=torch.float32)
-            responses = rollout_one_prompt(
-                actor, tokenizer, prompt_text, activation, vectors_ref,
-                inj_id, args.group_size, args.max_new_tokens, args.temperature, device,
-            )
-            for r in responses:
-                expl = extract_explanation(r["text"])
-                all_full_ids.append(r["full_ids"])
-                all_prompt_lens.append(r["prompt_len"])
-                all_activations.append(activation)
-                all_explanations.append(expl)
-                all_response_text.append(r["text"])
-                all_prompt_group.append(gi)
-                all_old_logps.append(r["old_logp"].to(device))
+        all_old_logps = []
+        for r in responses:
+            expl = extract_explanation(r["text"])
+            all_full_ids.append(r["full_ids"])
+            all_prompt_lens.append(r["prompt_len"])
+            # Re-attach the activation for this sample's prompt
+            all_activations.append(prompts_with_acts[r["prompt_idx"]][1])
+            all_explanations.append(expl)
+            all_response_text.append(r["text"])
+            all_prompt_group.append(r["prompt_idx"])
+            all_old_logps.append(r["old_logp"].to(device))
 
         # ---- scoring ----
         rewards = score_with_critic(
@@ -993,6 +1028,7 @@ def main():
             micro_batch=args.logp_micro_batch,
             clip_eps=args.clip_eps, kl_beta=args.kl_beta,
             max_grad_norm=args.max_grad_norm,
+            tis_cap=args.tis_cap,  # TIS clip for vLLM/HF residual mismatch
         )
         # Build a scalar-tensor stand-in for the existing logging path that
         # expects a `loss` tensor with .item().
@@ -1008,6 +1044,12 @@ def main():
             # The helper already refused to optim.step() on a non-finite grad
             # norm, so weights are intact; skip the critic update + logging.
             continue
+
+        # ---- Push HF actor weights → vLLM every N steps (TRL colocate pattern) ----
+        vllm_sync_secs = 0.0
+        if args.vllm_sync_every > 0 and (step + 1) % args.vllm_sync_every == 0:
+            vllm_sync_secs = sync_actor_to_vllm(actor, llm)
+            print(f"  [vllm sync@{step+1}] {vllm_sync_secs:.1f}s", flush=True)
 
         # ---- AR critic co-training (paper-faithful, optional) ----
         # Per paper §RL: "Update the AR by one step of gradient descent on the
@@ -1105,13 +1147,6 @@ def main():
             "fve": fve,
             "fve_pct": fve * 100.0,
             "fve_baseline": fve_baseline,
-            "fve_baseline_meannorm": fve_baseline_meannorm,
-            # FVE under the old (pre-2026-06-09) meannorm baseline, for
-            # comparing against historical wandb curves only.
-            "fve_pct_meannorm": (
-                (1.0 - (-float(np.mean(valid_rewards))) / fve_baseline_meannorm) * 100.0
-                if valid_rewards else float("nan")
-            ),
             "advantage_mean": adv.mean().item(),
             "advantage_std": adv.std().item(),
             "extraction_rate": extraction_rate,
@@ -1228,54 +1263,6 @@ def main():
                         flush=True,
                     )
 
-            # ---- External evals (hallucination, karvonen_confusion, …) ----
-            # Each eval reuses `actor` + `vectors_ref`, so no extra GPU load.
-            # Judge calls are parallelised inside each eval's evaluate().
-            for ev in external_evals:
-                try:
-                    result = ev.evaluate(step)
-                    for k, v in result.metrics.items():
-                        log[f"eval/{ev.id}/{k}"] = v
-                    if not args.no_wandb and result.table_rows:
-                        cols = list(result.table_rows[0].keys())
-                        log[f"eval/{ev.id}/rollouts"] = wandb.Table(
-                            columns=cols,
-                            data=[[r[c] for c in cols] for r in result.table_rows],
-                        )
-                except Exception as _ev_err:
-                    print(f"[external eval {ev.id}@{step}] FAILED: "
-                          f"{type(_ev_err).__name__}: {_ev_err}", flush=True)
-
-            # ---- Pareto chart: FVE (capability) vs hallucinations (faithful-
-            # ness) vs Karvonen captures-quirk (depth) on a shared X-axis.
-            # Tells you at a glance whether RL is buying capability at the
-            # cost of faithfulness or whether it's Pareto-improving.
-            pareto_history.append({
-                "step": step,
-                "fve_pct": float(log.get("eval/fve_pct", float("nan"))),
-                "halluc_x10": float(log.get(
-                    "eval/hallucination/hallucinations_mean", float("nan"))) * 10.0,
-                "captures_quirk_pct": float(log.get(
-                    "eval/karvonen_confusion/captures_quirk_rate", float("nan"))) * 100.0,
-                "clean_rate_pct": float(log.get(
-                    "eval/hallucination/clean_rate", float("nan"))) * 100.0,
-            })
-            if not args.no_wandb and len(pareto_history) >= 2:
-                _xs = [h["step"] for h in pareto_history]
-                log["pareto/capability_vs_faithfulness"] = wandb.plot.line_series(
-                    xs=_xs,
-                    ys=[
-                        [h["fve_pct"] for h in pareto_history],
-                        [h["halluc_x10"] for h in pareto_history],
-                        [h["captures_quirk_pct"] for h in pareto_history],
-                        [h["clean_rate_pct"] for h in pareto_history],
-                    ],
-                    keys=["FVE %", "hallucinations × 10",
-                          "captures_quirk %", "clean_rate %"],
-                    title="Capability vs faithfulness (shared X = step)",
-                    xname="step",
-                )
-
         if not args.no_wandb:
             wandb.log(log, step=step)
 
@@ -1285,19 +1272,22 @@ def main():
             out_dir.mkdir(parents=True, exist_ok=True)
             actor.save_pretrained(str(out_dir))
             if args.train_critic:
-                # Save the co-trained critic alongside the actor (LoRA + head,
-                # ~100MB) — it's the reward model behind this run's FVE curve,
-                # and resume needs it to avoid a reward discontinuity.
-                from safetensors.torch import save_file as _save_file
-                crit_dir = out_dir / "critic"
-                crit_dir.mkdir(exist_ok=True)
-                _crit_sd = {n: p_.detach().cpu().contiguous()
-                            for n, p_ in critic.named_parameters()
-                            if ("lora_" in n) or n.startswith("value_head")}
-                _save_file(_crit_sd, str(crit_dir / "ar_lora_value_head.safetensors"))
-                (crit_dir / "ar_meta.json").write_text(_json.dumps(ar_meta, indent=2))
+                # The co-trained critic is the reward model behind this run's
+                # FVE curve; without it, resume/eval scores against the stale
+                # SFT critic. Full-model save is ~11GB, so keep latest-only:
+                # write to a tmp dir then atomically swap into critic_latest/.
+                import shutil as _shutil
+                _crit_tmp = save_dir / "critic_latest.tmp"
+                _crit_dst = save_dir / "critic_latest"
+                if _crit_tmp.exists():
+                    _shutil.rmtree(_crit_tmp)
+                critic.save_pretrained(str(_crit_tmp))
+                (_crit_tmp / "saved_at_step.txt").write_text(str(step + 1))
+                if _crit_dst.exists():
+                    _shutil.rmtree(_crit_dst)
+                os.rename(_crit_tmp, _crit_dst)
             print(f"[save] LoRA → {out_dir}"
-                  + (" (+ co-trained critic)" if args.train_critic else ""))
+                  + (f" (+ critic_latest @ step {step + 1})" if args.train_critic else ""))
 
     print("done.")
     if not args.no_wandb:

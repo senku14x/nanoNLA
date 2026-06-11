@@ -42,6 +42,23 @@
   `mse_scale`, `d_model` — all loaded from `nla_meta.yaml` and asserted
   against the live tokenizer at startup. Never hardcode them.
 
+## RL training: target = multi-GPU (not single-GPU)
+
+- The current self-contained RL trainers (`nla/train_rl_self_contained.py` for
+  HF generate, `nla/train_rl_vllm.py` for vLLM rollouts) are being built to run
+  on **multiple GPUs by default** (typically 4× H200). Earlier prototypes
+  assumed single-GPU; that's no longer the target.
+- For vLLM rollouts: use `--tensor-parallel-size N` to spread the rollout
+  engine across all GPUs. The HF trainable side stays on one GPU (LoRA's
+  ~120M trainable params don't benefit from FSDP), so GPUs 1..N-1 are
+  vLLM-only during training-time forward but used during rollout.
+- Weight broadcast via `llm.collective_rpc("load_weights", ...)` handles
+  TP-sharding internally — same API regardless of TP size.
+- If we ever move to full fine-tuning instead of LoRA, sharded training
+  (FSDP) becomes worthwhile and the weight-gather path needs the TRL
+  `_sync_fsdp{1,2}_params_to_vllm()` treatment (`gather_if_zero3`,
+  `summon_full_params`, etc.) — note for future-Claude.
+
 ## Debugging
 
 If injection silently fails the actor sees the literal CJK marker char and
