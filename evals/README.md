@@ -20,7 +20,7 @@ Every input in this package is **fully disjoint** from training data. Three guar
 | Eval | Source | Path |
 |---|---|---|
 | `hallucination` | held-out `rl_shuf` rows | `rl_shuf.parquet` rows ≥ `--eval-skip-rows` |
-| `karvonen_confusion` | external | `/home/celeste/shared/{investigations,verification}.json` |
+| `karvonen_confusion` | external | `<path-to>/{investigations,verification}.json` — local files you supply (Karvonen's investigation-corpus schema). Resolved via `$KARVONEN_CORPUS_DIR`, falling back to a couple of standard locations (see `_resolve_corpus_paths` in `evals/karvonen_confusion/eval.py`). |
 
 ## Adding a new eval
 
@@ -28,7 +28,8 @@ Every input in this package is **fully disjoint** from training data. Three guar
 2. Decorate with `@register("my_eval")` from `evals.registry`.
 3. Add `fixtures/` (parquet or JSON) + `fixtures/README.md` explaining
    provenance + disjointness from training.
-4. Wire into `nla/train_rl_self_contained.py`'s `--eval-suite` arg (TODO).
+4. Wire into `nla/train_rl_self_contained.py`'s `--external-evals` arg
+   (comma-separated eval IDs, run every `--eval-every` steps).
 
 ## Cost guardrails
 
@@ -39,7 +40,6 @@ Sonnet 4.6 judge calls aren't free. Defaults:
 - Judge model: **Sonnet 4.6** (per CLAUDE.md judge rule), not Opus, unless
   `--judge-model claude-opus-4-7` is passed explicitly
 - `temperature = 0` on the judge (reproducibility)
-- Anthropic Batches API for `--standalone` runs over >20 samples
 
 Rough cost: `steps/10 * 20 * 1 eval * ~$0.003 per call ≈ $0.60 per 1k RL steps`.
 
@@ -57,6 +57,10 @@ identical seed + step + ckpt + judge `temperature=0` reproduce metrics modulo
 Anthropic API non-determinism (rare for `temperature=0`).
 
 ## Standalone usage
+
+Note: `--av-ckpt` must be a **full (merged) model dir** loadable by
+`AutoModelForCausalLM.from_pretrained` — not a LoRA adapter dir. Pass the RL
+LoRA adapter separately via `--rl-lora`.
 
 ```bash
 python -m evals.run_evals \

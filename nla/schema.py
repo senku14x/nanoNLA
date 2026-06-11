@@ -1,7 +1,8 @@
 """Shared NLA sidecar schema — single source of truth for token metadata.
 
 Imported by both nla/datagen/ (writes sidecars) and nla/config.py (reads + asserts).
-Schema: docs/design.md §2.
+This file IS the schema definition — field names and conventions here are the
+single source of truth for sidecar contents.
 
 Two sidecar conventions:
   - Dataset: {parquet_path}.nla_meta.yaml  (kind: nla_dataset)
@@ -119,7 +120,7 @@ class NLATokenMeta:
 def sidecar_path_for(path: str | Path) -> Path:
     """Resolve sidecar path for either a parquet file or a checkpoint directory.
 
-    Handles miles' path-slicing syntax (foo.parquet@[0:1000]) by stripping the
+    Handles the `@[slice]` path syntax (foo.parquet@[0:1000]) by stripping the
     slice suffix before appending SIDECAR_SUFFIX.
 
     Directory vs file detection uses is_dir() (exists + is-dir) OR a heuristic

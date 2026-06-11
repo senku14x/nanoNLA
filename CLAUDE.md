@@ -4,13 +4,9 @@
 
 - **This is an open-source repo.** Only standard libs: `pathlib.Path`,
   `pyarrow`, `transformers`, `datasets`, `httpx`, `pyyaml`, `numpy`, `orjson`,
-  `safetensors`, the public `anthropic` SDK, and whatever Miles/SGLang pull in.
+  `safetensors`, the public `anthropic` SDK.
   No private/internal dependencies.
-- **Miles is upstream, not ours.** Don't edit files under `miles/` — extend via
-  subclassing (`NLAFSDPActor`) and the `--*-path` function-pointer args. The
-  two upstream patches we depend on (`--custom-actor-cls-path`,
-  `--force-use-critic`) are documented in `docs/design.md` §2.
-- Miles uses argparse; match that for CLIs in `nla/`.
+- Use argparse for CLIs in `nla/`.
 - Storage and completion-provider backends are pluggable via import-path
   strings (`--storage-cls`, `--provider-cls`). The shipped implementations are
   `LocalStorage` and `AnthropicProvider`. Cloud storage / other LLM APIs are
@@ -34,20 +30,18 @@
   regardless of chunk boundaries, slice ordering, or process count. This is
   what makes multi-GPU stage-0 sharding bit-reproducible.
 - **Injection hook scans for the token ID inside the hook** (`inputs[0]`), not
-  from precomputed positions. Miles reorders samples twice before the forward
-  pass; any precomputed index is wrong by construction.
-- **`cp_size == 1` only.** Context-parallel splits each sample across ranks
-  and breaks the neighbor check. NLA sequences are short; CP buys nothing.
+  from precomputed positions. Batching/reordering means precomputed indices
+  are wrong by construction.
 - **Sidecar is the contract.** Token IDs, prompt templates, `injection_scale`,
   `mse_scale`, `d_model` — all loaded from `nla_meta.yaml` and asserted
   against the live tokenizer at startup. Never hardcode them.
 
-## RL training: target = multi-GPU (not single-GPU)
+## RL training: two trainers
 
-- The current self-contained RL trainers (`nla/train_rl_self_contained.py` for
-  HF generate, `nla/train_rl_vllm.py` for vLLM rollouts) are being built to run
-  on **multiple GPUs by default** (typically 4× H200). Earlier prototypes
-  assumed single-GPU; that's no longer the target.
+- The **verified recipe is single-GPU 4-bit** with HF `generate()` rollouts:
+  `nla/train_rl_self_contained.py` (see `scripts/sbatch_rl_fixed.sh` for the
+  working invocation). `nla/train_rl_vllm.py` is the faster multi-GPU path
+  (vLLM rollouts).
 - For vLLM rollouts: use `--tensor-parallel-size N` to spread the rollout
   engine across all GPUs. The HF trainable side stays on one GPU (LoRA's
   ~120M trainable params don't benefit from FSDP), so GPUs 1..N-1 are
@@ -63,5 +57,6 @@
 
 If injection silently fails the actor sees the literal CJK marker char and
 free-associates Chinese. Grep generated text for CJK — that's the loudest
-smoke test for the entire injection path. See `docs/inference.md`
-§ "Debugging: injection-failure smell" for the cause checklist.
+smoke test for the entire injection path. Usual causes: the marker token ID
+drifted (wrong tokenizer/sidecar), the hook never registered (wrong layer
+attribute path), or the prompt template lost the marker char.

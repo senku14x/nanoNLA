@@ -3,8 +3,11 @@
 End-to-end recipe for training a Natural Language Autoencoder (AV verbalizer +
 AR reconstructor) on **any** decoder LM:
 **activation extraction → AV/AR warm-start SFT → GRPO RL**, all logged to Weights
-& Biases. Generalizes the worked [Qwen3-8B run](qwen3_8b_run.md); install
-Miles + SGLang first per [setup.md](setup.md).
+& Biases. Everything runs from this repo's self-contained trainers
+(`nla/train_sft.py`, `nla/train_rl_self_contained.py`) — no external RL
+framework needed. The exact verified invocations live in
+`scripts/sbatch_{av,ar}_sft_lora_fixed.sh` and `scripts/sbatch_rl_fixed.sh`;
+`scripts/smoke_fixed_pipeline.sh` exercises the whole chain in minutes.
 
 Prereqs on the box:
 
@@ -66,67 +69,85 @@ explanations); a few dozen docs is enough to confirm the dims are right.
 
 ## 2 · AV SFT — verbalizer (activation → text)
 
+`nla/train_sft.py --mode av` loads the base model (4-bit + LoRA by default for
+single-GPU budgets), hooks the Karvonen norm-matched injection at the layer-1
+output, and trains cross-entropy on response tokens only:
+
 ```bash
-export NLA_KARVONEN_INJECTION=1                  # norm-matched injection (the key knob)
-export INSTRUCT_MODEL=<your/model>
-export AV_SFT_PARQUET=/data/nla/<run>/av_sft_shuf.parquet
-export INJ_SCALE=raw
-export SAVE_DIR=/ckpts/nla/<run>_av
-export WANDB_PROJECT=nla-<run>  WANDB_NAME=av_sft
-cd "$(python -c 'import miles,os;print(os.path.dirname(miles.__file__))')/.."
-bash configs/actor_sft.sh \
-  --actor-num-gpus-per-node 2 --attn-implementation sdpa \
-  --rollout-batch-size 32 --global-batch-size 32 --micro-batch-size 4 \
-  --lr 2e-5 --min-lr 2e-6 --lr-warmup-iters 50 --lr-decay-style cosine \
-  --num-rollout 1000 --save-interval 500 --use-wandb --wandb-project "$WANDB_PROJECT"
+python -m nla.train_sft --mode av --base-ckpt <your/model> \
+  --parquet /data/nla/<run>/av_sft_shuf.parquet \
+  --sidecar /data/nla/<run>/av_sft_shuf.parquet \
+  --save-dir /ckpts/nla/<run>_av \
+  --num-steps 1000 --batch-size 64 --gradient-accumulation-steps 1 \
+  --use-lora --quant 4bit --lora-r 128 --lora-alpha 16 \
+  --lr 3e-5 --min-lr 3e-6 --lr-warmup-steps 50 --max-grad-norm 1.0 \
+  --save-every 500 --wandb-project nla-<run> --wandb-name av_sft --seed 0
 ```
+
+(Verified invocation: `scripts/sbatch_av_sft_lora_fixed.sh`.)
 
 ## 3 · AR SFT — reconstructor (text → activation)
 
-Build the truncated critic init (a copy of the model truncated to your layer +
-a `Linear(d, d)` head), then SFT it:
+Same entry point with `--mode ar`. The trainer truncates the base model
+in-process to `--ar-num-layers` blocks + a `Linear(d, d)` value head — **set
+`--ar-num-layers` to `layer_index + 1`** (the critic needs the *output of*
+block K, so block K must exist). The final RMSNorm is stripped by default
+(`--strip-final-norm`, recorded in `ar_meta.json` inside the checkpoint):
 
 ```bash
-python -m nla.scripts.prepare_critic_checkpoint \
-  --base-model <your/model> --num-layers <layer_index> \
-  --dataset-sidecar /data/nla/<run>/ar_sft_shuf.parquet \
-  --output /ckpts/nla/<run>_critic_init
-
-export AR_SFT_PARQUET=/data/nla/<run>/ar_sft_shuf.parquet
-export NLA_FREEZE_VALUE_HEAD=1                    # stability (see qwen3_8b_run.md)
-export CRITIC_INIT_CKPT=/ckpts/nla/<run>_critic_init
-export SAVE_DIR=/ckpts/nla/<run>_ar
-export WANDB_PROJECT=nla-<run>  WANDB_NAME=ar_sft
-cd "$(python -c 'import miles,os;print(os.path.dirname(miles.__file__))')/.."
-bash configs/critic_sft.sh \
-  --actor-num-gpus-per-node 2 --attn-implementation sdpa \
-  --rollout-batch-size 256 --global-batch-size 256 --micro-batch-size 64 \
-  --lr 2e-5 --min-lr 2e-6 --lr-warmup-iters 50 --lr-decay-style cosine \
-  --num-rollout 1000 --save-interval 200 --use-wandb --wandb-project "$WANDB_PROJECT"
+python -m nla.train_sft --mode ar --base-ckpt <your/model> \
+  --parquet /data/nla/<run>/ar_sft_shuf.parquet \
+  --sidecar /data/nla/<run>/ar_sft_shuf.parquet \
+  --save-dir /ckpts/nla/<run>_ar \
+  --num-steps 1000 --batch-size 64 --gradient-accumulation-steps 1 \
+  --use-lora --quant 4bit --lora-r 128 --lora-alpha 16 \
+  --ar-num-layers <layer_index + 1> \
+  --lr 3e-5 --min-lr 3e-6 --lr-warmup-steps 50 --max-grad-norm 1.0 \
+  --save-every 500 --wandb-project nla-<run> --wandb-name ar_sft --seed 0
 ```
 
-Convert both checkpoints to HF (`tools/convert_fsdp_to_hf.py` for the AV;
-`launch/convert_ar_dcp_to_hf.py --num-layers <layer_index+1>` for the AR — see
-[qwen3_8b_run.md §3](qwen3_8b_run.md)).
+(Verified invocation: `scripts/sbatch_ar_sft_lora_fixed.sh`.)
+
+For an honest held-out FVE during training, pass `--heldout-parquet` pointing
+at a doc-disjoint parquet (e.g. the AV split — disjoint from AR data by
+stage-1 construction). Post-hoc, `scripts/eval_ar_heldout.py` runs the same
+doc-disjoint eval (plus a shuffled control) against a saved checkpoint.
+Checkpoints save in HF format directly — no conversion step.
 
 ## 4 · RL — GRPO (reward = −reconstruction MSE)
 
 The self-contained trainer rolls out the AV with HF `generate()` under the
-Karvonen hook, scores with the frozen AR, and does GRPO:
+Karvonen hook, scores with the AR critic, and does GRPO. **`--train-critic` is
+required in practice**: with a frozen critic the reward is static, advantages
+collapse to ≈0, and RL does nothing (FVE stays dead-flat).
 
 ```bash
 python -m nla.train_rl_self_contained \
-  --av-ckpt /ckpts/nla/<run>_av/iter_0001000/hf \
-  --ar-ckpt /ckpts/nla/<run>_ar/iter_0001000/hf \
+  --av-ckpt /ckpts/nla/<run>_av/iter_0001000 \
+  --ar-ckpt /ckpts/nla/<run>_ar/iter_0001000 \
+  --base-ckpt <your/model> --quant 4bit \
   --rl-parquet /data/nla/<run>/rl_shuf.parquet \
   --sidecar    /data/nla/<run>/rl_shuf.parquet \
   --save-dir   /ckpts/nla/<run>_rl \
-  --num-steps 250 --batch-prompts 8 --group-size 4 \
-  --lr 1e-6 --kl-beta 0.01 --clip-eps 0.2 --lora-r 16 --lora-alpha 32 \
-  --wandb-project nla-<run> --wandb-name rl_grpo
+  --num-steps 500 --batch-prompts 16 --group-size 16 \
+  --max-new-tokens 150 --temperature 1.0 \
+  --lr 1e-5 --kl-beta 0.01 --clip-eps 0.2 \
+  --train-critic --critic-lr 5e-5 \
+  --logp-micro-batch 2 --max-rows 30000 \
+  --save-every 50 --eval-every 10 --eval-n-prompts 20 --eval-skip-rows 35000 \
+  --max-grad-norm 1.0 \
+  --wandb-project nla-<run> --wandb-name rl_grpo --seed 0
 ```
 
-Every stage streams to wandb; checkpoints land in each `SAVE_DIR`. That's the
+`--av-ckpt` is the AV LoRA dir; `--ar-ckpt` is the AR LoRA dir (must contain
+`ar_meta.json`); both apply onto `--base-ckpt`. Resume with
+`--resume-from-lora <iter_dir> --start-step <N>` (see
+`scripts/sbatch_rl_fixed_resume.sh` for a self-chaining SLURM variant).
+
+(Verified invocation: `scripts/sbatch_rl_fixed.sh`. A faster multi-GPU
+rollout path exists in `nla/train_rl_vllm.py`.)
+
+Every stage streams to wandb; checkpoints land in each `--save-dir`. That's the
 whole loop — extraction → warm-start → RL.
 
 ---
@@ -135,5 +156,7 @@ whole loop — extraction → warm-start → RL.
 
 The datagen/extraction path here is **smoke-tested on Qwen3-0.6B** (layer 18,
 no preset, no code change): stage 0 produced correct 1024-dim activations and
-stage 1 split them cleanly. The SFT/RL commands above are the exact ones from the
-[Qwen3-8B production run](qwen3_8b_run.md) with the model/paths parameterized.
+stage 1 split them cleanly. The SFT/RL commands above are the exact ones from
+the verified Qwen3-8B fixed-pipeline run
+(`scripts/sbatch_{av,ar}_sft_lora_fixed.sh`, `scripts/sbatch_rl_fixed.sh`)
+with the model/paths parameterized.

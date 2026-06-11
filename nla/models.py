@@ -98,11 +98,10 @@ class NLACriticModel(PreTrainedModel):
     def from_pretrained(cls, pretrained_model_name_or_path, *, nla_num_layers: int | None = None, **kwargs):
         """Load an NLACriticModel from an HF checkpoint.
 
-        Normal case: checkpoint was produced by prepare_critic_checkpoint.py or
-        a previous NLA training run → config.json already has the truncated
-        num_hidden_layers. Just load.
+        Normal case: checkpoint was produced by a previous NLA training run →
+        config.json already has the truncated num_hidden_layers. Just load.
 
-        Bootstrapping case (prepare_critic_checkpoint.py only): pass
+        Bootstrapping case (fresh truncation from a full base model): pass
         nla_num_layers = the datagen extraction layer_index. Truncation keeps
         blocks 0..layer_index INCLUSIVE — we need the output OF block K, which
         means we need block K to exist, so num_hidden_layers = K+1.
@@ -115,8 +114,8 @@ class NLACriticModel(PreTrainedModel):
             of the LAST block.
           - So last block must be block K → num_hidden_layers = K+1.
         """
-        # Miles' fsdp_utils/actor.py:96 passes trust_remote_code + attn_implementation
-        # via kwargs. Default to True if caller doesn't specify.
+        # Callers may pass trust_remote_code + attn_implementation via kwargs.
+        # Default trust_remote_code to True if caller doesn't specify.
         kwargs.setdefault("trust_remote_code", True)
         config = AutoConfig.from_pretrained(
             pretrained_model_name_or_path, trust_remote_code=kwargs["trust_remote_code"]
@@ -148,7 +147,8 @@ class NLACriticModel(PreTrainedModel):
         if hasattr(backbone, "lm_head"):
             backbone.lm_head = nn.Identity()
 
-        # Strip final layernorm — arch doc §4: raw residual-stream → value head.
+        # Strip final layernorm — the value head must see the raw layer-K
+        # residual stream, not a normalized version of it.
         inner = _inner_transformer(backbone)
         for attr in ("norm", "final_layernorm", "ln_f"):
             if hasattr(inner, attr):

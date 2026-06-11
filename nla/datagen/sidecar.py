@@ -1,6 +1,6 @@
 """Read/write NLA dataset sidecar YAML files.
 
-Sidecar schema is defined in docs/design.md §2.
+The sidecar schema is defined by nla/schema.py (shared single source of truth).
 Every parquet gets a `{parquet_path}.nla_meta.yaml` written alongside it.
 Training-side code (nla/config.py) reads these and asserts against the live
 tokenizer — this is the contract that catches prompt-format drift and

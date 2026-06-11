@@ -17,8 +17,6 @@ load, then just `tokens[-1]` indexing per-forward — no GPU scanning).
 
 Neighbor-ID computation lives in `nla.schema.compute_canonical_neighbors` —
 shared with training-side verification.
-
-See docs/design.md §1 for the full rationale.
 """
 
 from pathlib import Path

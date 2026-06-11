@@ -1,5 +1,7 @@
 # Training Notes (Qwen2.5-7B case study)
 
+> Historical notes (Miles pipeline + pre-2026-06 meannorm FVE metric — numbers read ~8-13pp higher than the current paper-def baseline). Current recipe: docs/train_new_model.md.
+
 > **These are the settings we used, not settings we claim are optimal.** We did
 > not sweep batch size, learning rate, or GRPO group size for RL, and do not
 > regard the configurations below as near-optimal. They are a working point

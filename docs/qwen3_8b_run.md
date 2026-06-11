@@ -1,5 +1,12 @@
 # Qwen3-8B NLA — reproduction notes
 
+> ⚠️ **Historical (June 2026, Miles-era + pre-metric-fix).** FVE numbers below
+> use the old meannorm baseline (≈0.69) and read ~8-13pp higher than the
+> current code's paper-definition baseline (≈0.56) — e.g. the 44.5%→47.4% RL
+> numbers are ≈32%→35% paper-def. Paths referencing `launch/` and `tools/`
+> predate the consolidation; current equivalents live in `scripts/`. For the
+> current verified pipeline see [train_new_model.md](train_new_model.md).
+
 This doc captures the **Qwen3-8B layer-24** NLA training run added in this fork,
 including all scripts, the deviations from the paper's reference Qwen2.5-7B
 recipe, and the empirical fixes we landed.
@@ -9,9 +16,10 @@ recipe, and the empirical fixes we landed.
 ```
 Stage 0 (extract)           Stage 1 (split)            Stage 2 (judge)         Stage 3 (build SFT)
   FineFineWeb 100k docs  →  doc-level partition into  →  Sonnet 4.6 via       →  parquets:
-  → 1.4M positions @          {av_sft, ar_sft, rl}       Batches API:            av_train.parquet
-  layer 24, raw bf16        80/10/10                    explanation per        av_val.parquet
-  activations                                            (doc, position)        ar_sft_shuf_clean.parquet
+  → 1M positions            {av_sft, ar_sft, rl}       Batches API:            av_train.parquet
+  (100k × 10) @ layer 24,   25/25/50 (av/ar/rl,        explanation per        av_val.parquet
+  raw activations (stored   doc-level)                 (doc, position)        ar_sft_shuf_clean.parquet
+  fp32, computed bf16)
                                                                                 rl_shuf.parquet
 
 Stage 4 (AV SFT)            Stage 5 (AR SFT)           Stage 6 (RL GRPO)
@@ -127,10 +135,10 @@ eval reported below is the **overnight** run.
 
 | knob | overnight (250-step) | long (1500-step) | paper / `rl.sh` |
 |---|---|---|---|
-| actor LR | `1e-6` | `1e-5` | `1e-6` constant |
+| actor LR | `1e-6` | `1e-5` | `1e-5` |
 | LoRA actor | r=16, α=32 | r=128, α=16, **rsLoRA** | full 8B FT |
 | AR critic | **frozen** | **co-trained** (`--train-critic`, critic-lr 5e-5) | co-trained |
-| effective batch | 8×4 = 32 / step | 16×16 = 256 / step | 128×4 = 512 / step |
+| effective batch | 8×4 = 32 / step | 16×16 = 256 / step | 128×8 = 1024 / step |
 
 Deviations from the paper common to **both** runs (memory / single-GPU constraint):
 
@@ -172,8 +180,9 @@ past the RL trainer's `--max-rows 20000` cursor; doc-disjoint from
 **FVE = 1 − mse_actual / baseline_mse**, where the baseline is the
 predict-the-mean ceiling (normalize(μ) as constant pred, μ = mean of
 held-out activations). 0% = no better than constant prediction; 100% =
-perfect reconstruction. Paper's Qwen2.5-7B critic-SFT alone reports FVE
-= 37.5% (TRAINING_NOTES.md); our AV-SFT-alone hits 44.5% on held-out
+perfect reconstruction. Our earlier Miles-era Qwen2.5-7B critic-SFT hit
+FVE = 37.5% (meannorm metric; TRAINING_NOTES.md — NOT a paper number);
+our AV-SFT-alone hits 44.5% on held-out
 data, and 250 GRPO steps adds 2.9 pp. The win is modest — the
 1500-step run (in progress, wandb run `4cvdfjiw`) should give a sharper
 signal.

@@ -22,7 +22,7 @@ from nla.schema import SIDECAR_SUFFIX
 def dataset_sidecar_path(parquet_path: str) -> str:
     """Sidecar path for a parquet — string-only, no filesystem access.
 
-    Strips miles' `@[slice]` syntax. Dataset sidecars are ALWAYS the
+    Strips the `@[slice]` path syntax. Dataset sidecars are ALWAYS the
     suffix-append form ({parquet}.nla_meta.yaml); the directory form
     ({dir}/nla_meta.yaml) is for model checkpoints which are local-only
     and handled by schema.sidecar_path_for.
@@ -151,7 +151,7 @@ def fetch_to_local_cache(
     the cache dir to force a refetch.
 
     Returns the local parquet path (with @[slice] suffix preserved if present
-    on the remote path — miles' read_file handles slicing locally).
+    on the remote path — the parquet reader applies the slice locally).
     """
     local_base, slice_suffix = _local_cache_path(remote_path, cache_dir)
 

@@ -1,12 +1,11 @@
 """Load NLA runtime config from a sidecar YAML (dataset or model).
 
-The sidecar pins tokenizer-dependent constants (injection token ID, PM token ID,
+The sidecar pins tokenizer-dependent constants (injection token ID,
 neighbor IDs, prompt templates) that were fixed at dataset/model generation time.
 Loading them here and asserting against the live tokenizer catches drift before
 training starts, not after output goes to Chinese.
 
-Schema: docs/design.md §2.
-Shared types/helpers: nla/schema.py
+Schema + shared types/helpers: nla/schema.py
 """
 
 import datetime
@@ -34,8 +33,8 @@ def resolve_sidecar_source(
          authoritative for what THIS model was trained with)
       3. prompt_data (dataset sidecar — fallback for fresh base-model runs)
 
-    Callers unpack args themselves — this function never sees the miles args
-    namespace, so a miles field rename can't silently fall through.
+    Callers unpack args themselves — this function never sees a trainer's full
+    args namespace, so a field rename can't silently fall through.
 
     Train-side, rollout-side (nla_generate), and reward-side (nla_rm) MUST all
     call this — train/infer scale mismatch is silent garbage if they diverge.
@@ -155,7 +154,6 @@ def load_nla_config(sidecar_source: str, tokenizer) -> NLAConfig:
       - injection char is not UNK
       - canonical actor prompt produces exactly one injection token
       - neighbor IDs at inj_pos ± 1 match the sidecar
-      - PM token (if present) tokenizes to expected ID
     """
     meta_path = sidecar_path_for(sidecar_source)
     meta = yaml.safe_load(meta_path.read_text())
@@ -254,8 +252,8 @@ def write_model_sidecar(checkpoint_dir: str, cfg: NLAConfig, *, role: str, stage
                         training_args: dict[str, Any] | None = None) -> None:
     """Write {checkpoint_dir}/nla_meta.yaml for an NLA-trained model.
 
-    Called from NLAFSDPActor.save_model. Mirrors the dataset sidecar writer in
-    nla/datagen/sidecar.py but for the model-checkpoint schema (arch doc §2).
+    Mirrors the dataset sidecar writer in nla/datagen/sidecar.py but for the
+    model-checkpoint schema (kind: nla_model — see load_nla_config above).
     """
     meta: dict[str, Any] = {
         "kind": "nla_model",

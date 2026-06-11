@@ -8,12 +8,10 @@ Single entry point with `--mode {av,ar}`:
         loss = MSE on L2-normalised (pred, gold) at last-token position
         target: critic learns to reconstruct activation from explanation text
 
-Replaces:
-  - nla/train_actor.py (NLAFSDPActor — Miles FSDP subclass)
-  - nla/loss.py (nla_critic_loss, plugged in via Miles --custom-loss-function-path)
-  - nla/rollout/sft_actor.py, nla/rollout/sft_critic.py (Miles rollout adapters)
-  - configs/actor_sft.sh, configs/critic_sft.sh (shell wrappers for Miles train.py)
-  - nla/scripts/prepare_critic_checkpoint.py (truncation now happens in-script for AR)
+Replaces the old Miles-era pipeline (FSDP actor subclass, loss plug-ins,
+rollout adapters, shell wrappers, and a separate critic-init script — all
+removed in the repo consolidation). AR backbone truncation now happens
+in-script.
 
 Loads bf16 model + bitsandbytes AdamW8bit (~4 GB optim states on 8B model
 instead of 64 GB for fp32 AdamW). Single GPU; activation memory bounded by
@@ -240,7 +238,7 @@ def heldout_fve_mse(critic, tokenizer, pairs, template, mse_scale_f, device,
 
 # ----------------------------------------------------------------------------
 # AR critic init: truncate base Qwen3 to K+1 layers + Linear(d, d) value_head,
-# identity-init the head. Replaces nla/scripts/prepare_critic_checkpoint.py.
+# identity-init the head. (Previously a separate critic-init script; now in-process.)
 # ----------------------------------------------------------------------------
 
 def _resolve_device_map(device_map_mode, max_gpu_mem, quant_config):
@@ -304,7 +302,7 @@ def init_critic_from_base(base_ckpt: str, num_layers: int, dtype, quant_config=N
     if getattr(base.config, "layer_types", None) is not None:
         base.config.layer_types = list(base.config.layer_types)[:num_layers]
     if strip_final_norm:
-        # Design §4: RAW residual stream → value head. The full model's final
+        # RAW residual stream → value head. The full model's final
         # RMSNorm was trained for the LAST layer's output; applying it to the
         # layer-K stream bakes a per-channel γ reweighting into every critic
         # prediction. NLACriticModel.from_pretrained already strips it — this
@@ -481,7 +479,7 @@ def main():
                    default=True,
                    help="AR mode: replace the backbone's final RMSNorm with "
                         "Identity so the value head sees the raw layer-K "
-                        "residual (design §4, matches NLACriticModel."
+                        "residual (matches NLACriticModel."
                         "from_pretrained). --no-strip-final-norm reproduces "
                         "pre-2026-06 checkpoints. Recorded in ar_meta.json.")
     p.add_argument("--max-len", type=int, default=1024)

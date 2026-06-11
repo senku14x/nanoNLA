@@ -1,15 +1,13 @@
 # NLA Data Generation Pipeline
 
-Generates the three training parquets (`av_sft`, `ar_sft`, `rl`) + sidecars that the NLA training side (`nla/config.py`, `nla/data_source.py`) reads.
-
-Full design: [docs/design.md](../../docs/design.md) §0.
+Generates the three training parquets (`av_sft`, `ar_sft`, `rl`) + sidecars that the NLA training side reads (`nla/config.py` loads + asserts the sidecar; the `<INJECT>` placeholder swap happens in `nla/train_sft.py` `_av_prepare_chunk` and the RL trainers' `build_prompt_text`).
 
 ## Config-driven run (recommended)
 
 One YAML, all stages. See `configs/datagen/qwen7b_fineweb_1M.yaml` for a worked example (100k docs × 10 positions → ~1M vectors, split 25/25/50).
 
 ```bash
-export PYTHONPATH=/path/to/natural_language_autoencoders:${PYTHONPATH:-}
+export PYTHONPATH=/path/to/nanoNLA:${PYTHONPATH:-}
 python -m nla.datagen.run_pipeline --config configs/datagen/qwen7b_fineweb_1M.yaml
 
 # Resume from a specific stage (e.g. after fixing an API error):
@@ -21,7 +19,7 @@ Output paths are derived from `config.output_dir` — `base.parquet`, `splits/*.
 ## Quick start (manual, stage-by-stage)
 
 ```bash
-export PYTHONPATH=/path/to/natural_language_autoencoders:${PYTHONPATH:-}
+export PYTHONPATH=/path/to/nanoNLA:${PYTHONPATH:-}
 
 OUT=/tmp/nla_run
 MODEL=Qwen/Qwen2.5-7B-Instruct
@@ -96,8 +94,7 @@ python -m nla.datagen.merge_base \
 | **1: split** | `base.parquet` | 3 subset parquets | Document-level partition (all rows from same doc go to same bucket). Default 30:30:40. |
 | **2: explain** | SL subset | +`api_explanation` col | Calls Anthropic API with the NLA instruction prompt (2-3 features, `<analysis>` tags). Strict extract: requires closing tag. Bullet cleanup (strip `- * 1.`). Drops rows with <2 features. |
 | **3: build** | subsets | training parquets | av_sft: `prompt` (constant, `<INJECT>` placeholder), `response` (`<explanation>...`). ar_sft: `prompt` ends with `<summary>`, training extracts at `tokens[-1]`. rl: prompt only. Provenance always carried. |
-| **shuffle** | any parquet | shuffled | Row permutation via `pyarrow.take()`. Keyed on `(seed, dataset_id)`. |
-| **shuffle_activations** | any stage3 output | baseline | Permutes ONLY `activation_vector` — prompts/responses fixed. The random-baseline dataset for measuring injection-signal value. |
+| **shuffle** (`stage_shuffle`) | any parquet | shuffled | Row permutation via `pyarrow.take()`. Keyed on `(seed, dataset_id)`. |
 
 ## Output schemas
 
@@ -105,7 +102,7 @@ python -m nla.datagen.merge_base \
 
 | Column | Type | Notes |
 |---|---|---|
-| `prompt` | `list[struct]` (av_sft/rl) or `str` (ar_sft) | `<INJECT>` literal for av_sft/rl — training-side `NLADataSource` swaps for the injection char |
+| `prompt` | `list[struct]` (av_sft/rl) or `str` (ar_sft) | `<INJECT>` literal for av_sft/rl — training swaps it for the injection char (`_av_prepare_chunk` / `build_prompt_text`) |
 | `response` | `str` | av_sft only, `<explanation>\n...\n</explanation>` wrapped |
 | `activation_vector` | `list[float32]` | RAW hidden state — training normalizes |
 | `n_raw_tokens`, `activation_layer`, `doc_id` | provenance | always carried |
