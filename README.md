@@ -6,6 +6,16 @@
 
 This is a minimal reimplementation of [Natural Language Autoencoders Produce Unsupervised Explanations of LLM Activations](https://transformer-circuits.pub/2026/nla/index.html). 
 
+> [!WARNING]
+> **Faithfulness disclaimer — this is a perpetual work-in-progress.** I am *not*
+> fully confident this reproduction is faithful to the paper. The training runs,
+> the FVE goes up, and the explanations look plausible — but I have not verified
+> that every design choice matches the original, and several knowingly don't (see
+> the deviations below; there are likely others I haven't caught). Treat the
+> numbers here as "this implementation's results," not "the paper's results
+> reproduced." Bugs are found and fixed on an ongoing basis. Don't build anything
+> load-bearing on this without checking the relevant code path yourself.
+
 Starting from their [implementation](https://github.com/kitft/natural_language_autoencoders), I here share a minimal version that is sufficient to train NLAs on small models (no SGLang) and should lead to significantly reduced infra hassle.
 
 **The code contains the code to warmstart an AV and an AR, and co-train them using RL**
