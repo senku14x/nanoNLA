@@ -44,7 +44,6 @@ def main() -> None:
     ap.add_argument("--dataset", default="syvb/nanonla-qwen3-8b-L24-data-full")
     ap.add_argument("--split", default="av_sft_full.parquet",
                     help="doc-disjoint held-out split (AV split is disjoint from AR training)")
-    ap.add_argument("--expl-col", default="api_explanation")
     ap.add_argument("--critic-template",
                     default="Summary of the following text: <text>{explanation}</text> <summary>")
     ap.add_argument("-n", type=int, default=1000)
@@ -58,7 +57,8 @@ def main() -> None:
     from huggingface_hub import hf_hub_download, snapshot_download
     from transformers import AutoTokenizer
     from nla.models import NLACriticModel
-    from nla.schema import ACTIVATION_COLUMN, compute_predict_mean_baselines, normalize_activation
+    from nla.schema import (ACTIVATION_COLUMN, compute_predict_mean_baselines,
+                            extract_explanation, normalize_activation)
 
     # --- critic: snapshot first so value_head.safetensors loads (HF-id gotcha) ---
     local = snapshot_download(args.ar)
@@ -75,19 +75,27 @@ def main() -> None:
           f"mse_scale={mse_scale:.2f}")
 
     # --- held-out (explanation, activation) pairs -------------------------------
+    # AV-split parquet: the explanation lives in `response`, wrapped in
+    # <explanation> tags (extract_explanation), paired with activation_vector.
+    # Matches nla.train_sft.load_heldout_explanation_pairs.
     pq_path = hf_hub_download(args.dataset, args.split, repo_type="dataset")
     expls: list[str] = []
     chunks: list[np.ndarray] = []
     for batch in pq.ParquetFile(pq_path).iter_batches(
-        batch_size=4096, columns=[args.expl_col, ACTIVATION_COLUMN]
+        batch_size=4096, columns=["response", ACTIVATION_COLUMN]
     ):
-        e = batch.column(args.expl_col).to_pylist()
-        a = batch.column(ACTIVATION_COLUMN).flatten().to_numpy(zero_copy_only=False)
-        chunks.append(a.astype(np.float32).reshape(len(e), -1))
-        expls.extend(e)
-        if sum(c.shape[0] for c in chunks) >= args.n:
+        resp = batch.column("response").to_pylist()
+        a = (batch.column(ACTIVATION_COLUMN).flatten().to_numpy(zero_copy_only=False)
+             .astype(np.float32).reshape(len(resp), -1))
+        for r, row_a in zip(resp, a):
+            ex = extract_explanation(r)
+            if ex is None:           # extraction-failure rows excluded, as in training
+                continue
+            expls.append(ex)
+            chunks.append(row_a[None, :])
+        if len(expls) >= args.n:
             break
-    gold = torch.tensor(np.concatenate(chunks, 0)[: args.n], dtype=torch.float32)
+    gold = torch.tensor(np.concatenate(chunks[: args.n], 0), dtype=torch.float32)
     expls = expls[: args.n]
     print(f"[data] {len(expls)} held-out pairs from {args.split}")
 
