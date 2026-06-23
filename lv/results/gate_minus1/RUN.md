@@ -24,19 +24,23 @@ Train Δ_c on construction A, test whether it separates a structurally-different
 | concept | A → B | within_B | **dir_transfer** | probe_transfer | shuffled_B | len_auroc_B | verdict |
 |---|---|---|---|---|---|---|---|
 | truth_value | GoT cities → larger_than | 1.000 | **0.996** | 0.999 | 0.495 | 0.62 | **TRANSFERS** |
+| truth_value | GoT cities → neg_cities | 1.000 | **0.999** | 1.000 | 0.525 | 0.51 | **TRANSFERS** |
 
-**Read:** the cities-trained truth direction separates numeric `larger_than` at 0.996
-(≈ ceiling, vs 0.495 floor) → truth_value is a **real, transferable direction**, not
-cities-template leakage. `len_auroc_B = 0.62` is a mild length signal in `larger_than`
-but cannot drive a 0.996 transfer (cities true/false are near-minimal pairs, so the
-trained direction is not a length direction).
+**Read:** the cities-trained truth direction separates numeric `larger_than` (0.996) AND
+negated `neg_cities` (0.999) — both ≈ ceiling, vs ~0.50 floors. `len_auroc_B` is 0.62 on
+larger_than but **0.51** on neg_cities (no length signal), and neither can drive a ~1.0
+transfer (cities true/false are near-minimal pairs, so the trained direction is not a
+length direction). Surviving **negation** is notable: it's the case where affirmative-
+trained truth probes classically fail (GoT), so the direction is genuinely truth-tracking,
+not polarity-locked.
 
-**Upgrades truth_value:** suspect → trustworthy *as a direction*. Validates the harness
-on real activations (matches the self-test).
+**Upgrades truth_value:** suspect → **supported** — a real, transferable read control
+across two structurally-different constructions incl. the hard negation case. Validates
+the transfer harness on real activations (matches the self-test).
 
-## Open (before truth_value is "supported", and for the rest of the panel)
-- **More transfer pairs:** run `sp_en_trans` and especially **`neg_cities`** (negation is
-  where truth directions classically break). One pair is a pattern, not a supported claim.
+## Open (panel)
+- **Optional third pair:** `sp_en_trans` (translation) — nice-to-have; truth is already
+  supported by larger_than + neg_cities.
 - **Caveat:** the direction may track *factual plausibility* rather than truth-disposition
   — fine for a read control, do not overclaim.
 - **Per-concept transfer still owed:** refusal (AdvBench → naturalistic); corrigibility
