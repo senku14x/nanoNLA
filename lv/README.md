@@ -1,7 +1,8 @@
 # Making-LV-Explainers
 
 
-***SHELVED***
+***SHELVED : 
+The released NLA only ever sees the model reading generic web text, so the safety behaviors we set out to study (refusal, sycophancy, deception) never occur in its inputs and can't be measured on this substrate — making the core question untestable here without a different NLA.***
 
 Research code for studying **why Natural Language Autoencoders (NLAs) verbalize
 some activation content and silently omit other linearly-decodable content**, and
