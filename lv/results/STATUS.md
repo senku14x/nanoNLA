@@ -1,5 +1,19 @@
 # NLA whitened-reward study — status & findings (live)
 
+> **SHELVED — bottleneck.** The released Qwen3-8B NLA — and every publicly available
+> NLA (kitft's Qwen2.5/Gemma/Llama, syvb's Qwen3) — is trained on activations from the
+> base model *passively reading generic FineWeb web documents* (confirmed from the AR
+> sidecar `extraction.corpus: finefineweb`, the Stage-0 datagen in `docs/qwen3_8b_run.md`,
+> and the released completions' source texts). The safety behaviors this project set out
+> to study — refusal, sycophancy, deception, corrigibility — only arise when the model is
+> *acting* (responding to a user), never when reading web prose, so they do not occur in
+> the NLA's input distribution at all. You cannot measure whether the NLA omits a concept
+> that is never present, which makes the core question untestable on any public NLA.
+> Anthropic's eval-awareness / hidden-motivation findings that motivated this work came
+> from internal NLAs applied to agentic/evaluation activations that were never released.
+> Unblocking requires *training or extending* an NLA on agentic activations — not swapping
+> in another released checkpoint — so the project is shelved until such a substrate exists.
+
 Empirical record of what has actually run on hardware (Qwen3-8B L24, syvb NLA).
 Claims are graded per the research contract: **supported** (survives baselines/
 controls/replication) · **measured** (a confirmed instrument/substrate fact) ·
