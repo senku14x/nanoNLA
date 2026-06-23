@@ -48,7 +48,7 @@ def main() -> None:
     agg = {}
     for tag in TAGS:
         try:
-            shutil.copy(_get(f"heldout/{tag}.summary.json"), OUT / f"{tag}.summary.json")
+            shutil.copy(_get(f"heldout/{tag}.samples.summary.json"), OUT / f"{tag}.summary.json")
             agg[tag] = json.loads((OUT / f"{tag}.summary.json").read_text())
         except Exception as e:  # noqa: BLE001
             print(f"skip {tag} summary: {e}")
