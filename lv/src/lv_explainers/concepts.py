@@ -56,7 +56,9 @@ def mean_difference(h_present: np.ndarray, h_absent: np.ndarray, name: str) -> C
 
 
 def _sigmoid(z: np.ndarray) -> np.ndarray:
-    return np.where(z >= 0, 1 / (1 + np.exp(-z)), np.exp(z) / (1 + np.exp(z)))
+    # clip to avoid exp overflow on large logits — raw activations have big norms,
+    # and np.where would still evaluate both branches. Clipping is the clean fix.
+    return 1.0 / (1.0 + np.exp(-np.clip(z, -30.0, 30.0)))
 
 
 def fit_logistic(
@@ -69,7 +71,8 @@ def fit_logistic(
     Xb = np.hstack([X, np.ones((X.shape[0], 1))])
     w = np.zeros(Xb.shape[1])
     n = Xb.shape[0]
-    # standardize features for conditioning (store nothing; probe is per-call)
+    # caller standardizes features per-fold (see probe_auroc_cv); GD on the
+    # bias-augmented design matrix.
     for _ in range(iters):
         p = _sigmoid(Xb @ w)
         grad = Xb.T @ (p - y) / n + l2 * np.r_[w[:-1], 0.0]
@@ -121,8 +124,13 @@ def probe_auroc_cv(
         if len(np.unique(y[tr])) < 2 or te.sum() == 0:
             scores[te] = 0.0
             continue
-        w = fit_logistic(X[tr], y[tr])
-        scores[te] = np.hstack([X[te], np.ones((te.sum(), 1))]) @ w
+        Xtr, Xte = X[tr], X[te]
+        mu = Xtr.mean(0)
+        sd = Xtr.std(0) + 1e-6           # standardize per-fold: fit on train, no leakage
+        Xtr = (Xtr - mu) / sd
+        Xte = (Xte - mu) / sd
+        w = fit_logistic(Xtr, y[tr])
+        scores[te] = np.hstack([Xte, np.ones((te.sum(), 1))]) @ w
     return {"auroc": auroc(scores, y), "scores": scores}
 
 
