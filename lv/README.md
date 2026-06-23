@@ -1,5 +1,8 @@
 # Making-LV-Explainers
 
+
+***SHELVED***
+
 Research code for studying **why Natural Language Autoencoders (NLAs) verbalize
 some activation content and silently omit other linearly-decodable content**, and
 whether a **variance-equalized (whitened) reconstruction reward** can recover the
