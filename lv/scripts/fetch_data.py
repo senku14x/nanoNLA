@@ -28,11 +28,17 @@ from pathlib import Path
 UA = {"User-Agent": "Mozilla/5.0 (lv-explainers fetch_data)"}
 
 RAW = "https://raw.githubusercontent.com"
+GOT = f"{RAW}/saprmarks/geometry-of-truth/main/datasets"
 URLS = {
     "corrigibility": f"{RAW}/anthropics/evals/main/advanced-ai-risk/human_generated_evals/corrigible-neutral-HHH.jsonl",
     "advbench": f"{RAW}/llm-attacks/llm-attacks/main/data/advbench/harmful_behaviors.csv",
     "alpaca": f"{RAW}/tatsu-lab/stanford_alpaca/main/alpaca_data.json",
-    "got_cities": f"{RAW}/saprmarks/geometry-of-truth/main/datasets/cities.csv",
+    "got_cities": f"{GOT}/cities.csv",
+    # Geometry-of-Truth held-out sets for the Gate -1 TRANSFER check: train Delta_c
+    # on cities, test it separates these structurally-different truth constructions.
+    "got_larger_than": f"{GOT}/larger_than.csv",     # numeric comparisons
+    "got_sp_en_trans": f"{GOT}/sp_en_trans.csv",     # Spanish-English translation
+    "got_neg_cities": f"{GOT}/neg_cities.csv",        # negated city statements
 }
 
 
@@ -110,10 +116,43 @@ def fetch_truth_value(out: Path, limit: int, force: bool) -> str:
     return f"truth_value: {len(true_s)} true / {len(false_s)} false -> {t_dest.parent}"
 
 
+def fetch_truth_transfer(out: Path, limit: int, force: bool) -> str:
+    """Geometry-of-Truth held-out sets for the Gate -1 TRANSFER check. Each written
+    as present/absent txt under data/truth_transfer/{name}_{true,false}.txt, so the
+    same --transfer-present/--transfer-absent path works. Train Delta_c on cities
+    (truth_value), test it separates these structurally-different constructions."""
+    sets = {"larger_than": "got_larger_than",   # numeric comparisons
+            "sp_en_trans": "got_sp_en_trans",   # translation true/false
+            "neg_cities": "got_neg_cities"}     # negation (hardest transfer)
+    msgs = []
+    for name, key in sets.items():
+        t_dest = out / "truth_transfer" / f"{name}_true.txt"
+        f_dest = out / "truth_transfer" / f"{name}_false.txt"
+        if _exists(t_dest) and _exists(f_dest) and not force:
+            msgs.append(f"{name}: exists"); continue
+        rows = list(csv.DictReader(io.StringIO(download(URLS[key]).decode())))
+        if not rows:
+            raise RuntimeError(f"{key} returned no rows")
+        cols = {c.lower(): c for c in rows[0].keys()}
+        sc, lc = cols.get("statement"), cols.get("label")
+        if not sc or not lc:
+            raise RuntimeError(f"{name}.csv missing statement/label columns: {list(rows[0])}")
+        is_true = lambda r: str(r[lc]).strip() in ("1", "1.0", "True", "true")
+        true_s = [r[sc] for r in rows if is_true(r)]
+        false_s = [r[sc] for r in rows if not is_true(r)]
+        if limit:
+            true_s, false_s = true_s[:limit], false_s[:limit]
+        _write(t_dest, "\n".join(true_s))
+        _write(f_dest, "\n".join(false_s))
+        msgs.append(f"{name}: {len(true_s)}t/{len(false_s)}f")
+    return "truth_transfer: " + "; ".join(msgs) + f" -> {out / 'truth_transfer'}"
+
+
 FETCHERS = {
     "corrigibility": fetch_corrigibility,
     "refusal": fetch_refusal,
     "truth_value": fetch_truth_value,
+    "truth_transfer": fetch_truth_transfer,
 }
 # To add: sycophancy/false_agreement, deception/withholding (MASK, SycophancyEval) —
 # see docs/datasets.md. Those are the semantic targets; add fetchers here.
@@ -148,6 +187,11 @@ def main(argv=None) -> int:
           f"      --concept refusal --present {out}/refusal/harmful.txt --absent {out}/refusal/harmless.txt")
     print(f"  python -m lv_explainers.validate_concepts --model Qwen/Qwen3-8B --layer 24 \\\n"
           f"      --concept truth_value --present {out}/truth_value/true.txt --absent {out}/truth_value/false.txt")
+    print("\n  # Gate -1 TRANSFER (is the direction real or construction leakage?):")
+    print(f"  python -m lv_explainers.validate_concepts --model Qwen/Qwen3-8B --layer 24 \\\n"
+          f"      --concept truth_value --present {out}/truth_value/true.txt --absent {out}/truth_value/false.txt \\\n"
+          f"      --transfer-present {out}/truth_transfer/larger_than_true.txt \\\n"
+          f"      --transfer-absent  {out}/truth_transfer/larger_than_false.txt")
     return rc
 
 
