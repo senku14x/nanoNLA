@@ -4,6 +4,28 @@ Live decisions that may override specific recommendations in the design doc.
 Newest first. Each entry records the decision, the rationale, and the tradeoff we
 are knowingly accepting (per the research contract — record the cost, don't bury it).
 
+## D7 — Replace bare BoW with a tiered text baseline; split the two jobs (2026-06-23)
+**Decision.** A bag-of-words baseline is too weak and was doing two different jobs.
+Use a **tiered text classifier** and apply the right tier to the right question:
+- **lexical floor** = TF-IDF unigram+bigram + logistic (`text_baselines.lexical_auroc`,
+  numpy, tested). Replaces raw BoW. Only rules out *trivial lexical* leakage.
+- **semantic** = frozen sentence-encoder probe (`embedding_auroc`) and/or an **LLM
+  judge** (`llm_judge_decodability`) — the baselines that actually threaten the
+  interpretation (catch paraphrase/meaning). NEEDS-GPU/API.
+**Two jobs, kept distinct:**
+1. *Leakage control* (Gate −1) — does the **activation probe** exploit a surface
+   confound? Real tests = shortcut-feature probe (length/position/token-id) +
+   transfer-to-naturalistic. The lexical baseline is only a cheap floor here.
+2. *Redundancy / decodability-from-text* (H1, Gate 0) — can a **strong reader**
+   recover c from the **AV explanation**? If yes, the AR reconstructs c from prose
+   and naming earns no reward (the redundancy mechanism). Use the SEMANTIC tier,
+   NOT BoW: a concept can saturate meaning with none of its surface words.
+**Crucial split (LLM judge, two prompts):** "does the explanation **name** c?"
+(read-rate) vs "can you **infer** c from the explanation?" (decodability).
+Inferable-but-not-named *is* decodable-but-unread — BoW cannot see this at all.
+**Caveat:** validate the judge on obvious ± and check it is not keying on
+affirmation language; report both judge modes + the gap, not a single number.
+
 ## D5 — Fork ceselder/nanoNLA; repo roles fixed; nanoNLA reality corrections (2026-06-23)
 **Decision.** Work on a **fork of `ceselder/nanoNLA`** — confirmed to be the exact
 code that trained syvb's Qwen3-8B L24 checkpoints (its RL script loads

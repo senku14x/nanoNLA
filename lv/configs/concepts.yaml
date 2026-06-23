@@ -86,9 +86,14 @@ panel:
 
 # Matching variables to report alongside read-rate (a difference in any of these
 # is an alternative explanation for a read/unread gap, not the concept itself):
+# NOTE (D7): `bow_auroc` in `observed` above is the historical bag-of-words floor.
+# Going forward use the tiered text baseline (text_baselines.py): lexical (TF-IDF
+# n-gram) AND semantic (embedding / LLM judge). The semantic tier, applied to the
+# AV explanation, is what tests the redundancy mechanism; BoW cannot.
 matching_variables:
   - probe_auroc
-  - bow_auroc
+  - lexical_auroc        # TF-IDF n-gram floor (was bow_auroc)
+  - semantic_auroc       # embedding / LLM-judge reader on the explanation (D7)
   - class_prevalence
   - prompt_length
   - token_position

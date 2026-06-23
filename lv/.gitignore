@@ -17,6 +17,7 @@ checkpoints/
 outputs/
 runs/
 wandb/
+data/          # datasets fetched by scripts/fetch_data.py — external, not committed
 
 # Notebooks / scratch
 .ipynb_checkpoints/

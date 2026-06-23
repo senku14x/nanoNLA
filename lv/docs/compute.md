@@ -45,6 +45,20 @@ pip install -r requirements-gpu.txt   # torch, transformers, safetensors, sglang
 huggingface-cli login                 # needed for gated bases (Llama/Gemma)
 ```
 
+## Operational practices (generic — for ephemeral/spot GPU boxes)
+Standard hygiene, nothing project-specific:
+- **Persist as you go.** Vast/Colab boxes are ephemeral; push every checkpoint +
+  any generated dataset to HF (or GCS) *immediately* after it's written, so a host
+  failure doesn't cost a run. Don't accumulate hours of state only on local disk.
+- **Fit, don't fight, memory.** Use gradient checkpointing for the AR-SFT and RL
+  steps before reaching for smaller models; tune micro-batch up to fill the card
+  rather than leaving VRAM idle. On the H200 (141 GB) bf16 8B has plenty of room.
+- **Logging from env.** Auto-enable wandb from `WANDB_API_KEY` so runs are tracked
+  without per-run flags; log the per-arm metrics the design lists (reward mean,
+  within-group reward std, critic loss, response length, extraction-failure rate).
+- **Calibrate wall-clock first.** Run ~20 steps to estimate time before committing
+  to a full sweep.
+
 ## First thing to run anywhere
 ```bash
 bash scripts/run_tests.sh    # pure-math self-tests; no GPU needed
