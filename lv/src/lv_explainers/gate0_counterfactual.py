@@ -48,6 +48,7 @@ mock scorer; the GPU only provides the real score_fn (nla_io.ARScorer.reconstruc
 
 from __future__ import annotations
 
+import zlib
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -210,7 +211,9 @@ def _mock_world(kind: str, d: int = 256, n: int = 40, seed: int = 0):
     def score_fn(text: str) -> np.ndarray:
         # deterministic pseudo-reconstruction from text hash, missing v_c unless
         # the concept is named (the string is appended by mention_sentence).
-        h = abs(hash(text)) % (2**32)
+        # zlib.crc32 (NOT builtin hash(), which is salted per process by
+        # PYTHONHASHSEED and would make this test flaky).
+        h = zlib.crc32(text.encode())
         r = np.random.default_rng(h).standard_normal(d)
         names_c = "reflects target_concept" in text
         if kind == "broken":

@@ -4,6 +4,22 @@ Live decisions that may override specific recommendations in the design doc.
 Newest first. Each entry records the decision, the rationale, and the tradeoff we
 are knowingly accepting (per the research contract — record the cost, don't bury it).
 
+## D8 — No lexical check on contrast prompts at Gate -1; verdict = probe vs shuffled (2026-06-23)
+**Decision.** `validate_concepts` (Gate -1) judges decodability from **probe AUROC vs
+a shuffled-label control** only → `DECODABLE` / `NOT_DECODABLE`. Removed the
+lexical-on-prompts gate (and the `LEXICAL_LEAK` verdict).
+**Why.** Running a lexical/TF-IDF classifier on the *rendered contrast text* is
+confounded by construction — the text encodes the label: two-population sets
+(refusal, truth) use entirely different prompts (lexical AUROC ≈ 1.0), and A/B pairs
+differ only by the appended answer letter (also ≈ 1.0). So it flagged *every* concept
+as `LEXICAL_LEAK`, mislabeling genuine directions (e.g. refusal). It measures the
+construction marker, not leakage.
+**Where the checks actually go.** Leakage/validity at Gate -1 = **transfer** to
+held-out naturalistic activations (separate data, to build). The lexical+semantic
+text baselines (D7) keep their home on the **AV explanation** at Gate 0 (redundancy),
+where the text is generated, not constructed. `text_baselines.py` is unchanged and
+still correct — it was just applied in the wrong place.
+
 ## D7 — Replace bare BoW with a tiered text baseline; split the two jobs (2026-06-23)
 **Decision.** A bag-of-words baseline is too weak and was doing two different jobs.
 Use a **tiered text classifier** and apply the right tier to the right question:

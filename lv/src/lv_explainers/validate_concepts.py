@@ -13,32 +13,41 @@ Split:
                              nla_io.ActivationExtractor, then calls it. NEEDS-GPU.
 
 Verdict per concept:
-  DECODABLE      probe AUROC >> lexical floor AND >> shuffled(~0.5) -> real direction
-  LEXICAL_LEAK   probe high but lexical baseline also high -> surface shortcut
+  DECODABLE      probe AUROC >> shuffled(~0.5) -> a linear direction exists at L24
   NOT_DECODABLE  probe ~ shuffled -> no linear direction at this layer
-(Transfer-to-naturalistic + the causal steering screen (Gate -1b) are separate,
-stronger checks; this is the decodability gate.)
+LEAKAGE/validity is NOT judged by a lexical classifier on the constructed prompts
+(confounded — the rendered text encodes the label; see validate_concept / D8). It is
+judged by TRANSFER to naturalistic activations (Gate -1 transfer) and the causal
+steering screen (Gate -1b). Text baselines (lexical + semantic) live on the AV
+EXPLANATION at Gate 0, where the text is generated, not constructed.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from . import concepts, text_baselines
+from . import concepts
 
 
 def validate_concept(
     name: str,
     present_acts: np.ndarray,   # (n_p, d) raw L24 activations, present-c
     absent_acts: np.ndarray,    # (n_a, d) raw L24 activations, absent-c
-    present_texts: list[str],
-    absent_texts: list[str],
     pair_ids: list[int] | None = None,
-    lexical_gap: float = 0.15,
-    shuffled_gap: float = 0.15,
+    shuffled_gap: float = 0.1,
     seed: int = 0,
 ) -> dict:
-    """Compute Delta_c + probe AUROC + lexical-floor + shuffled control + verdict."""
+    """Delta_c + probe AUROC vs a shuffled-label control -> DECODABLE / NOT_DECODABLE.
+
+    D8: we deliberately do NOT run a lexical/TF-IDF classifier on the contrast
+    prompts here. For these constructions it is confounded — the rendered text
+    encodes the label (the appended answer letter for A/B pairs; entirely different
+    prompts for two-population sets like refusal/truth), so a text classifier scores
+    ~1.0 and says nothing about whether the *activation* direction is the concept.
+    Leakage/validity is tested by TRANSFER to held-out naturalistic activations
+    (separate). Text baselines (lexical + semantic) belong on the AV EXPLANATION at
+    Gate 0, where the text is generated, not constructed.
+    """
     P = np.asarray(present_acts, dtype=np.float64)
     A = np.asarray(absent_acts, dtype=np.float64)
     assert P.shape[1] == A.shape[1], "present/absent activation dims differ"
@@ -54,17 +63,7 @@ def validate_concept(
 
     probe = concepts.probe_auroc_cv(X, y, np.asarray(groups) if groups else None, seed=seed)["auroc"]
     shuffled = concepts.shuffled_label_auroc(X, y, seed=seed)
-    lexical = text_baselines.lexical_auroc(present_texts + absent_texts, y.tolist(),
-                                           groups, seed=seed)["auroc"]
-    # sanity: probe direction should roughly align with the mean-difference
-    cos_probe_delta = None  # filled by caller if it has the probe weights; optional
-
-    if probe < shuffled + shuffled_gap:
-        verdict = "NOT_DECODABLE"
-    elif lexical > probe - lexical_gap:
-        verdict = "LEXICAL_LEAK"
-    else:
-        verdict = "DECODABLE"
+    verdict = "DECODABLE" if probe > shuffled + shuffled_gap else "NOT_DECODABLE"
 
     return {
         "concept": name,
@@ -72,10 +71,10 @@ def validate_concept(
         "n_absent": int(len(A)),
         "probe_auroc": float(probe),
         "shuffled_auroc": float(shuffled),
-        "lexical_auroc": float(lexical),
         "delta_c_norm": float(np.linalg.norm(cd.delta_c)),
         "verdict": verdict,
-        "note": "decodability only; run Gate -1b (causal) + transfer before trusting.",
+        "note": "decodability vs shuffled only; LEAKAGE -> transfer to naturalistic "
+                "activations (not a lexical check on constructed prompts).",
     }
 
 
@@ -122,39 +121,26 @@ def main(argv=None) -> None:  # pragma: no cover - NEEDS-GPU
     finally:
         ex.close()
 
-    rep = validate_concept(args.concept, P, A, cs.present_texts, cs.absent_texts, cs.pair_ids)
+    rep = validate_concept(args.concept, P, A, cs.pair_ids)
     print(json.dumps(rep, indent=2))
 
 
 def _selftest() -> None:
     rng = np.random.default_rng(0)
     d = 512
-
-    # DECODABLE: a planted direction separates classes; texts share vocabulary
-    # (so lexical floor ~ chance) -> probe high, lexical low -> DECODABLE.
+    # DECODABLE: a planted direction separates the classes
     vdir = rng.standard_normal(d); vdir /= np.linalg.norm(vdir)
     P = rng.standard_normal((80, d)) + 3.0 * vdir
     A = rng.standard_normal((80, d)) - 3.0 * vdir
-    pool = "user model goal task value system".split()
-    txt = lambda: " ".join(rng.choice(pool, 5))
-    r1 = validate_concept("planted", P, A, [txt() for _ in range(80)], [txt() for _ in range(80)])
+    r1 = validate_concept("planted", P, A)
     assert r1["verdict"] == "DECODABLE", r1
-
     # NOT_DECODABLE: no separation in activations
-    P2 = rng.standard_normal((80, d)); A2 = rng.standard_normal((80, d))
-    r2 = validate_concept("noise", P2, A2, [txt() for _ in range(80)], [txt() for _ in range(80)])
+    r2 = validate_concept("noise", rng.standard_normal((80, d)), rng.standard_normal((80, d)))
     assert r2["verdict"] == "NOT_DECODABLE", r2
 
-    # LEXICAL_LEAK: activations separable AND texts lexically separable
-    pres_t = [f"alpha keyword case {i}" for i in range(80)]
-    abs_t = [f"beta keyword case {i}" for i in range(80)]
-    r3 = validate_concept("leaky", P, A, pres_t, abs_t)
-    assert r3["verdict"] == "LEXICAL_LEAK", r3
-
     print("validate_concepts self-test: PASS")
-    print(f"  planted -> {r1['verdict']} (probe {r1['probe_auroc']:.2f} / lex {r1['lexical_auroc']:.2f})")
+    print(f"  planted -> {r1['verdict']} (probe {r1['probe_auroc']:.2f} / shuf {r1['shuffled_auroc']:.2f})")
     print(f"  noise   -> {r2['verdict']} (probe {r2['probe_auroc']:.2f} / shuf {r2['shuffled_auroc']:.2f})")
-    print(f"  leaky   -> {r3['verdict']} (probe {r3['probe_auroc']:.2f} / lex {r3['lexical_auroc']:.2f})")
 
 
 if __name__ == "__main__":

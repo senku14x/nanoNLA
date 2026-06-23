@@ -163,7 +163,10 @@ class ActivationExtractor:
         seq = hs.shape[0]
         if positions is None:
             positions = list(range(min(50, seq - 1), seq))  # skip under-sampled prefix
+        positions = [p + seq if p < 0 else p for p in positions]  # resolve -1 -> last token
         positions = [p for p in positions if 0 <= p < seq]
+        if not positions:
+            raise ValueError(f"no valid positions for text with seq len {seq}")
         vecs = hs[positions].float().cpu().numpy()
         return positions, vecs
 
