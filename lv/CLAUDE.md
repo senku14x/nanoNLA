@@ -166,7 +166,16 @@ self-tests run via `bash scripts/run_tests.sh`. GPU boxes: **Vast H200** + **Lam
 or out; does syvb ship an `nla_meta.yaml` sidecar; is syvb post-trained or `-Base`;
 does any target actually go unread on syvb's NLA (Gate 1).
 
-**Code map.** `src/lv_explainers/`: `metrics.py` (MSE/FVE/residual, tested),
-`concepts.py` (Δ_c/probe, tested), `gate0_counterfactual.py` (decisive test, tested),
-`nla_io.py` (sidecar + GPU-gated AR/extractor). Pure-math modules carry executable
-self-tests; GPU code is marked `NEEDS-GPU-VALIDATION` and is untested locally.
+**Results.** Run outcomes are pushed from the GPU box into `results/` (mirrored to
+BOTH this repo and the nanoNLA fork, via `scripts/push_results.sh`). **Read
+`results/` first** to see what actually happened on hardware — it's the empirical
+record across sessions.
+
+**Code map.** `src/lv_explainers/`: `metrics.py` (MSE/FVE/residual), `concepts.py`
+(Δ_c/probe/AUROC/CV), `data.py` (dataset loaders → contrast sets), `text_baselines.py`
+(lexical TF-IDF + semantic interfaces, D7), `validate_concepts.py` (Gate −1 "test the
+vectors" runner + CLI), `gate0_counterfactual.py` (decisive test), `nla_io.py` (sidecar
++ GPU-gated AR/extractor; injection = nanoNLA residual-ADD, D5). All pure-math modules
+carry executable self-tests (`bash scripts/run_tests.sh`); GPU code is
+`NEEDS-GPU-VALIDATION`. Scripts: `check_model.py`, `fetch_data.py`, `setup_env.sh`,
+`transfer_to_fork.sh`, `push_results.sh`.
