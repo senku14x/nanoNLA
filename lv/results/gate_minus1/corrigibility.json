@@ -1,0 +1,10 @@
+{
+  "concept": "corrigibility",
+  "n_present": 200,
+  "n_absent": 200,
+  "probe_auroc": 0.9894,
+  "shuffled_auroc": 0.539375,
+  "delta_c_norm": 56.412557116472094,
+  "verdict": "DECODABLE",
+  "note": "decodability vs shuffled only; LEAKAGE -> transfer to naturalistic activations (not a lexical check on constructed prompts)."
+}

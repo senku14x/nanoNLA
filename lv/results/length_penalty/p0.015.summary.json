@@ -1,0 +1,15 @@
+{
+  "tag": "p0.015",
+  "n": 1000,
+  "extraction_rate": 0.999,
+  "mean_tokens": 25.19,
+  "mean_mse": 0.36852076487826396,
+  "nmse": 0.5497326557069476,
+  "fve": 0.4502673442930524,
+  "fve_baseline": 0.6703636050224304,
+  "rl_lora": "/workspace/nla/ckpts/rl/p0.015/iter_000250",
+  "mean_tokens_std": 4.843954995662119,
+  "mean_tokens_sem": 0.15317930669643337,
+  "fve_std": 0.2711157480904841,
+  "fve_sem": 0.00857772266915011
+}

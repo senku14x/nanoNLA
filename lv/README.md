@@ -1,5 +1,8 @@
 # Making-LV-Explainers
 
+
+***SHELVED***
+
 Research code for studying **why Natural Language Autoencoders (NLAs) verbalize
 some activation content and silently omit other linearly-decodable content**, and
 whether a **variance-equalized (whitened) reconstruction reward** can recover the
@@ -15,8 +18,12 @@ toward the reducible **residual** makes the explainer name decodable-but-unread
 concepts — and we try hard to falsify that before believing it.
 
 ## Status
-Design + verified pure-math core. **No model has been trained.** The decisive
-first step (Gate 0) has not been run — it needs a GPU box (see below).
+Running on hardware (syvb Qwen3-8B L24 NLA). Substrate + measurement instruments
+validated; **one supported result** (truth_value is a real, transferable
+direction) and **one characterized baseline** (the length-penalty sweep). The AR
+critic loads + reconstructs correctly (cross-checked vs the repo's `NLACriticModel`).
+**No read/unread number measured yet** — H1 is untouched; the next blocker is
+on-manifold concept-bearing activations. Full graded record: **`results/STATUS.md`**.
 
 ## Operating contract
 `CLAUDE.md` is the research contract (skeptical-by-default, falsification-first,

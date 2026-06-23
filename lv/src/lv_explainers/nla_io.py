@@ -190,59 +190,80 @@ class ARScorer:
     """
 
     def __init__(self, checkpoint: str, sidecar: NLASidecar, device: str = "cuda",
-                 dtype: str = "bfloat16"):
+                 dtype: str = "bfloat16", final_norm: bool = False):
         import torch
-        from transformers import AutoModel, AutoTokenizer
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
         self.torch = torch
         self.sc = sidecar
         self.tokenizer = AutoTokenizer.from_pretrained(checkpoint)
-        # AutoModel (no LM head). The released critic may need trust_remote_code
-        # if it ships a custom class; assert d_model and layer count after load.
-        self.backbone = AutoModel.from_pretrained(
+        # The released AR is saved as a (truncated, K+1-layer) Qwen3ForCausalLM.
+        # Load the full CausalLM so backbone weights map unambiguously (no
+        # state-dict prefix guessing), then keep only .model — it returns
+        # last_hidden_state; the lm_head is unused. Assert d_model / layer count.
+        full = AutoModelForCausalLM.from_pretrained(
             checkpoint, torch_dtype=getattr(torch, dtype), device_map=device,
             trust_remote_code=True,
         ).eval()
+        self.backbone = full.model
+        cfg = full.config
         d = sidecar.d_model
-        cfg = self.backbone.config
         assert getattr(cfg, "hidden_size", d) == d, "AR hidden_size != sidecar d_model"
         if sidecar.critic_num_hidden_layers is not None:
             assert cfg.num_hidden_layers == sidecar.critic_num_hidden_layers, (
                 f"AR layer count {cfg.num_hidden_layers} != sidecar "
                 f"{sidecar.critic_num_hidden_layers} (K+1)"
             )
+        # Released critic replaces the final norm with Identity (docs/nla-method-
+        # notes). Default to that; --final-norm keeps it. The Gate-0 smoke test
+        # arbitrates empirically — a wrong choice shows up as a dead calibrator.
+        self.final_norm = final_norm
+        if not final_norm and hasattr(self.backbone, "norm"):
+            self.backbone.norm = torch.nn.Identity()
         self.value_head = self._load_value_head(checkpoint, d, device, dtype)
 
     def _load_value_head(self, checkpoint, d, device, dtype):
-        """Load value_head weights from the checkpoint's safetensors. The key
-        name varies by release; try the documented candidates and fail loudly."""
+        """Load the value_head weight. The released AR ships it as a standalone
+        value_head.safetensors holding a single (d, d) tensor under key 'weight'.
+        Works for a local dir or an HF repo id (downloads just that file)."""
         import torch
         from safetensors import safe_open
 
-        candidates = ["value_head.weight", "critic_head.weight", "v_head.weight"]
-        files = list(Path(checkpoint).glob("*.safetensors")) if Path(checkpoint).exists() else []
+        if Path(checkpoint).exists():
+            f = Path(checkpoint) / "value_head.safetensors"
+            path = str(f) if f.exists() else None
+        else:
+            from huggingface_hub import hf_hub_download
+            path = hf_hub_download(checkpoint, "value_head.safetensors")
+        if path is None:
+            raise AssertionError(f"value_head.safetensors not found under {checkpoint}")
         head = torch.nn.Linear(d, d, bias=False).to(device=device, dtype=getattr(torch, dtype))
-        for f in files:
-            with safe_open(str(f), framework="pt") as st:
-                for key in candidates:
-                    if key in st.keys():
-                        head.weight.data = st.get_tensor(key).to(head.weight.device, head.weight.dtype)
-                        return head
-        raise AssertionError(
-            f"value_head weight not found in {checkpoint}; checked {candidates}. "
-            "Inspect the checkpoint and update _load_value_head."
-        )
+        with safe_open(path, framework="pt") as st:
+            keys = list(st.keys())
+            key = "weight" if "weight" in keys else next(
+                (k for k in ("value_head.weight", "critic_head.weight", "v_head.weight")
+                 if k in keys), None)
+            if key is None:
+                raise AssertionError(f"no value-head weight in {path}; keys={keys}")
+            w = st.get_tensor(key)
+        assert tuple(w.shape) == (d, d), f"value_head {tuple(w.shape)} != ({d}, {d})"
+        head.weight.data = w.to(head.weight.device, head.weight.dtype)
+        return head
 
     def reconstruct(self, text: str):
         """Return the raw (un-normalized) predicted activation, numpy (d,).
 
-        Per the released inference guide, the caller MUST normalize this by hand
-        (to mse_scale) before computing MSE/FVE — reconstruct() does not."""
+        `text` is the explanation; it is wrapped in the sidecar's critic template
+        (suffix-anchored, ending '... <summary>') and read at the LAST token — the
+        position the value_head was trained on. The caller normalizes to mse_scale
+        before computing MSE/FVE; reconstruct() returns raw."""
         torch = self.torch
-        ids = self.tokenizer(text, return_tensors="pt").to(self.backbone.device)
+        tmpl = self.sc.critic_prompt_template
+        formatted = tmpl.format(explanation=text) if tmpl else text
+        ids = self.tokenizer(formatted, return_tensors="pt").to(self.backbone.device)
         with torch.no_grad():
             out = self.backbone(**ids)
-            last = out.last_hidden_state[0, -1]  # last token
+            last = out.last_hidden_state[0, -1]  # suffix-anchored last token
             pred = self.value_head(last)
         return pred.float().cpu().numpy()
 

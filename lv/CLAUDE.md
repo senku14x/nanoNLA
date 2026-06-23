@@ -162,9 +162,15 @@ concepts — and try hard to falsify that first.
 self-tests run via `bash scripts/run_tests.sh`. GPU boxes: **Vast H200** + **Lambda
 2×H100**. First action on a box: `scripts/check_model.py` (post-trained vs `-Base`).
 
-**Status / open questions.** No model trained; no gate run. Open: corrigibility in
-or out; does syvb ship an `nla_meta.yaml` sidecar; is syvb post-trained or `-Base`;
-does any target actually go unread on syvb's NLA (Gate 1).
+**Status / open questions.** Running on hardware. RESOLVED: syvb is post-trained
+Qwen3-8B (sidecar `base_model` + behavioral); ships `nla_meta.yaml` (critic
+template, marker `㈎`/149705, suffix ids; no `mse_scale` → `sqrt(d)=64`); λ=0 base
+= `rl-lora/p0.0`; LoRA r=16/α=32. SUPPORTED: truth_value transfers (real
+direction). MEASURED: AR loads + reconstructs (≡ `NLACriticModel`; syvb FVE ~0.53).
+RETRACTED: the off-manifold "refusal not read" smoke test. OPEN: **no read/unread
+number measured** (H1 untouched); the blocker is on-manifold concept-bearing
+activations (concept data is off the FineWeb manifold); corrigibility likely out
+(MCQ-only, can't transfer). Full graded ledger: `results/STATUS.md`.
 
 **Results.** Run outcomes are pushed from the GPU box into `results/` (mirrored to
 BOTH this repo and the nanoNLA fork, via `scripts/push_results.sh`). **Read
