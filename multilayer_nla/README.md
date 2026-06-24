@@ -16,23 +16,27 @@ above, on passive FineWeb activations.
 
 ---
 
-## What's built here (and what isn't)
+## What's built here
 
-This is the **NLA-free pre-training** slice — plan execution-order steps 1–2
-(§12.5). It exists to answer the pre-registered **Gate 0** for ~probe-fitting
-cost *before* any AV/AR/RL GPU time.
+| Script | Role | Plan ref | Runs on |
+|---|---|---|---|
+| `extract_multilayer.py` | Stage 0: corpus → 3-layer patch (RAW), keyed-RNG positions | §4, §6.1, §12.5.1 | H200 |
+| `verify_center_parity.py` | center tap == legacy L24 (bitwise) | §12.5.1 | H200 |
+| `headroom.py` | Gate 0 probe (`H_unique`) | §5.1, §8, §13 | CPU/H200 |
+| `regenerate_multilayer_activations.py` | **published prefix → 3-layer triplet at final token** (free labels, no API) | §6.1 | H200 |
+| `build_from_published.py` | regenerated published rows → our 3-slot av/ar/rl training parquets | §6.1, §7 | anywhere |
+| `build_datasets.py` | split a fresh extraction → av/ar/rl (dummy/real explanations) | §6.1 | anywhere |
+| `datasets.py` | 3-slot AV prompt, doc-split, loaders, chunk prep | §6.1–6.2 | anywhere |
+| `injection_multi.py` | 3-slot norm-matched ADD + per-row marker guard | §6.1 | anywhere |
+| `models_multi.py` | multi-tap AR (3 depth heads) + three-target reward | §6.2 | H200 |
+| `train_{av,ar,rl}_multi.py` | AV-SFT / AR-SFT / GRPO trainers (bf16+LoRA, wandb) | §6.2–6.3 | H200 |
+| `manifest.py` | run provenance (§12.6) | §12.6 | — |
+| `tests/` | 47 offline tests (numpy/pyarrow/torch) | — | anywhere |
 
-| Script | Plan ref | Runs on |
-|---|---|---|
-| `extract_multilayer.py` | §4, §6.1, §12.5.1 | H200 (loads Qwen3-8B) |
-| `verify_center_parity.py` | §12.5.1 | H200 |
-| `headroom.py` | §5.1, §8, §13 | CPU/H200 (cached patches; MLP wants a GPU but runs on CPU) |
-| `manifest.py` | §12.6 | — (provenance helper) |
-| `tests/test_fve_math.py` | §5.1.6, §6.3 | anywhere (numpy only) |
-
-**Not built yet** — Stage 2+, gated behind a GO verdict: the AV 3-slot
-injection, the multi-tap AR (heads tapping their own depth, §6.2 Rev 2),
-Conditions A–D (§7), and RL. Do not start these until Gate 0 returns GO.
+**Still pending:** the pre-registered **Gate 0** headroom verdict (deferred by
+the operator until after the higher-priority training runs); the **§7 condition
+flag** (`coherent / duplicate / single / mismatched`) as a train/inject-time
+switch; and the real **coherent + duplicate** run on the labeled corpus.
 
 ---
 
@@ -85,6 +89,69 @@ python -m multilayer_nla.headroom \
 
 The sidecar (`$OUT/base_multilayer.parquet.mlnla_meta.yaml`) is auto-discovered by
 the probe and folded into the results manifest (plan §12.6).
+
+---
+
+## Real run — free labels from the published dataset (NO API)
+
+nanoNLA's published warmstart dataset
+[`ceselder/qwen3-8b-nla-L24-finefineweb-100k`](https://huggingface.co/datasets/ceselder/qwen3-8b-nla-L24-finefineweb-100k)
+**already contains the real labels** — the AV `response` explanations, AR
+`prompt`s, RL prompts, the exact `detokenized_text_truncated` prefix,
+`n_raw_tokens`, and `doc_id`. It intentionally omits only the raw activation
+array, because the activation is a deterministic function of (exact prefix,
+layer) — and the *label* itself only ever depended on the **text** (stage 2 feeds
+the API model just the prefix; it never sees the activation). So the published
+explanation is exactly as valid for our three-layer patch as for the original
+single layer-24 vector. We **regenerate only the activations** and inherit the
+labels for free: no API key, no paid Stage-2 labeling, just H200 forward time.
+
+> **Corpus caution.** The labeled data is over **`m-a-p/FineFineWeb`**. Our 30k
+> `extract_multilayer.py` run used **`HuggingFaceFW/fineweb`** — a *different*
+> corpus, kept only as a plumbing/extraction check. Do **not** join the published
+> labels onto those rows or point the regenerator at that extraction; positions
+> and texts will not line up. The regenerator consumes the published rows'
+> *stored prefixes* directly.
+
+```bash
+export PYTHONPATH=/path/to/nanoNLA
+PUB=/data/mlnla/published          # downloaded HF subsets (text + LABELS, no vectors)
+REGEN=/data/mlnla/published_L24x3  # + activation_prev/centre/next
+TRAIN=/data/mlnla/qwen3_8b_L24_labeled
+
+# 1. Download the published av_sft / ar_sft / rl subsets.
+python - <<'PY'
+import os
+from datasets import load_dataset
+PUB = os.environ["PUB"]
+for name in ("av_sft", "ar_sft", "rl"):
+    ds = load_dataset("ceselder/qwen3-8b-nla-L24-finefineweb-100k", name, split="train")
+    ds.to_parquet(f"{PUB}/{name}.parquet"); print(name, ds.num_rows)
+PY
+
+# 2. Regenerate ONLY the 3-layer triplet [a23,a24,a25] at each prefix's FINAL token.
+#    --max-length 4096 MUST match the published extraction; the n_raw_tokens
+#    round-trip check hard-fails on any drift (wrong position).
+for s in av_sft ar_sft rl; do
+  python -m multilayer_nla.regenerate_multilayer_activations \
+      --in $PUB/$s.parquet --out $REGEN/$s.parquet \
+      --base-model Qwen/Qwen3-8B --center-layer 24 --max-length 4096
+done
+
+# 3. Adapt to our 3-slot format: swap the single-marker actor prompt for our
+#    three-marker prompt (av, rl); keep the published <explanation> response (av)
+#    and the canonical critic prompt (ar) verbatim; carry the triplet through.
+python -m multilayer_nla.build_from_published --mode all --in-dir $REGEN --out-dir $TRAIN
+#  -> $TRAIN/{av_sft,ar_sft,rl}.parquet   (NO sidecar needed — trainers auto-pick the marker)
+
+# 4. Train AV-SFT -> AR-SFT -> RL exactly as the point-6 smoke, but --*-parquet
+#    pointed at $TRAIN (bf16 + LoRA, --quant none). The av/ar/rl document split is
+#    INHERITED from the published subsets (the split the released checkpoints used).
+```
+
+The §7 controls (`coherent` / `duplicate` / `single` / `mismatched`) run on these
+**identical labeled rows** — they only change how the triplet is arranged at
+inject time, so they are a train-time flag, not a separate data build.
 
 ---
 

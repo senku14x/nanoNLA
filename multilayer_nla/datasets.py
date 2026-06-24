@@ -236,7 +236,18 @@ def prepare_av_chunk_multi(rows: list[dict], tokenizer, inject_char: str, inj_id
 # Suffix-anchored critic prompt (plan §6.2): the AR reads ONLY the explanation,
 # formatted into this template ending in a fixed suffix, and taps the LAST token.
 # No marker / injection on the AR side.
-AR_CRITIC_TEMPLATE = "<text>{explanation}</text> <summary>"
+#
+# This string is IDENTICAL to nla.datagen.stage3_build._DEFAULT_CRITIC_TEMPLATE,
+# which built the `ar_sft.prompt` column of the published warmstart dataset
+# (ceselder/qwen3-8b-nla-L24-finefineweb-100k). Matching it byte-for-byte lets us
+# reuse the published AR prompts verbatim — we only regenerate the activation
+# triplet (see regenerate_multilayer.py / build_from_published.py). It is also the
+# SINGLE source used by BOTH AR-SFT (build_datasets / build_from_published) and
+# RL-time critic scoring (train_rl_multi via fill_ar_prompt), so the §6.2 invariant
+# "AR-SFT critic input format == RL-time critic input format" holds by construction.
+# The suffix after {explanation} — "</text> <summary>" — is unchanged, so the
+# last-token suffix anchor is identical to the old (prefix-less) template.
+AR_CRITIC_TEMPLATE = "Summary of the following text: <text>{explanation}</text> <summary>"
 
 
 def fill_ar_prompt(explanation: str) -> str:
