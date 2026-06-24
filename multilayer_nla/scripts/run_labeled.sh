@@ -25,6 +25,9 @@ MAXLEN="${MAXLEN:-4096}"                       # MUST match the published extrac
 DATASET="${DATASET:-ceselder/qwen3-8b-nla-L24-finefineweb-100k}"
 WANDB_PROJECT="${WANDB_PROJECT:-multi layer nla}"
 NUM_SHARDS="${NUM_SHARDS:-8}"                  # crash-resilient regen (per-shard files; resume via skip-if-exists)
+REGEN_BATCH="${REGEN_BATCH:-24}"               # regen forward batch. H200 140GB: 24 comfortable, 32 fits (the
+                                               #   lm_head logits [B,S,152k] at max_length 4096 are the memory hog).
+                                               #   Watch nvidia-smi on the first chunks; back off if it nears the cap.
 MAXDROP="${MAX_DROP_FRAC:-0.02}"               # tolerate benign detokenize->retokenize drift (~0.2% observed
                                                #   per chunk); a much higher rate = systematic error (e.g. wrong --max-length)
 RUN_FULL="${RUN_FULL:-0}"                      # 0 = smoke only; 1 = also run the full ~1M-row pipeline
@@ -72,7 +75,7 @@ for s in av_sft ar_sft rl; do
   python -m multilayer_nla.regenerate_multilayer_activations \
       --in "$SMK/pub/$s.parquet" --out "$SMK/regen/$s.parquet" \
       --base-model "$BASE" --center-layer "$CENTER" --save-layers "$SAVE_LAYERS" \
-      --max-length "$MAXLEN" --max-drop-frac "$MAXDROP"
+      --max-length "$MAXLEN" --max-drop-frac "$MAXDROP" --batch-size "$REGEN_BATCH"
 done   # a ~0.2% round-trip drop is EXPECTED (benign detokenize drift); a large drop = problem
 python -m multilayer_nla.build_from_published --mode all --center "$CENTER" \
       --in-dir "$SMK/regen" --out-dir "$SMK/train"
@@ -106,7 +109,7 @@ for s in av_sft ar_sft rl; do
     python -m multilayer_nla.regenerate_multilayer_activations \
         --in "$PUB/$s.parquet" --out "$REGEN/$s.parquet" \
         --base-model "$BASE" --center-layer "$CENTER" --save-layers "$SAVE_LAYERS" \
-        --max-length "$MAXLEN" --max-drop-frac "$MAXDROP" \
+        --max-length "$MAXLEN" --max-drop-frac "$MAXDROP" --batch-size "$REGEN_BATCH" \
         --num-shards "$NUM_SHARDS" --shard-index "$i"
   done
 done
