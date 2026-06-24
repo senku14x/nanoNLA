@@ -60,24 +60,28 @@ def _layer_col(k: int) -> str:
     return f"activation_L{k}"
 
 
-def _resolve_triplet(table: pa.Table, center: int) -> list:
-    """Return (prev, centre, next) activation columns for `center`.
+def _triplet_names(schema_names, center: int) -> list:
+    """Source column names for the `center` triplet, from the SCHEMA (no data load).
 
-    Prefers the archive (activation_L{center-1,center,center+1}); falls back to a
-    legacy parquet that already carries activation_prev/centre/next. Raises if
-    neither is present (e.g. --save-layers did not cover this center).
+    Prefers the archive (activation_L{c-1,c,c+1}); falls back to a legacy
+    prev/centre/next parquet. Raises if neither is present (e.g. --save-layers
+    did not cover this center). Single source of truth for triplet precedence.
     """
-    names = table.schema.names
     arch = [_layer_col(center - 1), _layer_col(center), _layer_col(center + 1)]
-    if all(c in names for c in arch):
-        return [table.column(c) for c in arch]
-    if all(c in names for c in SLOT_COLUMNS):
-        return [table.column(c) for c in SLOT_COLUMNS]
+    if all(c in schema_names for c in arch):
+        return arch
+    if all(c in schema_names for c in SLOT_COLUMNS):
+        return list(SLOT_COLUMNS)
     raise SystemExit(
         f"input has neither the archive layers {arch} nor the legacy triplet "
         f"{list(SLOT_COLUMNS)} — run regenerate_multilayer_activations.py first "
         f"(and ensure --save-layers covered center {center})."
     )
+
+
+def _resolve_triplet(table: pa.Table, center: int) -> list:
+    """The `center` triplet as (prev, centre, next) columns from a loaded table."""
+    return [table.column(c) for c in _triplet_names(table.schema.names, center)]
 
 
 def assemble_published(table: pa.Table, mode: str, center: int = 24) -> pa.Table:
@@ -148,14 +152,38 @@ def assemble_published(table: pa.Table, mode: str, center: int = 24) -> pa.Table
     return pa.table(cols)
 
 
-def build_one(in_path: str, mode: str, out_path: str, center: int = 24) -> int:
-    table = pq.read_table(in_path)
-    out = assemble_published(table, mode, center)
+def build_one(in_path: str, mode: str, out_path: str, center: int = 24,
+              batch_size: int = 4096) -> int:
+    """Stream a regenerated subset -> training parquet, row-group by row-group.
+
+    Projects ONLY the columns build needs (the {c-1,c,c+1} triplet + the per-mode
+    label/provenance columns) so a wide activation_L{k} archive (e.g. 11 layers,
+    ~180 GB for the full 1M set) never lands in RAM and the 8 unused layers are
+    not even read. Mirrors split_by_document's streaming idiom.
+    """
+    pf = pq.ParquetFile(in_path)
+    schema_names = pf.schema_arrow.names
+    tri = _triplet_names(schema_names, center)
+    extra = [c for c in (PROMPT_COL, RESPONSE_COL, EXPLANATION_COL, "doc_id", "n_raw_tokens")
+             if c in schema_names]
+    projection = list(dict.fromkeys(tri + extra))  # dedup, preserve order
+
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(out, out_path, row_group_size=4096)
+    writer = None
+    n = 0
+    try:
+        for batch in pf.iter_batches(batch_size=batch_size, columns=projection):
+            out = assemble_published(pa.Table.from_batches([batch]), mode, center)
+            if writer is None:
+                writer = pq.ParquetWriter(out_path, out.schema)
+            writer.write_table(out)
+            n += out.num_rows
+    finally:
+        if writer is not None:
+            writer.close()
     print(f"[from-published:{mode}] center={center} {in_path} -> {out_path}  "
-          f"({out.num_rows} rows, cols={out.schema.names})")
-    return out.num_rows
+          f"({n} rows, streamed; read {len(projection)} of {len(schema_names)} cols)")
+    return n
 
 
 def main() -> None:

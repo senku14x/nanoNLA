@@ -117,6 +117,11 @@ labels for free: no API key, no paid Stage-2 labeling, just H200 forward time.
 > and texts will not line up. The regenerator consumes the published rows'
 > *stored prefixes* directly.
 
+The whole thing — fresh-instance bootstrap (clone + `pip install -e .`), the
+small-slice smoke, and the full sharded run — is scripted in
+[`scripts/run_labeled.sh`](scripts/run_labeled.sh) (smoke by default; `RUN_FULL=1`
+for the ~1M-row run). The annotated steps:
+
 ```bash
 export PYTHONPATH=/path/to/nanoNLA
 PUB=/data/mlnla/published          # downloaded HF subsets (text + LABELS, no vectors)

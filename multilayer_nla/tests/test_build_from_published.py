@@ -200,6 +200,29 @@ def test_provenance_columns_carried_through():
         assert out.column("center_layer").to_pylist() == [24] * 4
 
 
+def test_build_one_streams_archive_in_batches():
+    # the 11-layer archive must build via streaming (column-projected, batched) —
+    # never read whole — and select the right triplet across batch boundaries.
+    with tempfile.TemporaryDirectory() as tmp:
+        layers = list(range(19, 30))
+        cols, vecs = _archive_cols(10, layers)
+        cols["response"] = pa.array([f"<explanation>\nfeat {i}\n</explanation>" for i in range(10)])
+        cols["doc_id"] = pa.array([f"doc:{i}" for i in range(10)], pa.string())
+        in_path = str(Path(tmp) / "regen_av.parquet")
+        pq.write_table(pa.table(cols), in_path)
+        out_path = str(Path(tmp) / "av_sft.parquet")
+        n = build_one(in_path, "av", out_path, center=24, batch_size=4)  # -> 3 batches
+        assert n == 10
+        rows = load_av_sft_dataset(out_path)
+        assert len(rows) == 10
+        for i in (0, 4, 5, 9):  # across batch boundaries
+            assert np.allclose(rows[i]["activation_prev"], vecs[23][i])
+            assert np.allclose(rows[i]["activation_centre"], vecs[24][i])
+            assert np.allclose(rows[i]["activation_next"], vecs[25][i])
+        # the 8 unused archive layers are NOT carried into the training parquet
+        assert "activation_L19" not in pq.read_table(out_path).schema.names
+
+
 def test_missing_triplet_refused():
     table = pa.table({"response": pa.array(["<explanation>\nx\n</explanation>"])})
     try:
