@@ -36,6 +36,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
@@ -221,7 +222,15 @@ def main() -> None:
             texts = chunk[args.text_column]
             results = extractor.extract_multi(texts, layers)
 
-            rows: dict[str, list[Any]] = {k: [] for k in schema.names}
+            # Vectorized row build: accumulate per-doc numpy slices, then build the
+            # FixedSizeList columns from contiguous buffers once per chunk. The old
+            # path called .tolist() on every 4096-float vector (3 per position ->
+            # ~31M Python float objects per chunk), which is single-threaded and
+            # dominates CPU time on a many-core box. numpy advanced-indexing +
+            # FixedSizeListArray.from_arrays skips the Python-object layer entirely
+            # — same RAW float32 values, just no per-float boxing.
+            prev_parts, centre_parts, next_parts = [], [], []
+            nrt_col, did_col, cl_col, text_col = [], [], [], []
             for doc_offset, res in enumerate(results):
                 doc_idx = args.corpus_start + chunk_start + doc_offset
                 doc_id = f"{args.corpus}:{args.corpus_split}:{doc_idx}"
@@ -239,25 +248,38 @@ def main() -> None:
                     continue
                 if len(positions) < args.positions_per_doc:
                     n_docs_short_sampled += 1
-                h_prev = res["hidden"][center - 1]
-                h_centre = res["hidden"][center]
-                h_next = res["hidden"][center + 1]
+                pos_idx = torch.as_tensor(positions, dtype=torch.long)
+                h = res["hidden"]
+                # advanced-index -> [n_pos, d] float32 (h tensors are already float cpu).
+                # RAW vectors — normalization is a downstream (FVE/AR) decision.
+                prev_parts.append(h[center - 1][pos_idx].numpy())
+                centre_parts.append(h[center][pos_idx].numpy())
+                next_parts.append(h[center + 1][pos_idx].numpy())
                 for pos in positions:
-                    n_raw_tokens = pos + 1
-                    rows["n_raw_tokens"].append(n_raw_tokens)
+                    nrt_col.append(pos + 1)
+                    did_col.append(doc_id)
+                    cl_col.append(center)
                     if keep_text:
-                        rows["detokenized_text_truncated"].append(
-                            tokenizer.decode(token_ids[:n_raw_tokens], skip_special_tokens=True)
+                        text_col.append(
+                            tokenizer.decode(token_ids[: pos + 1], skip_special_tokens=True)
                         )
-                    # RAW vectors — normalization is a downstream (FVE/AR) decision.
-                    rows["activation_prev"].append(h_prev[pos].tolist())
-                    rows["activation_centre"].append(h_centre[pos].tolist())
-                    rows["activation_next"].append(h_next[pos].tolist())
-                    rows["center_layer"].append(center)
-                    rows["doc_id"].append(doc_id)
 
-            writer.write_table(pa.Table.from_pydict(rows, schema=schema))
-            row_count += len(rows["doc_id"])
+            if did_col:
+                def _fsl(parts):
+                    flat = np.concatenate(parts, axis=0).reshape(-1).astype(np.float32, copy=False)
+                    return pa.FixedSizeListArray.from_arrays(pa.array(flat), d_model)
+                cols = {
+                    "n_raw_tokens": pa.array(nrt_col, pa.int64()),
+                    "activation_prev": _fsl(prev_parts),
+                    "activation_centre": _fsl(centre_parts),
+                    "activation_next": _fsl(next_parts),
+                    "center_layer": pa.array(cl_col, pa.int64()),
+                    "doc_id": pa.array(did_col, pa.string()),
+                }
+                if keep_text:
+                    cols["detokenized_text_truncated"] = pa.array(text_col, pa.string())
+                writer.write_table(pa.table(cols, schema=schema))
+                row_count += len(did_col)
 
     corpus_slice = {"start": args.corpus_start, "length": args.corpus_length}
     manifest = build_manifest(
