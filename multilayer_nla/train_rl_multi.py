@@ -142,6 +142,14 @@ def rollout_multislot(actor, tokenizer, prompt_text, acts3, vectors_ref, inj_id,
             input_ids=batched, attention_mask=torch.ones_like(batched),
             max_new_tokens=max_new_tokens, do_sample=True, temperature=temperature,
             top_p=1.0, top_k=0, repetition_penalty=1.0,
+            # The actor must NEVER emit the injection marker: a stray marker in the
+            # generated response makes the training-forward (over prompt+response)
+            # see != k markers, which the injection hook hard-rejects. An undertrained
+            # or occasionally-unlucky actor WILL emit it over many rollouts. Suppress
+            # it at the source. Safe for GRPO: output_logits=True returns RAW
+            # pre-processor logits, so old_logp is unaffected (suppression only
+            # constrains which tokens get sampled, never the marker among them).
+            suppress_tokens=[inj_id],
             pad_token_id=tokenizer.eos_token_id,
             return_dict_in_generate=True, output_logits=True,
         )

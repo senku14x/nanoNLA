@@ -4,7 +4,11 @@ Pure torch — no peft/model. Run: python -m multilayer_nla.tests.test_train_rl_
 
 import torch
 
-from multilayer_nla.train_rl_multi import compute_group_advantages, grpo_surrogate
+from multilayer_nla.train_rl_multi import (
+    compute_group_advantages,
+    grpo_surrogate,
+    rollout_multislot,
+)
 
 
 def test_fix4_kl_zero_when_reference_equals_actor():
@@ -55,6 +59,42 @@ def test_group_advantages_normalize_per_group():
     # group 1: zero variance -> advantages ~ 0 (no NaN from /0)
     assert torch.allclose(adv[3:], torch.zeros(3), atol=1e-3)
     assert torch.isfinite(adv).all()
+
+
+def test_rollout_suppresses_marker_token():
+    """The actor must never emit the injection marker — rollout_multislot must pass
+    suppress_tokens=[inj_id] to generate(), or a stray marker in the response makes
+    the training-forward see != k markers (the crash this fixes). Fake actor/tokenizer,
+    no model."""
+    INJ = 9
+
+    class FakeTok:
+        eos_token_id = 0
+        def encode(self, s, add_special_tokens=False):
+            return [5, 6, 7]
+        def decode(self, ids, skip_special_tokens=True):
+            return "resp"
+
+    class FakeGen:
+        pass
+
+    class FakeActor:
+        def __init__(self):
+            self.kw = None
+        def generate(self, **kw):
+            self.kw = kw
+            G = kw["input_ids"].shape[0]
+            o = FakeGen()
+            o.sequences = torch.cat([kw["input_ids"], torch.tensor([[8, 0]] * G)], dim=1)
+            o.logits = (torch.zeros(G, 16), torch.zeros(G, 16))
+            return o
+
+    actor = FakeActor()
+    acts3 = [[0.1] * 4, [0.2] * 4, [0.3] * 4]  # [3, d]
+    out = rollout_multislot(actor, FakeTok(), "prompt", acts3, [None], INJ,
+                            2, 2, 1.0, "cpu", {0})
+    assert actor.kw["suppress_tokens"] == [INJ], "rollout must suppress the marker token"
+    assert len(out) == 2 and all("full_ids" in r and "old_logp" in r for r in out)
 
 
 def _run_all():
