@@ -63,7 +63,9 @@ PY
 
 # ════════════════════════════════════════════════════════════════════
 # A. SMALL-SLICE SMOKE (~2k rows — prove the whole path cheaply FIRST)
+#    Skip with SKIP_SMOKE=1 once you've seen it green (saves ~15 min before a full run).
 # ════════════════════════════════════════════════════════════════════
+if [ "${SKIP_SMOKE:-0}" != "1" ]; then
 SMK="$DATA/smoke"; mkdir -p "$SMK"/{pub,regen,train,ckpt}
 python - <<PY
 import pyarrow.parquet as pq
@@ -93,6 +95,9 @@ python -m multilayer_nla.train_rl_multi --base-ckpt "$BASE" \
       --save-dir "$SMK/ckpt/rl" --quant none --num-steps 5 --batch-prompts 4 --group-size 4 \
       --wandb-project "$WANDB_PROJECT" --wandb-name smoke-rl
 echo "[smoke] GREEN iff: round-trip drop small (~0.2%) | AV loss down | AR FVE printed | RL Fix-4 KL≈0, ext>0, no CJK"
+else
+  echo "[skip] SKIP_SMOKE=1 — skipping the 2k-row smoke"
+fi
 
 [ "$RUN_FULL" = "1" ] || { echo "[done] smoke complete. Re-run with RUN_FULL=1 for the full ~1M-row pipeline."; exit 0; }
 
