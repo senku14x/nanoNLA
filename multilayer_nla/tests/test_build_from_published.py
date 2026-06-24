@@ -149,6 +149,46 @@ def test_ar_rejects_prompt_without_summary_anchor():
         raise AssertionError("expected rejection of ar prompts lacking the <summary> anchor")
 
 
+def _archive_cols(n, layers, seed=1):
+    """activation_L{k} archive columns (what the generalized regen writes)."""
+    rng = np.random.default_rng(seed)
+    vecs = {k: [rng.standard_normal(D).astype(np.float32) for _ in range(n)] for k in layers}
+    cols = {f"activation_L{k}": _fsl(vecs[k]) for k in layers}
+    return cols, vecs
+
+
+def test_resolve_triplet_from_archive_selects_center():
+    layers = list(range(19, 30))  # 11-layer window
+    cols, vecs = _archive_cols(4, layers)
+    cols["response"] = pa.array(["<explanation>\nfeat\n</explanation>"] * 4)
+    cols["doc_id"] = pa.array([f"doc:{i}" for i in range(4)], pa.string())
+    table = pa.table(cols)
+
+    out24 = assemble_published(table, "av", center=24)  # -> L23/L24/L25
+    for i in range(4):
+        assert np.allclose(out24.column("activation_prev").to_pylist()[i], vecs[23][i])
+        assert np.allclose(out24.column("activation_centre").to_pylist()[i], vecs[24][i])
+        assert np.allclose(out24.column("activation_next").to_pylist()[i], vecs[25][i])
+    assert out24.column("center_layer").to_pylist() == [24] * 4
+
+    out22 = assemble_published(table, "av", center=22)  # re-slice, no re-extraction
+    assert np.allclose(out22.column("activation_centre").to_pylist()[0], vecs[22][0])
+    assert np.allclose(out22.column("activation_prev").to_pylist()[0], vecs[21][0])
+    assert out22.column("center_layer").to_pylist() == [22] * 4
+
+
+def test_center_outside_window_raises():
+    cols, _ = _archive_cols(2, list(range(19, 30)))
+    cols["response"] = pa.array(["<explanation>\nf\n</explanation>"] * 2)
+    table = pa.table(cols)
+    try:
+        assemble_published(table, "av", center=10)  # L9/L10/L11 not saved, no legacy triplet
+    except SystemExit as e:
+        assert "neither" in str(e)
+    else:
+        raise AssertionError("expected SystemExit when center is outside the saved window")
+
+
 def test_provenance_columns_carried_through():
     # doc_id / center_layer / n_raw_tokens survive so the inherited split + center
     # stay auditable downstream (and a wrong-corpus mix would be visible).
@@ -164,10 +204,10 @@ def test_missing_triplet_refused():
     table = pa.table({"response": pa.array(["<explanation>\nx\n</explanation>"])})
     try:
         assemble_published(table, "av")
-    except AssertionError as e:
+    except SystemExit as e:
         assert "triplet" in str(e)
     else:
-        raise AssertionError("expected refusal when the activation triplet is absent")
+        raise AssertionError("expected refusal when no activation columns are present")
 
 
 def _run_all():

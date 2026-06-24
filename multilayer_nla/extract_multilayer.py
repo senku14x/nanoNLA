@@ -85,15 +85,25 @@ class MultiLayerHFExtractor(HFExtractor):
         return handles
 
     @torch.no_grad()
-    def extract_multi(self, texts: list[str], layer_indices: list[int]) -> list[dict[str, Any]]:
+    def extract_multi(self, texts: list[str], layer_indices: list[int],
+                      *, final_token_only: bool = False) -> list[dict[str, Any]]:
         handles = self._register_multi_hooks(layer_indices)
         try:
-            return self._extract_multi_impl(texts, layer_indices)
+            return self._extract_multi_impl(texts, layer_indices,
+                                            final_token_only=final_token_only)
         finally:
             for h in handles:
                 h.remove()
 
-    def _extract_multi_impl(self, texts: list[str], layer_indices: list[int]) -> list[dict[str, Any]]:
+    def _extract_multi_impl(self, texts: list[str], layer_indices: list[int],
+                            *, final_token_only: bool = False) -> list[dict[str, Any]]:
+        """Per-text {token_ids, hidden}. `hidden[li]` is [seq_len, d] by default;
+        with `final_token_only=True` it is the FINAL real token's vector [d]
+        (under right padding, index seq_len-1). The latter is what the regenerate
+        path wants — it keeps CPU memory flat regardless of how many layers are
+        captured (saving an 11-layer window over long prefixes would otherwise
+        accumulate the full [seq, d] per layer per text).
+        """
         results: list[dict[str, Any]] = []
         for start in range(0, len(texts), self.batch_size):
             sub = texts[start : start + self.batch_size]
@@ -119,9 +129,13 @@ class MultiLayerHFExtractor(HFExtractor):
 
             lengths = attention_mask.sum(dim=1).cpu()
             for i, seq_len in enumerate(lengths.tolist()):
+                if final_token_only:
+                    hid = {li: hidden[li][i, seq_len - 1].clone() for li in layer_indices}  # [d]
+                else:
+                    hid = {li: hidden[li][i, :seq_len].clone() for li in layer_indices}     # [seq, d]
                 results.append({
                     "token_ids": input_ids[i, :seq_len].cpu().tolist(),
-                    "hidden": {li: hidden[li][i, :seq_len].clone() for li in layer_indices},
+                    "hidden": hid,
                 })
         return results
 

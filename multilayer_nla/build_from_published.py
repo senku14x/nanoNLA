@@ -4,12 +4,17 @@ Pipeline (NO API, NO paid labeling — see regenerate_multilayer_activations.py)
 
     HF: ceselder/qwen3-8b-nla-L24-finefineweb-100k   (text + LABELS, no vectors)
         av_sft / ar_sft / rl
-            |  regenerate_multilayer_activations.py   (+ activation_prev/centre/next)
+            |  regenerate_multilayer_activations.py   (+ activation_L{k} window)
             v
-        regenerated av_sft / ar_sft / rl              (labels + three-layer triplet)
-            |  build_from_published.py  (THIS)        (adapt to our 3-slot format)
+        regenerated av_sft / ar_sft / rl              (labels + layer-window archive)
+            |  build_from_published.py  (THIS)        (--center selects the triplet)
             v
         training parquets the multilayer_nla trainers load
+
+`--center c` selects activation_L{c-1,c,c+1} from the archive and renames them to
+activation_prev/centre/next (what the trainers read). Re-probing a different
+center later is just a re-run of THIS step on the same archive — no re-extraction.
+A legacy parquet that already has activation_prev/centre/next is accepted as-is.
 
 What this step changes vs. the published row, per subset:
 
@@ -51,32 +56,53 @@ PROMPT_COL = "prompt"
 SUMMARY_SUFFIX = "<summary>"
 
 
-def _require_triplet(table: pa.Table) -> None:
-    missing = [c for c in SLOT_COLUMNS if c not in table.schema.names]
-    assert not missing, (
-        f"input lacks the activation triplet {missing} — run "
-        f"regenerate_multilayer_activations.py on the published parquet first."
+def _layer_col(k: int) -> str:
+    return f"activation_L{k}"
+
+
+def _resolve_triplet(table: pa.Table, center: int) -> list:
+    """Return (prev, centre, next) activation columns for `center`.
+
+    Prefers the archive (activation_L{center-1,center,center+1}); falls back to a
+    legacy parquet that already carries activation_prev/centre/next. Raises if
+    neither is present (e.g. --save-layers did not cover this center).
+    """
+    names = table.schema.names
+    arch = [_layer_col(center - 1), _layer_col(center), _layer_col(center + 1)]
+    if all(c in names for c in arch):
+        return [table.column(c) for c in arch]
+    if all(c in names for c in SLOT_COLUMNS):
+        return [table.column(c) for c in SLOT_COLUMNS]
+    raise SystemExit(
+        f"input has neither the archive layers {arch} nor the legacy triplet "
+        f"{list(SLOT_COLUMNS)} — run regenerate_multilayer_activations.py first "
+        f"(and ensure --save-layers covered center {center})."
     )
 
 
-def assemble_published(table: pa.Table, mode: str) -> pa.Table:
+def assemble_published(table: pa.Table, mode: str, center: int = 24) -> pa.Table:
     """Adapt one regenerated published subset into a training parquet (pure pyarrow).
 
     av : prompt(3-marker) + response(published <explanation> label) + 3 acts
     ar : prompt(published canonical critic, verbatim)              + 3 acts
     rl : prompt(3-marker)                                          + 3 acts
+
+    The triplet is selected for `center` from the activation_L{k} archive (or a
+    legacy prev/centre/next parquet) and written as activation_prev/centre/next.
     """
     assert mode in ("av", "ar", "rl"), mode
-    _require_triplet(table)
     n = table.num_rows
     names = table.schema.names
 
-    cols = {c: table.column(c) for c in SLOT_COLUMNS}
-    # Carry provenance through so the inherited split + center layer stay auditable
-    # downstream (the trainers ignore these columns, but they let a post-hoc check
-    # confirm av/ar/rl are doc-disjoint and which center the triplet came from —
-    # and make an accidental wrong-corpus mix visible).
-    for prov in ("doc_id", "center_layer", "n_raw_tokens"):
+    prev, centre, nxt = _resolve_triplet(table, center)
+    cols = {SLOT_COLUMNS[0]: prev, SLOT_COLUMNS[1]: centre, SLOT_COLUMNS[2]: nxt}
+    # center_layer records THIS triplet's center (the build center, which may
+    # differ from the archive's nominal center on a layer-sweep re-run).
+    cols["center_layer"] = pa.array([center] * n, pa.int64())
+    # Carry provenance so the inherited split stays auditable downstream (trainers
+    # ignore these; they let a post-hoc check confirm av/ar/rl are doc-disjoint and
+    # make an accidental wrong-corpus mix visible).
+    for prov in ("doc_id", "n_raw_tokens"):
         if prov in names:
             cols[prov] = table.column(prov)
 
@@ -122,13 +148,13 @@ def assemble_published(table: pa.Table, mode: str) -> pa.Table:
     return pa.table(cols)
 
 
-def build_one(in_path: str, mode: str, out_path: str) -> int:
+def build_one(in_path: str, mode: str, out_path: str, center: int = 24) -> int:
     table = pq.read_table(in_path)
-    out = assemble_published(table, mode)
+    out = assemble_published(table, mode, center)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(out, out_path, row_group_size=4096)
-    print(f"[from-published:{mode}] {in_path} -> {out_path}  ({out.num_rows} rows, "
-          f"cols={out.schema.names})")
+    print(f"[from-published:{mode}] center={center} {in_path} -> {out_path}  "
+          f"({out.num_rows} rows, cols={out.schema.names})")
     return out.num_rows
 
 
@@ -137,6 +163,10 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--mode", choices=["av", "ar", "rl", "all"], required=True)
+    p.add_argument("--center", type=int, default=24,
+                   help="center layer c; selects activation_L{c-1,c,c+1} from the archive as "
+                        "the training triplet. Re-run with a different --center to sweep centers "
+                        "without re-extracting (the §5 layer-selection sweep).")
     p.add_argument("--in", dest="inp", help="regenerated published parquet (for av/ar/rl)")
     p.add_argument("--out", help="output training parquet (for av/ar/rl)")
     p.add_argument("--in-dir", help="for --mode all: dir with av_sft/ar_sft/rl .parquet (regenerated)")
@@ -147,28 +177,24 @@ def main() -> None:
         assert args.in_dir and args.out_dir, "--mode all needs --in-dir and --out-dir"
         ind, outd = Path(args.in_dir), Path(args.out_dir)
         counts = {}
-        centers = set()
         for mode, fname in (("av", "av_sft"), ("ar", "ar_sft"), ("rl", "rl")):
             src = ind / f"{fname}.parquet"
             assert src.exists(), f"missing regenerated parquet {src}"
-            counts[mode] = build_one(str(src), mode, str(outd / f"{fname}.parquet"))
-            t = pq.read_table(str(outd / f"{fname}.parquet"), columns=None)
-            if "center_layer" in t.schema.names:
-                centers |= set(t.column("center_layer").to_pylist())
+            counts[mode] = build_one(str(src), mode, str(outd / f"{fname}.parquet"), args.center)
         outd.mkdir(parents=True, exist_ok=True)
         (outd / "build_manifest.json").write_text(json.dumps({
             "source": "build_from_published",
             "in_dir": str(ind),
             "counts": counts,
-            "center_layers": sorted(centers),
+            "center_layer": args.center,
             "split": "inherited from the published av/ar/rl subsets (not re-split)",
             "note": "labels reused from ceselder/qwen3-8b-nla-L24-finefineweb-100k; "
                     "activations regenerated locally (no API).",
         }, indent=2))
-        print(f"[from-published] av/ar/rl -> {outd}  counts={counts}  centers={sorted(centers)}")
+        print(f"[from-published] av/ar/rl (center {args.center}) -> {outd}  counts={counts}")
     else:
         assert args.inp and args.out, "--mode av/ar/rl needs --in and --out"
-        build_one(args.inp, args.mode, args.out)
+        build_one(args.inp, args.mode, args.out, args.center)
 
 
 if __name__ == "__main__":

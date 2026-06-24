@@ -1,4 +1,4 @@
-"""Regenerate the three-layer activation triplet for a published NLA parquet row.
+"""Regenerate a window of layer activations for a published NLA parquet row.
 
 Multi-layer analog of `tools/regenerate_activations.py`. The published warmstart
 dataset (ceselder/qwen3-8b-nla-L24-finefineweb-100k, over **m-a-p/FineFineWeb**)
@@ -7,13 +7,21 @@ already contains the real LABELS — av_sft `response`, ar_sft `prompt`, rl
 `doc_id`. It intentionally OMITS only the raw layer-24 vector, because the
 activation is a deterministic function of (exact prefix, layer):
 
-    detokenized_text_truncated  --(one forward, hooks at {l-1, l, l+1})-->  [a^(l-1), a^(l), a^(l+1)]
+    detokenized_text_truncated  --(one forward, hooks at {save-layers})-->  {a^(k) : k in window}
 
 The label only ever depended on the text (stage2 feeds the API model just the
 prefix; it never sees the activation), so the published explanation is exactly
 as valid for our three-layer patch as for the original single layer-l vector.
 We therefore REGENERATE the activations locally — NO API, NO paid labeling, just
 H200 forward-pass time — and inherit the labels for free.
+
+ONE forward computes EVERY layer's hidden state, so capturing a wider window
+(`--save-layers`, default the center triplet) is FREE on compute — only storage
+grows (≈16 KB/row/layer at d=4096 fp32). Saving e.g. 19-29 future-proofs the §5
+center-selection sweep: re-probing any center in [20..28] becomes a re-slice in
+build_from_published (--center), never a re-extraction. Layers are written as a
+uniform `activation_L{k}` archive (build_from_published selects the {c-1,c,c+1}
+triplet → activation_prev/centre/next for the trainers).
 
 ⚠️  CORPUS: this consumes the PUBLISHED rows' stored prefixes directly. Do NOT
 re-sample positions from a corpus, and do NOT point this at our 30k
@@ -23,19 +31,18 @@ published AV/AR/RL rows. The 30k fineweb run stays a plumbing/extraction check
 only. Use `extract_multilayer.py` for fresh corpus sampling; use THIS for the
 labeled run.
 
-For each published row we forward `detokenized_text_truncated` through the base
-model and read the {l-1, l, l+1} hidden states at the FINAL token — the original
-extraction position by construction, since stage 0 truncated the prefix to end
-exactly there. We are "just extending the hook set from layer 24 to [23,24,25]".
-Output = the input table with `activation_prev/centre/next` (RAW, norm="none" —
-the invariant) appended; every published column (`prompt`, `response`, `doc_id`,
-`n_raw_tokens`, ...) is carried through UNTOUCHED. The single→three-marker actor
+For each published row we forward `detokenized_text_truncated` and read the
+windowed hidden states at the FINAL token — the original extraction position by
+construction, since stage 0 truncated the prefix to end exactly there. Output =
+the input table with `activation_L{k}` (RAW, norm="none" — the invariant) +
+`center_layer` appended; every published column (`prompt`, `response`, `doc_id`,
+`n_raw_tokens`, ...) carried through UNTOUCHED. The single→three-marker actor
 prompt swap happens later, in build_from_published.py.
 
 Usage:
     python -m multilayer_nla.regenerate_multilayer_activations \\
         --in  av_sft.parquet  --out av_sft.mlnla.parquet \\
-        --base-model Qwen/Qwen3-8B --center-layer 24 --max-length 4096
+        --base-model Qwen/Qwen3-8B --center-layer 24 --save-layers 19-29 --max-length 4096
 """
 
 import argparse
@@ -47,42 +54,66 @@ import pyarrow.parquet as pq
 from nla.arch_adapters import resolve_decoder_layers
 from nla.datagen._common import add_storage_args, load_class, make_storage, parse_kwargs
 
-# Output column names — IDENTICAL to extract_multilayer._schema so the same
-# loaders/trainers consume either source interchangeably.
-SLOT_COLUMNS = ("activation_prev", "activation_centre", "activation_next")
 TEXT_COL = "detokenized_text_truncated"
 
 
-def append_triplet_columns(table: pa.Table, results: list[dict], center: int,
-                           d_model: int, *, check_roundtrip: bool = True,
-                           row_offset: int = 0, max_drop_frac: float = 0.0) -> pa.Table:
-    """Append activation_prev/centre/next (RAW, at the final token) to `table`.
+def layer_col(k: int) -> str:
+    """Uniform archive column name for layer k's final-token vector."""
+    return f"activation_L{k}"
+
+
+def parse_layers(spec: str) -> list[int]:
+    """Parse a layer spec like "19-29" or "19,20,24" or "19-21,25,27-29" -> sorted ints."""
+    out: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-")
+            out.update(range(int(a), int(b) + 1))
+        else:
+            out.add(int(part))
+    assert out, f"empty/invalid --save-layers spec: {spec!r}"
+    return sorted(out)
+
+
+def _final_vec(h) -> np.ndarray:
+    """Final-token vector [d] from a per-text hidden capture.
+
+    Accepts either the [seq_len, d] full capture (take last row) or the already
+    final-token [d] capture (extract_multi(..., final_token_only=True)).
+    """
+    v = np.asarray(h, dtype=np.float32)
+    return v[-1] if v.ndim == 2 else v
+
+
+def append_layer_columns(table: pa.Table, results: list[dict], save_layers: list[int],
+                         d_model: int, *, check_roundtrip: bool = True,
+                         row_offset: int = 0, max_drop_frac: float = 0.0) -> pa.Table:
+    """Append `activation_L{k}` (RAW, final token) for each k in `save_layers`.
 
     `results[i]` aligns to `table` row i and is `{token_ids: list[int],
-    hidden: {layer_index -> array[seq_len, d]}}` (exactly what
-    MultiLayerHFExtractor.extract_multi returns; layer indices are the
-    output-of-block indices {center-1, center, center+1}). The triplet is read
-    at index -1 of each layer's hidden states — the final (extraction) token,
-    because stage-0 truncated the prefix to end there.
+    hidden: {layer_index -> vec}}` where `vec` is [seq_len, d] or the final-token
+    [d] (MultiLayerHFExtractor.extract_multi, optionally final_token_only=True).
 
-    Round-trip guard (when `check_roundtrip` and `n_raw_tokens` is present): the
+    Round-trip guard (when `check_roundtrip` and `n_raw_tokens` present): the
     re-encoded prefix must reproduce the stored token count, or the final token
-    is NOT the position the label describes. A re-encode mismatch means the
-    activation would land on the wrong token and is unusable. `max_drop_frac`
-    controls the response: 0.0 (default) is a hard failure on ANY mismatch (the
-    single-layer regenerate tool's behavior, and the right default — a systematic
-    mismatch is almost always a --max-length misconfiguration, which silent
-    dropping would mask). A small positive value (e.g. 1e-3) tolerates rare
-    per-row tokenizer drift on a large run by DROPPING the offending rows and
-    logging the count, failing only if the drop fraction exceeds the threshold.
+    is NOT the position the label describes — the activation would land on the
+    wrong token and is unusable. `max_drop_frac` controls the response: 0.0
+    (default) hard-fails on ANY mismatch (the single-layer regenerate tool's
+    behavior, and the right default — a systematic mismatch is almost always a
+    --max-length misconfiguration, which silent dropping would mask). A small
+    positive value (e.g. 1e-3) tolerates rare per-row tokenizer drift on a large
+    run by DROPPING + logging the offending rows, failing only if the drop
+    fraction exceeds the threshold.
 
-    Pure (numpy/pyarrow only, no model) so it is unit-testable offline with
-    fabricated `results`.
+    Pure (numpy/pyarrow only, no model) — unit-testable offline with fabricated
+    `results`.
     """
     assert len(results) == table.num_rows, (
         f"results ({len(results)}) and table rows ({table.num_rows}) misaligned"
     )
-    layers = (center - 1, center, center + 1)
 
     if check_roundtrip and "n_raw_tokens" in table.schema.names:
         n_raw = table.column("n_raw_tokens").to_pylist()
@@ -110,8 +141,7 @@ def append_triplet_columns(table: pa.Table, results: list[dict], center: int,
 
     def _final_token_fsl(layer_index: int) -> pa.Array:
         # [n_rows, d] float32 — the final-token vector for this layer per row.
-        mat = np.stack([np.asarray(r["hidden"][layer_index], dtype=np.float32)[-1]
-                        for r in results])
+        mat = np.stack([_final_vec(r["hidden"][layer_index]) for r in results])
         assert mat.shape == (table.num_rows, d_model), (
             f"layer {layer_index}: built {mat.shape}, expected "
             f"({table.num_rows}, {d_model}) — wrong d_model or empty seq?"
@@ -120,16 +150,12 @@ def append_triplet_columns(table: pa.Table, results: list[dict], center: int,
         return pa.FixedSizeListArray.from_arrays(pa.array(flat), d_model)
 
     out = table
-    for name, li in zip(SLOT_COLUMNS, layers):
+    for li in save_layers:
+        name = layer_col(li)
         assert name not in out.schema.names, (
-            f"input already has {name!r} — nothing to regenerate (this parquet "
-            f"already carries the triplet)"
+            f"input already has {name!r} — nothing to regenerate"
         )
         out = out.append_column(name, _final_token_fsl(li))
-    # center_layer pins the provenance the same way extract_multilayer does.
-    if "center_layer" not in out.schema.names:
-        out = out.append_column("center_layer",
-                                pa.array([center] * out.num_rows, pa.int64()))
     return out
 
 
@@ -169,8 +195,13 @@ def main() -> None:
     p.add_argument("--out", required=True, help="output parquet (triplet appended, labels preserved)")
     p.add_argument("--base-model", required=True, help="HF base model, e.g. Qwen/Qwen3-8B")
     p.add_argument("--center-layer", type=int, default=None,
-                   help="center block l; patch = {l-1, l, l+1}. Default: read from the "
+                   help="center block l (provenance + default window). Default: read from the "
                         "center_layer/activation_layer column (24 for the published L24 set).")
+    p.add_argument("--save-layers", default=None,
+                   help="layers to capture, e.g. '19-29' or '19,24,29' or '19-21,25'. "
+                        "Default: the center triplet {l-1, l, l+1}. Wider windows are FREE on "
+                        "compute (one forward) and future-proof the §5 center sweep; cost is "
+                        "storage (~16 KB/row/layer at d=4096 fp32). Written as activation_L{k}.")
     p.add_argument("--chunk-size", type=int, default=512, help="rows per write (bounds memory)")
     p.add_argument("--batch-size", type=int, default=16, help="model forward batch size")
     p.add_argument("--max-length", type=int, default=4096,
@@ -203,12 +234,18 @@ def main() -> None:
     assert TEXT_COL in names, (
         f"input lacks {TEXT_COL!r} — cannot regenerate without the source prefix"
     )
-    for c in SLOT_COLUMNS:
-        assert c not in names, f"input already has {c!r} — nothing to regenerate"
 
     center = _infer_center(pf, args.center_layer)
-    layers = [center - 1, center, center + 1]
     assert center - 1 >= 0, f"center-layer={center} has no l-1 block"
+    save_layers = parse_layers(args.save_layers) if args.save_layers else [center - 1, center, center + 1]
+    assert min(save_layers) >= 0, f"--save-layers has a negative layer: {save_layers}"
+    triplet = {center - 1, center, center + 1}
+    if not triplet.issubset(save_layers):
+        print(f"WARNING: --save-layers {save_layers} omits part of the center {center} triplet "
+              f"{sorted(triplet)} — build_from_published --center {center} will fail until you "
+              f"either widen the window or build at a center whose triplet IS saved.", flush=True)
+    for li in save_layers:
+        assert layer_col(li) not in names, f"input already has {layer_col(li)!r} — nothing to regenerate"
 
     user_kwargs = parse_kwargs(args.extractor_kwargs)
     assert "model_name" not in user_kwargs, "pass --base-model, not model_name in --extractor-kwargs"
@@ -221,8 +258,8 @@ def main() -> None:
     )
     d_model = extractor.d_model
     n_layers = len(resolve_decoder_layers(extractor.model))
-    assert center + 1 < n_layers, (
-        f"center-layer={center} needs block {center + 1}, but model has {n_layers} blocks"
+    assert max(save_layers) < n_layers, (
+        f"--save-layers max {max(save_layers)} out of range for a {n_layers}-block model"
     )
 
     assert args.num_shards >= 1 and 0 <= args.shard_index < args.num_shards, (
@@ -248,12 +285,16 @@ def main() -> None:
             if o_lo < o_hi:  # this batch overlaps the shard's row range
                 tbl = pa.Table.from_batches([batch]).slice(o_lo - g, o_hi - o_lo)
                 texts = tbl.column(TEXT_COL).to_pylist()
-                results = extractor.extract_multi(texts, layers)
-                tbl = append_triplet_columns(
-                    tbl, results, center, d_model,
+                results = extractor.extract_multi(texts, save_layers, final_token_only=True)
+                tbl = append_layer_columns(
+                    tbl, results, save_layers, d_model,
                     check_roundtrip=not args.no_roundtrip_check,
                     row_offset=o_lo, max_drop_frac=args.max_drop_frac,
                 )
+                # center_layer pins provenance the same way extract_multilayer does.
+                if "center_layer" not in tbl.schema.names:
+                    tbl = tbl.append_column("center_layer",
+                                            pa.array([center] * tbl.num_rows, pa.int64()))
                 if writer is None:
                     writer = pq.ParquetWriter(storage.open_write(out_path), tbl.schema)
                 writer.write_table(tbl)
@@ -265,7 +306,7 @@ def main() -> None:
     finally:
         if writer is not None:
             writer.close()
-    print(f"wrote {n_out} rows with triplet {layers} (center {center}, d={d_model}) -> {out_path}")
+    print(f"wrote {n_out} rows, layers {save_layers} (center {center}, d={d_model}) -> {out_path}")
     if args.num_shards > 1:
         print(f"[shard {args.shard_index}/{args.num_shards}] done. Merge all shards with e.g.:\n"
               f"  python -c \"import pyarrow.parquet as pq, glob; "

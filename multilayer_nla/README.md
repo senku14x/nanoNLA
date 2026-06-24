@@ -23,8 +23,8 @@ above, on passive FineWeb activations.
 | `extract_multilayer.py` | Stage 0: corpus → 3-layer patch (RAW), keyed-RNG positions | §4, §6.1, §12.5.1 | H200 |
 | `verify_center_parity.py` | center tap == legacy L24 (bitwise) | §12.5.1 | H200 |
 | `headroom.py` | Gate 0 probe (`H_unique`) | §5.1, §8, §13 | CPU/H200 |
-| `regenerate_multilayer_activations.py` | **published prefix → 3-layer triplet at final token** (free labels, no API) | §6.1 | H200 |
-| `build_from_published.py` | regenerated published rows → our 3-slot av/ar/rl training parquets | §6.1, §7 | anywhere |
+| `regenerate_multilayer_activations.py` | **published prefix → layer-window activations at final token** (`--save-layers`, free labels, no API; sharded) | §6.1 | H200 |
+| `build_from_published.py` | select center triplet (`--center`) → our 3-slot av/ar/rl training parquets | §6.1, §7 | anywhere |
 | `build_datasets.py` | split a fresh extraction → av/ar/rl (dummy/real explanations) | §6.1 | anywhere |
 | `datasets.py` | 3-slot AV prompt, doc-split, loaders, chunk prep | §6.1–6.2 | anywhere |
 | `injection_multi.py` | 3-slot norm-matched ADD + per-row marker guard | §6.1 | anywhere |
@@ -133,20 +133,26 @@ for name in ("av_sft", "ar_sft", "rl"):
     ds.to_parquet(f"{PUB}/{name}.parquet"); print(name, ds.num_rows)
 PY
 
-# 2. Regenerate ONLY the 3-layer triplet [a23,a24,a25] at each prefix's FINAL token.
+# 2. Regenerate the activation window at each prefix's FINAL token. Capturing
+#    layers 19-29 is FREE on compute (one forward computes every layer) and
+#    future-proofs the §5 center sweep [20,22,24,26,28]; cost is ~16 GB/layer.
 #    --max-length 4096 MUST match the published extraction; the n_raw_tokens
 #    round-trip check hard-fails on any drift (wrong position).
 for s in av_sft ar_sft rl; do
   python -m multilayer_nla.regenerate_multilayer_activations \
       --in $PUB/$s.parquet --out $REGEN/$s.parquet \
-      --base-model Qwen/Qwen3-8B --center-layer 24 --max-length 4096
+      --base-model Qwen/Qwen3-8B --center-layer 24 --save-layers 19-29 --max-length 4096
 done
+#  ~1M rows: fan out with --num-shards N --shard-index i (per-shard files; tool
+#  prints the merge one-liner). Saves activation_L19 .. activation_L29 (RAW).
 
-# 3. Adapt to our 3-slot format: swap the single-marker actor prompt for our
-#    three-marker prompt (av, rl); keep the published <explanation> response (av)
-#    and the canonical critic prompt (ar) verbatim; carry the triplet through.
-python -m multilayer_nla.build_from_published --mode all --in-dir $REGEN --out-dir $TRAIN
-#  -> $TRAIN/{av_sft,ar_sft,rl}.parquet   (NO sidecar needed — trainers auto-pick the marker)
+# 3. Select the center triplet -> our 3-slot training parquets: --center 24 picks
+#    activation_L{23,24,25} as prev/centre/next; swaps the single-marker actor
+#    prompt for our three-marker one (av, rl); keeps the published <explanation>
+#    response (av) and canonical critic prompt (ar) verbatim.
+python -m multilayer_nla.build_from_published --mode all --center 24 --in-dir $REGEN --out-dir $TRAIN
+#  -> $TRAIN/{av_sft,ar_sft,rl}.parquet   (NO sidecar — trainers auto-pick the marker)
+#  Sweep a different center later WITHOUT re-extracting: re-run step 3 with --center 22/26/...
 
 # 4. Train AV-SFT -> AR-SFT -> RL exactly as the point-6 smoke, but --*-parquet
 #    pointed at $TRAIN (bf16 + LoRA, --quant none). The av/ar/rl document split is
