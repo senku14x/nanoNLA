@@ -18,6 +18,11 @@ set -euo pipefail
 
 # ── config (override via env) ───────────────────────────────────────
 export PYTHONPATH="${PYTHONPATH:-$PWD}"        # repo root
+# Reclaim fragmented VRAM. The regen forward churns the allocator (11-layer hook
+# clones allocated/freed every chunk), leaving "reserved but unallocated" memory
+# that can't satisfy a large contiguous request -> OOM with free memory to spare.
+# expandable_segments lets PyTorch grow segments instead (its own OOM-msg advice).
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 BASE="${BASE:-Qwen/Qwen3-8B}"
 CENTER="${CENTER:-24}"
 SAVE_LAYERS="${SAVE_LAYERS:-19-29}"            # window; covers candidate_centers [20..28]
@@ -25,9 +30,12 @@ MAXLEN="${MAXLEN:-4096}"                       # MUST match the published extrac
 DATASET="${DATASET:-ceselder/qwen3-8b-nla-L24-finefineweb-100k}"
 WANDB_PROJECT="${WANDB_PROJECT:-multi layer nla}"
 NUM_SHARDS="${NUM_SHARDS:-8}"                  # crash-resilient regen (per-shard files; resume via skip-if-exists)
-REGEN_BATCH="${REGEN_BATCH:-24}"               # regen forward batch. H200 140GB: 24 comfortable, 32 fits (the
-                                               #   lm_head logits [B,S,152k] at max_length 4096 are the memory hog).
-                                               #   Watch nvidia-smi on the first chunks; back off if it nears the cap.
+REGEN_BATCH="${REGEN_BATCH:-64}"               # regen forward batch. With logits_to_keep=1 the lm_head logits are
+                                               #   gone; at max_length 4096 the cost is ~16GB weights + ~0.76GB/row
+                                               #   (the 11-layer hook clones + the MLP intermediate). H200 140GB peaks:
+                                               #   batch 64 ~65GB (safe), 96 ~89GB (ok w/ expandable_segments above),
+                                               #   128 ~113GB live -> OOMs once fragmentation is added. Worst case is
+                                               #   stochastic: a chunk where every row hits 4096 tokens.
 MAXDROP="${MAX_DROP_FRAC:-0.02}"               # tolerate benign detokenize->retokenize drift (~0.2% observed
                                                #   per chunk); a much higher rate = systematic error (e.g. wrong --max-length)
 LENGTH_BUCKET="${LENGTH_BUCKET:-0}"            # 1 = sort each chunk by n_raw_tokens before the forward (cuts
