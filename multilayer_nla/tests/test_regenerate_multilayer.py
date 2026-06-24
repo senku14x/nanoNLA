@@ -151,6 +151,22 @@ def test_double_regeneration_refused():
         raise AssertionError("expected refusal to re-add an existing activation_L{k} column")
 
 
+def test_gather_last_real_token_equals_slice_last():
+    # guards the Blocker-1 fix's indexing: under right padding, captured[batch, len-1]
+    # (gathered on GPU) == captured[i, :len_i][-1] (the old full-transfer path).
+    import torch
+    B, T, d = 4, 6, 5
+    captured = torch.randn(B, T, d)
+    attn = torch.tensor([[1, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 1],
+                         [1, 1, 0, 0, 0, 0], [1, 1, 1, 1, 0, 0]])
+    lengths = attn.sum(1)
+    last = (lengths - 1).clamp_min(0)
+    bidx = torch.arange(B)
+    gathered = captured[bidx, last]                  # the fix
+    for i in range(B):
+        assert torch.allclose(gathered[i], captured[i, : lengths[i]][-1])
+
+
 def test_parse_layers():
     assert parse_layers("19-29") == list(range(19, 30))
     assert parse_layers("19,24,29") == [19, 24, 29]

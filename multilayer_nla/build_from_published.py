@@ -45,6 +45,7 @@ import pyarrow.parquet as pq
 
 from nla.schema import EXPLANATION_OPEN, wrap_explanation
 from multilayer_nla.datasets import (
+    AR_CRITIC_TEMPLATE,
     SLOT_COLUMNS,
     build_av_prompt,
     fill_ar_prompt,
@@ -53,7 +54,10 @@ from multilayer_nla.datasets import (
 EXPLANATION_COL = "api_explanation"
 RESPONSE_COL = "response"
 PROMPT_COL = "prompt"
-SUMMARY_SUFFIX = "<summary>"
+# The canonical critic template split around {explanation}: a published AR prompt
+# is valid iff it == AR_CRITIC_TEMPLATE.format(explanation=X) for some X, i.e. it
+# starts with this prefix and ends with this suffix (so AR-SFT == RL-time scoring).
+_AR_PREFIX, _AR_SUFFIX = AR_CRITIC_TEMPLATE.split("{explanation}")
 
 
 def _layer_col(k: int) -> str:
@@ -133,6 +137,18 @@ def assemble_published(table: pa.Table, mode: str, center: int = 24) -> pa.Table
     elif mode == "ar":
         if PROMPT_COL in names and pa.types.is_string(table.schema.field(PROMPT_COL).type):
             prompt = table.column(PROMPT_COL).to_pylist()
+            # EXACT canonical check (not just "ends with <summary>"): the published
+            # AR prompt must equal AR_CRITIC_TEMPLATE.format(explanation=X) — i.e.
+            # have our prefix AND suffix — or AR-SFT trains on a different critic
+            # input than RL scores with (RL builds fill_ar_prompt(explanation)).
+            bad = [i for i, p in enumerate(prompt)
+                   if not (p and p.startswith(_AR_PREFIX) and p.endswith(_AR_SUFFIX))]
+            assert not bad, (
+                f"{len(bad)} ar prompts are NOT the canonical critic template (first idx "
+                f"{bad[0]}). RL scores with fill_ar_prompt(explanation), so the published AR "
+                f"prompt MUST equal AR_CRITIC_TEMPLATE.format(...) exactly (prefix "
+                f"{_AR_PREFIX!r} + suffix {_AR_SUFFIX!r}). Got: {prompt[bad[0]]!r}"
+            )
         elif EXPLANATION_COL in names:
             prompt = [fill_ar_prompt(e) for e in table.column(EXPLANATION_COL).to_pylist()]
         else:
@@ -140,29 +156,38 @@ def assemble_published(table: pa.Table, mode: str, center: int = 24) -> pa.Table
                 f"ar needs a string {PROMPT_COL!r} (published critic prompt) or "
                 f"{EXPLANATION_COL!r} column to source the critic input"
             )
-        bad = [i for i, p in enumerate(prompt)
-               if not p or not p.rstrip().endswith(SUMMARY_SUFFIX)]
-        assert not bad, (
-            f"{len(bad)} ar prompts do not end with {SUMMARY_SUFFIX!r} (first idx {bad[0]}). "
-            f"The suffix anchor (last-token tap) requires the critic template's "
-            f"'</text> <summary>' tail — published prompts must be the canonical critic format."
-        )
         cols[PROMPT_COL] = pa.array(prompt, pa.string())
 
     return pa.table(cols)
 
 
-def build_one(in_path: str, mode: str, out_path: str, center: int = 24,
-              batch_size: int = 4096) -> int:
-    """Stream a regenerated subset -> training parquet, row-group by row-group.
+def _subset_inputs(in_dir: Path, name: str) -> list:
+    """Authoritative layer-bank inputs for a subset: the SHARDS if present (we never
+    materialize a wide merged archive), else a single file."""
+    shards = sorted(in_dir.glob(f"{name}.shard*of*.parquet"))
+    if shards:
+        return [str(s) for s in shards]
+    single = in_dir / f"{name}.parquet"
+    if single.exists():
+        return [str(single)]
+    raise SystemExit(f"no {name}.shard*of*.parquet or {name}.parquet in {in_dir}")
 
-    Projects ONLY the columns build needs (the {c-1,c,c+1} triplet + the per-mode
-    label/provenance columns) so a wide activation_L{k} archive (e.g. 11 layers,
-    ~180 GB for the full 1M set) never lands in RAM and the 8 unused layers are
-    not even read. Mirrors split_by_document's streaming idiom.
+
+def build_one(in_paths, mode: str, out_path: str, center: int = 24,
+              batch_size: int = 4096) -> int:
+    """Stream regenerated shard(s) -> one training parquet, batch by batch.
+
+    `in_paths` is a path or list of shard paths (the authoritative layer bank —
+    NEVER merged into one wide file). Projects ONLY the columns build needs (the
+    {c-1,c,c+1} triplet + per-mode label/provenance) so the 8 unused archive
+    layers are never read and the full ~180 GB archive never lands in RAM.
+    Mirrors split_by_document's streaming idiom; appends every shard through one
+    ParquetWriter.
     """
-    pf = pq.ParquetFile(in_path)
-    schema_names = pf.schema_arrow.names
+    if isinstance(in_paths, str):
+        in_paths = [in_paths]
+    assert in_paths, "build_one got no input parquets"
+    schema_names = pq.ParquetFile(in_paths[0]).schema_arrow.names
     tri = _triplet_names(schema_names, center)
     extra = [c for c in (PROMPT_COL, RESPONSE_COL, EXPLANATION_COL, "doc_id", "n_raw_tokens")
              if c in schema_names]
@@ -172,18 +197,44 @@ def build_one(in_path: str, mode: str, out_path: str, center: int = 24,
     writer = None
     n = 0
     try:
-        for batch in pf.iter_batches(batch_size=batch_size, columns=projection):
-            out = assemble_published(pa.Table.from_batches([batch]), mode, center)
-            if writer is None:
-                writer = pq.ParquetWriter(out_path, out.schema)
-            writer.write_table(out)
-            n += out.num_rows
+        for in_path in in_paths:
+            for batch in pq.ParquetFile(in_path).iter_batches(batch_size=batch_size, columns=projection):
+                out = assemble_published(pa.Table.from_batches([batch]), mode, center)
+                if writer is None:
+                    writer = pq.ParquetWriter(out_path, out.schema)
+                writer.write_table(out)
+                n += out.num_rows
     finally:
         if writer is not None:
             writer.close()
-    print(f"[from-published:{mode}] center={center} {in_path} -> {out_path}  "
+    src = in_paths[0] if len(in_paths) == 1 else f"{len(in_paths)} shards"
+    print(f"[from-published:{mode}] center={center} {src} -> {out_path}  "
           f"({n} rows, streamed; read {len(projection)} of {len(schema_names)} cols)")
     return n
+
+
+def _assert_docs_disjoint(out_dir: Path) -> dict:
+    """One-time guard: av/ar/rl doc_id sets must be pairwise disjoint (the inherited
+    document-level split). Catches a wrong-corpus mix or a split bug before training.
+    Reads only the doc_id column. Returns per-subset unique-doc counts."""
+    sets, counts = {}, {}
+    for name in ("av_sft", "ar_sft", "rl"):
+        p = out_dir / f"{name}.parquet"
+        if "doc_id" not in pq.ParquetFile(p).schema_arrow.names:
+            print(f"[from-published] doc_id absent in {name} — skipping disjointness check")
+            return {}
+        s = set(pq.read_table(p, columns=["doc_id"]).column("doc_id").to_pylist())
+        sets[name], counts[name] = s, len(s)
+    pairs = (("av_sft", "ar_sft"), ("av_sft", "rl"), ("ar_sft", "rl"))
+    for a, b in pairs:
+        inter = sets[a] & sets[b]
+        assert not inter, (
+            f"{len(inter)} doc_id(s) shared between {a} and {b} (e.g. {sorted(inter)[:3]}). "
+            f"The av/ar/rl split must be document-disjoint — a leak means the published "
+            f"subsets were mixed or the wrong corpus was fed in."
+        )
+    print(f"[from-published] doc-disjoint OK: unique docs {counts}")
+    return counts
 
 
 def main() -> None:
@@ -195,34 +246,38 @@ def main() -> None:
                    help="center layer c; selects activation_L{c-1,c,c+1} from the archive as "
                         "the training triplet. Re-run with a different --center to sweep centers "
                         "without re-extracting (the §5 layer-selection sweep).")
-    p.add_argument("--in", dest="inp", help="regenerated published parquet (for av/ar/rl)")
+    p.add_argument("--in", dest="inp", help="regenerated published parquet or glob (for av/ar/rl)")
     p.add_argument("--out", help="output training parquet (for av/ar/rl)")
-    p.add_argument("--in-dir", help="for --mode all: dir with av_sft/ar_sft/rl .parquet (regenerated)")
+    p.add_argument("--in-dir", help="for --mode all: dir with regenerated av_sft/ar_sft/rl "
+                                    "(shards *.shardNNofMM.parquet are used directly — no merge)")
     p.add_argument("--out-dir", help="for --mode all: output dir")
     args = p.parse_args()
 
     if args.mode == "all":
         assert args.in_dir and args.out_dir, "--mode all needs --in-dir and --out-dir"
         ind, outd = Path(args.in_dir), Path(args.out_dir)
+        outd.mkdir(parents=True, exist_ok=True)
         counts = {}
         for mode, fname in (("av", "av_sft"), ("ar", "ar_sft"), ("rl", "rl")):
-            src = ind / f"{fname}.parquet"
-            assert src.exists(), f"missing regenerated parquet {src}"
-            counts[mode] = build_one(str(src), mode, str(outd / f"{fname}.parquet"), args.center)
-        outd.mkdir(parents=True, exist_ok=True)
+            counts[mode] = build_one(_subset_inputs(ind, fname), mode,
+                                     str(outd / f"{fname}.parquet"), args.center)
+        docs = _assert_docs_disjoint(outd)  # av/ar/rl must be document-disjoint
         (outd / "build_manifest.json").write_text(json.dumps({
             "source": "build_from_published",
             "in_dir": str(ind),
             "counts": counts,
+            "unique_docs": docs,
             "center_layer": args.center,
-            "split": "inherited from the published av/ar/rl subsets (not re-split)",
+            "split": "inherited from the published av/ar/rl subsets (not re-split); doc-disjoint asserted",
             "note": "labels reused from ceselder/qwen3-8b-nla-L24-finefineweb-100k; "
                     "activations regenerated locally (no API).",
         }, indent=2))
         print(f"[from-published] av/ar/rl (center {args.center}) -> {outd}  counts={counts}")
     else:
         assert args.inp and args.out, "--mode av/ar/rl needs --in and --out"
-        build_one(args.inp, args.mode, args.out, args.center)
+        import glob
+        ins = sorted(glob.glob(args.inp)) or [args.inp]  # expand a shard glob if given
+        build_one(ins, args.mode, args.out, args.center)
 
 
 if __name__ == "__main__":

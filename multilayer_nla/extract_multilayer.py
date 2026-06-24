@@ -125,18 +125,30 @@ class MultiLayerHFExtractor(HFExtractor):
                     f"layer {li}: captured width {self._captured_multi[li].shape[-1]} "
                     f"!= d_model {self.d_model}"
                 )
-            hidden = {li: self._captured_multi[li].float().cpu() for li in layer_indices}
-
-            lengths = attention_mask.sum(dim=1).cpu()
-            for i, seq_len in enumerate(lengths.tolist()):
-                if final_token_only:
-                    hid = {li: hidden[li][i, seq_len - 1].clone() for li in layer_indices}  # [d]
-                else:
-                    hid = {li: hidden[li][i, :seq_len].clone() for li in layer_indices}     # [seq, d]
-                results.append({
-                    "token_ids": input_ids[i, :seq_len].cpu().tolist(),
-                    "hidden": hid,
-                })
+            lengths = attention_mask.sum(dim=1)  # [B], on device
+            lengths_cpu = lengths.cpu().tolist()
+            if final_token_only:
+                # Select the final REAL token ON GPU, then move only [B, d] per layer
+                # to CPU — NOT the whole [B, T, d]. Right padding: the last real token
+                # is at index len-1, so captured[batch, len-1] gathers it. This keeps
+                # the GPU->CPU transfer ~T× smaller, which is the whole point of
+                # final_token_only when capturing a wide layer window.
+                last = (lengths - 1).clamp_min(0)                       # [B]
+                bidx = torch.arange(input_ids.shape[0], device=last.device)
+                final = {li: self._captured_multi[li][bidx, last].float().cpu()  # [B, d]
+                         for li in layer_indices}
+                for i, seq_len in enumerate(lengths_cpu):
+                    results.append({
+                        "token_ids": input_ids[i, :seq_len].cpu().tolist(),
+                        "hidden": {li: final[li][i] for li in layer_indices},  # [d]
+                    })
+            else:
+                hidden = {li: self._captured_multi[li].float().cpu() for li in layer_indices}  # [B,T,d]
+                for i, seq_len in enumerate(lengths_cpu):
+                    results.append({
+                        "token_ids": input_ids[i, :seq_len].cpu().tolist(),
+                        "hidden": {li: hidden[li][i, :seq_len].clone() for li in layer_indices},  # [seq,d]
+                    })
         return results
 
 

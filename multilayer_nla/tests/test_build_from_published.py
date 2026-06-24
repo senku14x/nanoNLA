@@ -13,7 +13,12 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from multilayer_nla.build_from_published import assemble_published, build_one
+from multilayer_nla.build_from_published import (
+    _assert_docs_disjoint,
+    _subset_inputs,
+    assemble_published,
+    build_one,
+)
 from multilayer_nla.datasets import (
     AR_CRITIC_TEMPLATE,
     INJECT_PLACEHOLDER,
@@ -221,6 +226,68 @@ def test_build_one_streams_archive_in_batches():
             assert np.allclose(rows[i]["activation_next"], vecs[25][i])
         # the 8 unused archive layers are NOT carried into the training parquet
         assert "activation_L19" not in pq.read_table(out_path).schema.names
+
+
+def test_ar_rejects_noncanonical_prefix():
+    # right <summary> suffix but WRONG prefix -> must be rejected (the old endswith
+    # check would have wrongly accepted it; AR-SFT must match RL's fill_ar_prompt).
+    cols, _ = _triplet_cols(2)
+    cols["prompt"] = pa.array(["Different lead-in: <text>x</text> <summary>",
+                               "Another: <text>y</text> <summary>"], pa.string())
+    table = pa.table(cols)
+    try:
+        assemble_published(table, "ar")
+    except AssertionError as e:
+        assert "canonical" in str(e)
+    else:
+        raise AssertionError("expected rejection of a non-canonical AR prompt prefix")
+
+
+def test_build_one_multi_shard_concatenates():
+    # the shards ARE the layer bank — build streams across all of them into one
+    # training parquet (no wide merge), selecting the center triplet per shard.
+    with tempfile.TemporaryDirectory() as tmp:
+        layers = list(range(19, 30))
+        paths, vecs_by_shard = [], {}
+        for sh in range(2):
+            cols, vecs = _archive_cols(6, layers, seed=sh)
+            cols["response"] = pa.array([f"<explanation>\nf{sh}_{i}\n</explanation>" for i in range(6)])
+            cols["doc_id"] = pa.array([f"doc:{sh}:{i}" for i in range(6)], pa.string())
+            p = str(Path(tmp) / f"av_sft.shard0{sh}of02.parquet")
+            pq.write_table(pa.table(cols), p)
+            paths.append(p); vecs_by_shard[sh] = vecs
+        out = str(Path(tmp) / "av_sft.parquet")
+        n = build_one(paths, "av", out, center=24, batch_size=4)
+        assert n == 12
+        rows = load_av_sft_dataset(out)
+        assert len(rows) == 12
+        assert np.allclose(rows[0]["activation_centre"], vecs_by_shard[0][24][0])
+        assert np.allclose(rows[6]["activation_centre"], vecs_by_shard[1][24][0])
+
+
+def test_subset_inputs_prefers_shards():
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        for sh in range(3):
+            (d / f"av_sft.shard0{sh}of03.parquet").write_bytes(b"x")
+        got = _subset_inputs(d, "av_sft")
+        assert len(got) == 3 and all("shard" in g for g in got)
+
+
+def test_docs_disjoint_pass_and_overlap_raises():
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        def w(name, ids):
+            pq.write_table(pa.table({"doc_id": pa.array(ids, pa.string())}), str(d / f"{name}.parquet"))
+        w("av_sft", ["a", "a", "b"]); w("ar_sft", ["c", "d"]); w("rl", ["e"])
+        assert _assert_docs_disjoint(d) == {"av_sft": 2, "ar_sft": 2, "rl": 1}
+        w("rl", ["e", "b"])  # 'b' leaks from av_sft -> must raise
+        try:
+            _assert_docs_disjoint(d)
+        except AssertionError as e:
+            assert "shared" in str(e)
+        else:
+            raise AssertionError("expected disjointness failure on a leaked doc_id")
 
 
 def test_missing_triplet_refused():

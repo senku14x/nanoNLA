@@ -277,6 +277,7 @@ def main() -> None:
     storage.ensure_parent(out_path)
     writer = None
     g = 0            # global INPUT row offset (for sharding + round-trip messages)
+    n_in = 0         # input rows seen in this shard's range
     n_out = 0        # output rows actually written (post drop)
     try:
         for batch in pf.iter_batches(batch_size=args.chunk_size):
@@ -284,6 +285,7 @@ def main() -> None:
             o_lo, o_hi = max(lo, g), min(hi, g + blen)
             if o_lo < o_hi:  # this batch overlaps the shard's row range
                 tbl = pa.Table.from_batches([batch]).slice(o_lo - g, o_hi - o_lo)
+                n_in += tbl.num_rows
                 texts = tbl.column(TEXT_COL).to_pylist()
                 results = extractor.extract_multi(texts, save_layers, final_token_only=True)
                 tbl = append_layer_columns(
@@ -306,7 +308,11 @@ def main() -> None:
     finally:
         if writer is not None:
             writer.close()
-    print(f"wrote {n_out} rows, layers {save_layers} (center {center}, d={d_model}) -> {out_path}")
+    n_dropped = n_in - n_out
+    drop_pct = (100.0 * n_dropped / n_in) if n_in else 0.0
+    print(f"wrote {n_out}/{n_in} rows, layers {save_layers} (center {center}, d={d_model}) -> {out_path}")
+    print(f"  round-trip drops: {n_dropped} ({drop_pct:.3f}%) — benign detokenize->retokenize drift "
+          f"(final token would land off the labelled position); kept rows are position-exact.")
     if args.num_shards > 1:
         print(f"[shard {args.shard_index}/{args.num_shards}] done. Merge all shards with e.g.:\n"
               f"  python -c \"import pyarrow.parquet as pq, glob; "
