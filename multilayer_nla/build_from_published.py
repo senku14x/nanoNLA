@@ -32,6 +32,7 @@ so these parquets need NO sidecar.
 """
 
 import argparse
+import json
 from pathlib import Path
 
 import pyarrow as pa
@@ -71,8 +72,13 @@ def assemble_published(table: pa.Table, mode: str) -> pa.Table:
     names = table.schema.names
 
     cols = {c: table.column(c) for c in SLOT_COLUMNS}
-    if "doc_id" in names:
-        cols["doc_id"] = table.column("doc_id")
+    # Carry provenance through so the inherited split + center layer stay auditable
+    # downstream (the trainers ignore these columns, but they let a post-hoc check
+    # confirm av/ar/rl are doc-disjoint and which center the triplet came from —
+    # and make an accidental wrong-corpus mix visible).
+    for prov in ("doc_id", "center_layer", "n_raw_tokens"):
+        if prov in names:
+            cols[prov] = table.column(prov)
 
     if mode in ("av", "rl"):
         # Discard the published single-marker actor prompt; use our 3-marker prompt.
@@ -141,11 +147,25 @@ def main() -> None:
         assert args.in_dir and args.out_dir, "--mode all needs --in-dir and --out-dir"
         ind, outd = Path(args.in_dir), Path(args.out_dir)
         counts = {}
+        centers = set()
         for mode, fname in (("av", "av_sft"), ("ar", "ar_sft"), ("rl", "rl")):
             src = ind / f"{fname}.parquet"
             assert src.exists(), f"missing regenerated parquet {src}"
             counts[mode] = build_one(str(src), mode, str(outd / f"{fname}.parquet"))
-        print(f"[from-published] av/ar/rl -> {outd}  counts={counts}")
+            t = pq.read_table(str(outd / f"{fname}.parquet"), columns=None)
+            if "center_layer" in t.schema.names:
+                centers |= set(t.column("center_layer").to_pylist())
+        outd.mkdir(parents=True, exist_ok=True)
+        (outd / "build_manifest.json").write_text(json.dumps({
+            "source": "build_from_published",
+            "in_dir": str(ind),
+            "counts": counts,
+            "center_layers": sorted(centers),
+            "split": "inherited from the published av/ar/rl subsets (not re-split)",
+            "note": "labels reused from ceselder/qwen3-8b-nla-L24-finefineweb-100k; "
+                    "activations regenerated locally (no API).",
+        }, indent=2))
+        print(f"[from-published] av/ar/rl -> {outd}  counts={counts}  centers={sorted(centers)}")
     else:
         assert args.inp and args.out, "--mode av/ar/rl needs --in and --out"
         build_one(args.inp, args.mode, args.out)

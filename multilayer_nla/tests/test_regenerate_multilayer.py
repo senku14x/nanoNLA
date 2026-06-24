@@ -87,6 +87,35 @@ def test_roundtrip_mismatch_raises():
         raise AssertionError("expected AssertionError on n_raw_tokens mismatch")
 
 
+def test_roundtrip_drop_within_threshold():
+    # 1 of 4 rows mismatches (25%) and max_drop_frac=0.5 -> drop-and-log, keep 3
+    n_raw = [3, 5, 4, 3]
+    table = _make_table(4, n_raw)
+    results = _make_results(n_raw)
+    results[2]["token_ids"] = list(range(99))  # corrupt only row 2
+    out = append_triplet_columns(table, results, CENTER, D, max_drop_frac=0.5)
+    assert out.num_rows == 3
+    assert "doc:2" not in out.column("doc_id").to_pylist()  # the bad row is gone
+    centre = out.column("activation_centre").to_pylist()
+    assert np.allclose(centre[0], results[0]["hidden"][CENTER][-1])
+    assert np.allclose(centre[2], results[3]["hidden"][CENTER][-1])  # row 3 shifted into slot 2
+
+
+def test_roundtrip_drop_over_threshold_still_raises():
+    # 2 of 4 (50%) exceeds max_drop_frac=0.1 -> hard fail
+    n_raw = [3, 5, 4, 3]
+    table = _make_table(4, n_raw)
+    results = _make_results(n_raw)
+    results[1]["token_ids"] = list(range(99))
+    results[2]["token_ids"] = list(range(99))
+    try:
+        append_triplet_columns(table, results, CENTER, D, max_drop_frac=0.1)
+    except AssertionError as e:
+        assert "round-trip" in str(e) and "exceeds" in str(e)
+    else:
+        raise AssertionError("expected raise when drop fraction exceeds max_drop_frac")
+
+
 def test_roundtrip_check_can_be_disabled():
     n_raw = [3]
     table = _make_table(1, n_raw)

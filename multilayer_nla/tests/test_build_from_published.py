@@ -41,6 +41,8 @@ def _triplet_cols(n, seed=0):
 def _published_table(n, mode, *, with_response=True, with_prompt=True, with_expl=False):
     cols, acts = _triplet_cols(n)
     cols["doc_id"] = pa.array([f"doc:{i}" for i in range(n)], pa.string())
+    cols["center_layer"] = pa.array([24] * n, pa.int64())  # written by the regen step
+    cols["n_raw_tokens"] = pa.array([50 + i for i in range(n)], pa.int64())
     if mode == "av" and with_response:
         cols["response"] = pa.array([f"<explanation>\nfeat {i}\n</explanation>" for i in range(n)])
     if mode == "av" and with_prompt:
@@ -145,6 +147,17 @@ def test_ar_rejects_prompt_without_summary_anchor():
         assert "<summary>" in str(e)
     else:
         raise AssertionError("expected rejection of ar prompts lacking the <summary> anchor")
+
+
+def test_provenance_columns_carried_through():
+    # doc_id / center_layer / n_raw_tokens survive so the inherited split + center
+    # stay auditable downstream (and a wrong-corpus mix would be visible).
+    for mode in ("av", "ar", "rl"):
+        table, _ = _published_table(4, mode)
+        out = assemble_published(table, mode)
+        for prov in ("doc_id", "center_layer", "n_raw_tokens"):
+            assert prov in out.schema.names, f"{mode}: dropped provenance column {prov}"
+        assert out.column("center_layer").to_pylist() == [24] * 4
 
 
 def test_missing_triplet_refused():

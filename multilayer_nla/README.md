@@ -47,11 +47,15 @@ switch; and the real **coherent + duplicate** run on the labeled corpus.
    └─ verify center tap == legacy L24 extraction (bitwise)  ── verify_center_parity.py
 2. geometry + ridge + mean-update + center-only headroom  ── headroom.py  → GATE 0
    ─────────────────────────────  (this is where the NLA-free phase ends)  ─────────────
-3. three-slot AV injection; coherent vs duplicate, 20 SFT steps        [Stage 2 — not built]
-4. verify marker count / slot order / no marker leakage / loss down    [Stage 2 — not built]
-5. multi-tap AR; 5k-doc full-chain smoke                               [Stage 2 — not built]
-6. 100k corpus + 500-step RL                                           [Stage 3 — not built]
+3. three-slot AV injection; coherent vs duplicate, 20 SFT steps        [built — train_av_multi.py]
+4. verify marker count / slot order / no marker leakage / loss down    [built — injection guard + smoke]
+5. multi-tap AR; 5k-doc full-chain smoke                               [built — train_ar_multi.py; smoke GREEN]
+6. 100k corpus + 500-step RL                                           [built — train_rl_multi.py; smoke GREEN]
 ```
+
+The end-to-end plumbing smoke (AV-SFT → AR-SFT → RL, dummy labels) is GREEN. For
+the **real** run, source labels from the published dataset (next section) instead
+of paying for API explanations; Gate 0 and the §7 condition flag remain pending.
 
 ---
 
@@ -148,6 +152,21 @@ python -m multilayer_nla.build_from_published --mode all --in-dir $REGEN --out-d
 #    pointed at $TRAIN (bf16 + LoRA, --quant none). The av/ar/rl document split is
 #    INHERITED from the published subsets (the split the released checkpoints used).
 ```
+
+**Scale (~1M rows).** The full L24 set is ~1M positions; step 2 is one forward per
+prefix (up to 4096 tokens). Fan out across GPUs with `--num-shards N --shard-index i`
+— each job writes its own `*.shardNNofMM.parquet` and the tool prints a one-liner to
+merge them before step 3. Validate on a small `--in` slice first: with
+`--max-length 4096` the `n_raw_tokens` round-trip should be 100% clean;
+`--max-drop-frac 1e-3` tolerates rare per-row tokenizer drift instead of aborting a
+whole shard (default `0.0` hard-fails on any mismatch — usually a `--max-length`
+misconfiguration).
+
+**Prompt length.** AR-SFT skips, and RL-time critic scoring penalizes, critic
+prompts over `--max-len` (default 1024). The critic prompt embeds the *explanation*,
+not the 4096-token prefix, so this rarely bites — but check the length distribution
+on the regenerated `ar_sft` parquet and raise `--max-len` if a non-trivial fraction
+would be dropped.
 
 The §7 controls (`coherent` / `duplicate` / `single` / `mismatched`) run on these
 **identical labeled rows** — they only change how the triplet is arranged at

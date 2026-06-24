@@ -55,7 +55,7 @@ TEXT_COL = "detokenized_text_truncated"
 
 def append_triplet_columns(table: pa.Table, results: list[dict], center: int,
                            d_model: int, *, check_roundtrip: bool = True,
-                           row_offset: int = 0) -> pa.Table:
+                           row_offset: int = 0, max_drop_frac: float = 0.0) -> pa.Table:
     """Append activation_prev/centre/next (RAW, at the final token) to `table`.
 
     `results[i]` aligns to `table` row i and is `{token_ids: list[int],
@@ -67,9 +67,14 @@ def append_triplet_columns(table: pa.Table, results: list[dict], center: int,
 
     Round-trip guard (when `check_roundtrip` and `n_raw_tokens` is present): the
     re-encoded prefix must reproduce the stored token count, or the final token
-    is NOT the position the label describes. This is the multi-layer equivalent
-    of the single-layer regenerate tool's assertion — a hard failure, never
-    silent (the usual cause is --max-length not matching the original 4096).
+    is NOT the position the label describes. A re-encode mismatch means the
+    activation would land on the wrong token and is unusable. `max_drop_frac`
+    controls the response: 0.0 (default) is a hard failure on ANY mismatch (the
+    single-layer regenerate tool's behavior, and the right default — a systematic
+    mismatch is almost always a --max-length misconfiguration, which silent
+    dropping would mask). A small positive value (e.g. 1e-3) tolerates rare
+    per-row tokenizer drift on a large run by DROPPING the offending rows and
+    logging the count, failing only if the drop fraction exceeds the threshold.
 
     Pure (numpy/pyarrow only, no model) so it is unit-testable offline with
     fabricated `results`.
@@ -84,13 +89,24 @@ def append_triplet_columns(table: pa.Table, results: list[dict], center: int,
         bad = [(row_offset + i, len(r["token_ids"]), n)
                for i, (r, n) in enumerate(zip(results, n_raw))
                if len(r["token_ids"]) != n]
-        assert not bad, (
-            f"{len(bad)} rows fail the tokenization round-trip "
-            f"(first: row {bad[0][0]} re-encoded to {bad[0][1]} tokens, "
-            f"stage-0 had {bad[0][2]}). These rows are not faithfully "
-            f"regenerable — check --max-length matches the original extraction "
-            f"(4096 for the published datasets), or filter the offending rows."
-        )
+        if bad:
+            frac = len(bad) / len(results)
+            if frac > max_drop_frac:
+                raise AssertionError(
+                    f"{len(bad)} rows fail the tokenization round-trip "
+                    f"(first: row {bad[0][0]} re-encoded to {bad[0][1]} tokens, "
+                    f"stage-0 had {bad[0][2]}). Drop fraction {frac:.4%} exceeds "
+                    f"--max-drop-frac {max_drop_frac:.4%}. These rows are not "
+                    f"faithfully regenerable — check --max-length matches the "
+                    f"original extraction (4096 for the published datasets)."
+                )
+            bad_local = {i for i, (r, n) in enumerate(zip(results, n_raw))
+                         if len(r["token_ids"]) != n}
+            good = [i for i in range(len(results)) if i not in bad_local]
+            table = table.take(good)
+            results = [results[i] for i in good]
+            print(f"[regen] dropped {len(bad)} ({frac:.4%}) round-trip-mismatch rows "
+                  f"(<= --max-drop-frac {max_drop_frac:.4%}); kept {len(good)}", flush=True)
 
     def _final_token_fsl(layer_index: int) -> pa.Array:
         # [n_rows, d] float32 — the final-token vector for this layer per row.
@@ -136,6 +152,15 @@ def _infer_center(pf: pq.ParquetFile, explicit: int | None) -> int:
     )
 
 
+def _shard_out(out: str, idx: int, n: int) -> str:
+    """Per-shard output path so parallel jobs never clobber one --out (merge after)."""
+    if n <= 1:
+        return out
+    from pathlib import Path
+    p = Path(out)
+    return str(p.with_name(f"{p.stem}.shard{idx:02d}of{n:02d}{p.suffix}"))
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -155,6 +180,17 @@ def main() -> None:
                         "round-trip check turns that into a hard error.")
     p.add_argument("--no-roundtrip-check", action="store_true",
                    help="disable the n_raw_tokens round-trip guard (NOT recommended)")
+    p.add_argument("--max-drop-frac", type=float, default=0.0,
+                   help="tolerate up to this fraction of round-trip-mismatch rows by DROPPING "
+                        "(and logging) them; default 0.0 hard-fails on any mismatch. Use a tiny "
+                        "value (e.g. 1e-3) for a large run where rare per-row tokenizer drift "
+                        "should not abort the whole shard.")
+    p.add_argument("--num-shards", type=int, default=1,
+                   help="data-parallel fan-out: split the input into N contiguous shards (one "
+                        "GPU/job each). Each shard writes its own parquet; merge after. The 30k "
+                        "stage0 run flagged exactly this for the 100k corpus.")
+    p.add_argument("--shard-index", type=int, default=0,
+                   help="which shard [0, num-shards) this job processes")
     p.add_argument("--extractor-cls",
                    default="multilayer_nla.extract_multilayer.MultiLayerHFExtractor")
     p.add_argument("--extractor-kwargs", default=None, help="JSON dict of extra extractor kwargs")
@@ -189,27 +225,52 @@ def main() -> None:
         f"center-layer={center} needs block {center + 1}, but model has {n_layers} blocks"
     )
 
-    storage.ensure_parent(args.out)
+    assert args.num_shards >= 1 and 0 <= args.shard_index < args.num_shards, (
+        f"bad shard config: shard_index={args.shard_index}, num_shards={args.num_shards}"
+    )
+    total = pf.metadata.num_rows
+    per = (total + args.num_shards - 1) // args.num_shards
+    lo = args.shard_index * per
+    hi = min(total, lo + per)
+    out_path = _shard_out(args.out, args.shard_index, args.num_shards)
+    if args.num_shards > 1:
+        print(f"[shard {args.shard_index}/{args.num_shards}] input rows [{lo}, {hi}) of {total} "
+              f"-> {out_path}", flush=True)
+
+    storage.ensure_parent(out_path)
     writer = None
-    done = 0
+    g = 0            # global INPUT row offset (for sharding + round-trip messages)
+    n_out = 0        # output rows actually written (post drop)
     try:
         for batch in pf.iter_batches(batch_size=args.chunk_size):
-            tbl = pa.Table.from_batches([batch])
-            texts = tbl.column(TEXT_COL).to_pylist()
-            results = extractor.extract_multi(texts, layers)
-            tbl = append_triplet_columns(
-                tbl, results, center, d_model,
-                check_roundtrip=not args.no_roundtrip_check, row_offset=done,
-            )
-            if writer is None:
-                writer = pq.ParquetWriter(storage.open_write(args.out), tbl.schema)
-            writer.write_table(tbl)
-            done += tbl.num_rows
-            print(f"  {done} rows", flush=True)
+            blen = batch.num_rows
+            o_lo, o_hi = max(lo, g), min(hi, g + blen)
+            if o_lo < o_hi:  # this batch overlaps the shard's row range
+                tbl = pa.Table.from_batches([batch]).slice(o_lo - g, o_hi - o_lo)
+                texts = tbl.column(TEXT_COL).to_pylist()
+                results = extractor.extract_multi(texts, layers)
+                tbl = append_triplet_columns(
+                    tbl, results, center, d_model,
+                    check_roundtrip=not args.no_roundtrip_check,
+                    row_offset=o_lo, max_drop_frac=args.max_drop_frac,
+                )
+                if writer is None:
+                    writer = pq.ParquetWriter(storage.open_write(out_path), tbl.schema)
+                writer.write_table(tbl)
+                n_out += tbl.num_rows
+                print(f"  {n_out} rows (input @ {o_hi}/{hi})", flush=True)
+            g += blen
+            if g >= hi:
+                break
     finally:
         if writer is not None:
             writer.close()
-    print(f"wrote {done} rows with triplet {layers} (center {center}, d={d_model}) -> {args.out}")
+    print(f"wrote {n_out} rows with triplet {layers} (center {center}, d={d_model}) -> {out_path}")
+    if args.num_shards > 1:
+        print(f"[shard {args.shard_index}/{args.num_shards}] done. Merge all shards with e.g.:\n"
+              f"  python -c \"import pyarrow.parquet as pq, glob; "
+              f"pq.write_table(pq.ParquetDataset(sorted(glob.glob('PREFIX.shard*of*.parquet'))).read(), "
+              f"'MERGED.parquet', row_group_size=4096)\"")
 
 
 if __name__ == "__main__":
