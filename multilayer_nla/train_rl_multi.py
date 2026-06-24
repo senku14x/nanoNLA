@@ -266,7 +266,7 @@ def main():
     p.add_argument("--av-ckpt", required=True, help="AV-SFT LoRA dir (policy init + frozen KL reference)")
     p.add_argument("--ar-ckpt", required=True, help="AR multitap dir (ar_multitap.safetensors + ar_meta.json)")
     p.add_argument("--base-ckpt", default="Qwen/Qwen3-8B")
-    p.add_argument("--quant", choices=["none", "4bit"], default="4bit")
+    p.add_argument("--quant", choices=["none", "4bit"], default="none")
     p.add_argument("--rl-parquet", required=True)
     p.add_argument("--save-dir", required=True)
     p.add_argument("--num-steps", type=int, default=500)
