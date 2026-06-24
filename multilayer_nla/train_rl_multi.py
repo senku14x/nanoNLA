@@ -114,12 +114,15 @@ def load_rl_dataset_multi(parquet_path, n_max=None):
 
 def build_prompt_text(prompt_msgs, inject_char, tokenizer):
     from nla.schema import INJECT_PLACEHOLDER
+    from multilayer_nla.datasets import apply_chat_template_no_think
     msgs = [
         {**m, "content": m["content"].replace(INJECT_PLACEHOLDER, inject_char)}
         if isinstance(m.get("content"), str) else m
         for m in prompt_msgs
     ]
-    return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    # enable_thinking=False — identical to AV-SFT prep, or the actor sees a
+    # different prompt than it learned (and Qwen3 burns the budget on <think>).
+    return apply_chat_template_no_think(tokenizer, msgs)
 
 
 @torch.no_grad()

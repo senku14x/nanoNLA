@@ -52,6 +52,27 @@ def build_av_prompt(placeholder: str = INJECT_PLACEHOLDER) -> list[dict]:
     return [{"role": "user", "content": av_user_content(placeholder)}]
 
 
+def apply_chat_template_no_think(tokenizer, msgs, *, add_generation_prompt=True) -> str:
+    """Chat-template the AV prompt with Qwen3 thinking DISABLED (enable_thinking=False).
+
+    Qwen3 is a thinking model: with thinking on it emits <think>...</think> and burns
+    the whole token budget reasoning *about* the prompt, never reaching <explanation>.
+    The NLA AV is a verbalizer, not a reasoner — we want the answer directly. The
+    kwarg is an unused template var on non-thinking archs (Llama/Gemma), so this is
+    harmless there. MUST be used identically at AV-SFT train time and RL rollout
+    time, or the actor sees a different prompt than it was trained on.
+    """
+    try:
+        return tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=add_generation_prompt,
+            enable_thinking=False,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=add_generation_prompt,
+        )
+
+
 # ---- Document-level split (plan §3 invariant, point 2) ----
 
 def doc_bucket(doc_id: str, fracs: tuple[float, ...], seed: int) -> int:
@@ -180,7 +201,7 @@ def prepare_av_chunk_multi(rows: list[dict], tokenizer, inject_char: str, inj_id
             if isinstance(m.get("content"), str) else m
             for m in row["prompt"]
         ]
-        prompt_str = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        prompt_str = apply_chat_template_no_think(tokenizer, msgs)
         prompt_ids = tokenizer.encode(prompt_str, add_special_tokens=False)
         n_mark = sum(1 for t in prompt_ids if t == inj_id)
         assert n_mark == k, (
