@@ -32,6 +32,7 @@ def inject_multislot_in_residual(
     vectors: torch.Tensor,
     inj_id: int,
     k: int,
+    prompt_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """ADD-norm-matched injection at K marker positions per example.
 
@@ -40,9 +41,18 @@ def inject_multislot_in_residual(
     vectors: [B*K, d] in example-major, prompt-slot order (see module docstring).
     inj_id: the marker token id (same char for all K slots).
     k: markers expected per example.
+    prompt_lens: [B] (optional). When given, ONLY markers at positions < prompt_lens[b]
+        are injection sites. This is required for RL: GRPO re-forwards the full
+        prompt+response sequence, but the rollout injected ONLY at the prompt prefill
+        (response tokens are generated one-at-a-time, where the hook no-ops), so a
+        marker the actor happened to emit in the RESPONSE is NOT an injection site.
+        Bounding to the prompt span keeps the training-forward injection identical to
+        the rollout's, and stops response markers from shifting slot order / tripping
+        the count guard / crashing the update. When None, all markers count (AV-SFT,
+        whose gold response is marker-free).
 
-    Returns the modified residual. Raises if the per-row marker count != k or the
-    total != vectors.shape[0].
+    Returns the modified residual. Raises if the per-row marker count (within the
+    prompt span when bounded) != k or the total != vectors.shape[0].
     """
     B, S = input_ids.shape
     assert resid.shape[:2] == (B, S), (
@@ -56,12 +66,17 @@ def inject_multislot_in_residual(
     )
 
     marker = input_ids == inj_id
+    if prompt_lens is not None:
+        # Only markers inside each row's prompt span are injection sites.
+        pos = torch.arange(S, device=input_ids.device).unsqueeze(0)              # [1, S]
+        marker = marker & (pos < prompt_lens.to(input_ids.device).unsqueeze(1))  # [B, S]
     per_row = marker.sum(dim=1)
     if not torch.all(per_row == k):
+        where = "the prompt span" if prompt_lens is not None else "each example"
         raise RuntimeError(
-            f"[inject_multislot] each example must have exactly k={k} markers; "
-            f"got per-row counts {per_row.tolist()}. Cause: stray marker token in "
-            f"the response, AV-prompt template drift, or wrong k/tokenizer."
+            f"[inject_multislot] {where} must have exactly k={k} markers; "
+            f"got per-row counts {per_row.tolist()}. Cause: AV-prompt template drift, "
+            f"a wrong k/tokenizer, or (if unbounded) a stray marker in the response."
         )
 
     out = resid.clone()
@@ -88,7 +103,12 @@ def register_multislot_hook(model, vectors_ref, inj_id: int, k: int, layer_idx: 
 
     Mirrors `nla.train_sft._register_karvonen_hook` but routes through
     `inject_multislot_in_residual`. `vectors_ref[0]` holds the current forward's
-    [B*K, d] tensor (set by the caller before each forward, cleared after).
+    injection payload (set by the caller before each forward, cleared after):
+      - None                                              → no-op
+      - {"vectors": [B*K, d], "prompt_lens": [B] | None}  → inject; prompt_lens
+        bounds injection to the prompt span (RL: the generated response may contain
+        marker tokens that are NOT injection sites — see inject_multislot_in_residual)
+      - a bare [B*K, d] tensor (legacy)                   → inject, no prompt bounding
 
     No-op when there's no full sequence to inject into (seq_len < 2, e.g. the
     single-token cache steps during RL `generate()`) or when no marker is present
@@ -111,13 +131,22 @@ def register_multislot_hook(model, vectors_ref, inj_id: int, k: int, layer_idx: 
         input_ids = state["input_ids"]
         if input_ids is None or resid.shape[1] < 2:
             return output
-        v = vectors_ref[0]
+        payload = vectors_ref[0]
+        if payload is None:
+            return output
+        if isinstance(payload, dict):
+            v, plens = payload.get("vectors"), payload.get("prompt_lens")
+        else:  # legacy bare tensor — no prompt bounding
+            v, plens = payload, None
         if v is None or v.shape[0] == 0:
             return output
         ids = input_ids.to(resid.device)
         if (ids == inj_id).sum().item() == 0:
             return output  # cache step / no marker — nothing to inject
-        injected = inject_multislot_in_residual(ids, resid, v.to(resid.device), inj_id, k)
+        injected = inject_multislot_in_residual(
+            ids, resid, v.to(resid.device), inj_id, k,
+            prompt_lens=(plens.to(resid.device) if plens is not None else None),
+        )
         if rest is None:
             return injected
         return (injected, *rest)

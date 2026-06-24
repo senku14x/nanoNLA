@@ -96,6 +96,51 @@ def test_hook_perturbs_tiny_model():
     assert not torch.allclose(base, injected), "injection hook had no effect on the model output"
 
 
+def test_prompt_bounded_injection_ignores_response_markers():
+    """Reproduces the [9,3] RL crash: row 0 = 3 prompt markers + 6 response markers,
+    row 1 = 3 prompt. With prompt_lens delimiting the prompt, only the 3 prompt sites
+    per row are injected and the response markers are untouched — no exception."""
+    torch.manual_seed(0)
+    B, S, d, k = 2, 14, 8, 3
+    plen = 6
+    ids = torch.randint(0, 50, (B, S)); ids[ids == INJ] = 0
+    prompt_marker = {0: [1, 3, 5], 1: [0, 2, 4]}                # all < plen
+    for b, ps in prompt_marker.items():
+        for p in ps:
+            ids[b, p] = INJ
+    ids[0, [6, 8, 9, 10, 11, 12]] = INJ                        # 6 stray response markers (>= plen)
+    resid = torch.randn(B, S, d)
+    vectors = torch.randn(B * k, d)
+    prompt_lens = torch.tensor([plen, plen])
+
+    out = inject_multislot_in_residual(ids, resid, vectors, INJ, k, prompt_lens=prompt_lens)
+
+    vec_idx = 0
+    for b in range(B):
+        for p in sorted(prompt_marker[b]):                     # exactly the 3 prompt slots
+            v = vectors[vec_idx]
+            expected = resid[b, p] + resid[b, p].norm() * v / (v.norm() + 1e-9)
+            assert torch.allclose(out[b, p], expected, atol=1e-5), f"prompt slot ({b},{p}) wrong"
+            vec_idx += 1
+    assert vec_idx == B * k
+    for p in [6, 8, 9, 10, 11, 12]:                            # response markers NOT injected
+        assert torch.equal(out[0, p], resid[0, p]), f"response marker pos {p} was injected"
+
+
+def test_unbounded_counts_response_markers_and_raises():
+    """Without prompt_lens the same row-0 sequence has 9 markers -> count guard fires.
+    (Pre-fix behavior; prompt-bounding is what makes RL full-sequence scoring safe.)"""
+    B, S, d, k = 2, 14, 8, 3
+    ids = torch.zeros(B, S, dtype=torch.long)
+    ids[0, [1, 3, 5]] = INJ; ids[0, [6, 8, 9, 10, 11, 12]] = INJ   # 9 total
+    ids[1, [0, 2, 4]] = INJ                                        # 3
+    try:
+        inject_multislot_in_residual(ids, torch.randn(B, S, d), torch.randn(B * k, d), INJ, k)
+        raise AssertionError("expected RuntimeError on 9 markers without prompt bounding")
+    except RuntimeError as e:
+        assert "exactly k=3" in str(e)
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

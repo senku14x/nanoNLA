@@ -44,14 +44,16 @@ def cjk_fraction(text: str) -> float:
     return sum(1 for c in text if "CJK" in unicodedata.name(c, "")) / len(text)
 
 
-def av_compute_loss(model, batch_ids, attn, loss_mask, vectors, vectors_ref):
+def av_compute_loss(model, batch_ids, attn, loss_mask, vectors, vectors_ref, prompt_lens=None):
     """Forward with the three-slot injection active, CE on response tokens only.
 
     Factored out so it can be plumbing-tested on a tiny model: sets vectors_ref
     for the hook, forwards, shifts-by-one, masks to the response, returns
     (loss, n_response_tokens). The hook reads vectors_ref[0]; we always clear it.
+    prompt_lens (optional) bounds injection to the prompt span (the gold response is
+    marker-free, so harmless here — it keeps the payload protocol identical to RL).
     """
-    vectors_ref[0] = vectors
+    vectors_ref[0] = {"vectors": vectors, "prompt_lens": prompt_lens}
     try:
         logits = model(input_ids=batch_ids, attention_mask=attn).logits.float()
     finally:
@@ -174,9 +176,9 @@ def main():
                 rng.shuffle(perm); cursor = 0
             chunk = [rows[i] for i in perm[cursor:cursor + args.batch_size]]
             cursor += args.batch_size
-            ids, attn, loss_mask, vectors = prepare_av_chunk_multi(
+            ids, attn, loss_mask, vectors, plens = prepare_av_chunk_multi(
                 chunk, tokenizer, inject_char, inj_id, device, max_len=args.max_len)
-            loss, n_resp = av_compute_loss(model, ids, attn, loss_mask, vectors, vectors_ref)
+            loss, n_resp = av_compute_loss(model, ids, attn, loss_mask, vectors, vectors_ref, plens)
             (loss / grad_accum).backward()
             accum_loss += loss.item(); accum_resp += n_resp
         grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)

@@ -61,17 +61,18 @@ def test_group_advantages_normalize_per_group():
     assert torch.isfinite(adv).all()
 
 
-def test_rollout_suppresses_marker_token():
-    """The actor must never emit the injection marker — rollout_multislot must pass
-    suppress_tokens=[inj_id] to generate(), or a stray marker in the response makes
-    the training-forward see != k markers (the crash this fixes). Fake actor/tokenizer,
+def test_rollout_payload_is_prompt_bounded_no_suppress():
+    """rollout_multislot must (a) set the {vectors, prompt_lens} payload so injection is
+    bounded to the prompt span, and (b) NOT pass suppress_tokens (which would renormalize
+    the sampled token prob and desync GRPO old/new/ref log-probs). Fake actor/tokenizer,
     no model."""
     INJ = 9
+    vref = [None]
 
     class FakeTok:
         eos_token_id = 0
         def encode(self, s, add_special_tokens=False):
-            return [5, 6, 7]
+            return [5, 6, 7]                       # plen = 3
         def decode(self, ids, skip_special_tokens=True):
             return "resp"
 
@@ -79,21 +80,24 @@ def test_rollout_suppresses_marker_token():
         pass
 
     class FakeActor:
-        def __init__(self):
-            self.kw = None
+        def __init__(self, vref):
+            self.vref = vref; self.kw = None; self.payload = None
         def generate(self, **kw):
             self.kw = kw
+            self.payload = self.vref[0]            # rollout set this right before generate
             G = kw["input_ids"].shape[0]
             o = FakeGen()
             o.sequences = torch.cat([kw["input_ids"], torch.tensor([[8, 0]] * G)], dim=1)
             o.logits = (torch.zeros(G, 16), torch.zeros(G, 16))
             return o
 
-    actor = FakeActor()
-    acts3 = [[0.1] * 4, [0.2] * 4, [0.3] * 4]  # [3, d]
-    out = rollout_multislot(actor, FakeTok(), "prompt", acts3, [None], INJ,
-                            2, 2, 1.0, "cpu", {0})
-    assert actor.kw["suppress_tokens"] == [INJ], "rollout must suppress the marker token"
+    actor = FakeActor(vref)
+    acts3 = [[0.1] * 4, [0.2] * 4, [0.3] * 4]      # [3, d]
+    out = rollout_multislot(actor, FakeTok(), "prompt", acts3, vref, INJ, 2, 2, 1.0, "cpu", {0})
+    assert isinstance(actor.payload, dict) and "vectors" in actor.payload
+    assert actor.payload["prompt_lens"].tolist() == [3, 3]     # plen=3, group_size=2
+    assert "suppress_tokens" not in actor.kw                   # reverted; injection is prompt-bounded
+    assert vref[0] is None                                     # cleared after the forward
     assert len(out) == 2 and all("full_ids" in r and "old_logp" in r for r in out)
 
 

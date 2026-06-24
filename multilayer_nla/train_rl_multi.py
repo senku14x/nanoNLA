@@ -132,31 +132,31 @@ def rollout_multislot(actor, tokenizer, prompt_text, acts3, vectors_ref, inj_id,
     markers of every sample. acts3: [3, d]. Returns per-sample dicts."""
     prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
     prompt_t = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+    plen = prompt_t.shape[1]
     batched = prompt_t.expand(group_size, -1).contiguous()
     # [G, 3, d] -> [G*3, d] example-major: matches the row-major 3-marker scan.
     v = torch.as_tensor(acts3, dtype=torch.float32, device=device)
     v_batch = v.unsqueeze(0).expand(group_size, -1, -1).reshape(group_size * N_SLOTS, -1).contiguous()
-    vectors_ref[0] = v_batch
+    # Injection is bounded to the prompt span (prompt_lens). generate() injects only on
+    # the prefill (the prompt; response tokens are cache steps where the hook no-ops),
+    # so the whole prefill is the prompt. We deliberately do NOT suppress the marker
+    # during sampling: that renormalizes the sampled token's probability and would
+    # desync old/new/ref log-probs in GRPO. A marker the actor emits in the response is
+    # simply not an injection site (prompt-bounded), and a degenerate marker-spamming
+    # response just earns poor reward.
+    vectors_ref[0] = {"vectors": v_batch,
+                      "prompt_lens": torch.full((group_size,), plen, dtype=torch.long, device=device)}
     try:
         gen = actor.generate(
             input_ids=batched, attention_mask=torch.ones_like(batched),
             max_new_tokens=max_new_tokens, do_sample=True, temperature=temperature,
             top_p=1.0, top_k=0, repetition_penalty=1.0,
-            # The actor must NEVER emit the injection marker: a stray marker in the
-            # generated response makes the training-forward (over prompt+response)
-            # see != k markers, which the injection hook hard-rejects. An undertrained
-            # or occasionally-unlucky actor WILL emit it over many rollouts. Suppress
-            # it at the source. Safe for GRPO: output_logits=True returns RAW
-            # pre-processor logits, so old_logp is unaffected (suppression only
-            # constrains which tokens get sampled, never the marker among them).
-            suppress_tokens=[inj_id],
             pad_token_id=tokenizer.eos_token_id,
             return_dict_in_generate=True, output_logits=True,
         )
     finally:
         vectors_ref[0] = None
     full_ids, scores = gen.sequences, gen.logits
-    plen = prompt_t.shape[1]
     out = []
     for g in range(group_size):
         resp_ids = full_ids[g, plen:].tolist()
@@ -218,14 +218,19 @@ def _grpo_update(actor, optim, tokenizer, full_ids_list, prompt_lens, acts_list,
         # vectors: each row's 3 acts -> [bs*3, d] example-major
         v = torch.stack([torch.as_tensor(acts_list[i], dtype=torch.float32, device=device) for i in idxs])
         v_batch = v.reshape(bs * N_SLOTS, -1)
+        # Bound injection to each row's prompt span: this forward is over prompt+response,
+        # but rollout injected ONLY at the prompt prefill — markers in the generated
+        # response are NOT injection sites (and would otherwise trip the count guard).
+        plens_t = torch.tensor([prompt_lens[i] for i in idxs], dtype=torch.long, device=device)
+        payload = {"vectors": v_batch, "prompt_lens": plens_t}
 
-        vectors_ref[0] = v_batch
+        vectors_ref[0] = payload
         try:
             new_logits = actor(input_ids=batch_ids, attention_mask=attn).logits
         finally:
             vectors_ref[0] = None
         new_logp = F.log_softmax(new_logits.float(), -1)
-        vectors_ref[0] = v_batch
+        vectors_ref[0] = payload
         try:
             with torch.no_grad():
                 actor.set_adapter("reference")

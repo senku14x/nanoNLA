@@ -185,7 +185,11 @@ def load_av_sft_dataset(parquet_path: str, n_max: int | None = None) -> list[dic
 
 def prepare_av_chunk_multi(rows: list[dict], tokenizer, inject_char: str, inj_id: int,
                            device, *, max_len: int = 1024, k: int = N_SLOTS):
-    """Build (input_ids, attn, loss_mask, vectors[B*k, d]) for a multi-slot AV-SFT batch.
+    """Build (input_ids, attn, loss_mask, vectors[B*k, d], prompt_lens[B]) for a multi-slot AV-SFT batch.
+
+    prompt_lens lets the injection hook bound injection to the prompt span (the gold
+    response is marker-free, so it's belt-and-suspenders here, but keeps the payload
+    protocol identical to RL).
 
     - prompt: chat-templated, with INJECT_PLACEHOLDER x k swapped to inject_char.
     - per-example guard: assert exactly k marker tokens in the prompt (complements
@@ -229,7 +233,8 @@ def prepare_av_chunk_multi(rows: list[dict], tokenizer, inject_char: str, inj_id
         loss_mask[i, prompt_lens[i]:L] = 1  # response-only (in target-token space; CE shift applied in loss)
 
     vectors = torch.tensor(stack_slot_vectors(rows, k), dtype=torch.float32, device=device)
-    return batch_ids, attn, loss_mask, vectors
+    prompt_lens_t = torch.tensor(prompt_lens, dtype=torch.long, device=device)
+    return batch_ids, attn, loss_mask, vectors, prompt_lens_t
 
 
 # ---- AR-SFT: text z -> three activations ----
