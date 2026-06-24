@@ -209,3 +209,74 @@ def prepare_av_chunk_multi(rows: list[dict], tokenizer, inject_char: str, inj_id
 
     vectors = torch.tensor(stack_slot_vectors(rows, k), dtype=torch.float32, device=device)
     return batch_ids, attn, loss_mask, vectors
+
+
+# ---- AR-SFT: text z -> three activations ----
+# Suffix-anchored critic prompt (plan §6.2): the AR reads ONLY the explanation,
+# formatted into this template ending in a fixed suffix, and taps the LAST token.
+# No marker / injection on the AR side.
+AR_CRITIC_TEMPLATE = "<text>{explanation}</text> <summary>"
+
+
+def fill_ar_prompt(explanation: str) -> str:
+    return AR_CRITIC_TEMPLATE.format(explanation=explanation)
+
+
+def load_ar_sft_dataset(parquet_path: str, n_max: int | None = None) -> list[dict]:
+    """Load AR-SFT rows: prompt (filled critic text, str) + 3 activations."""
+    cols = ["prompt", *SLOT_COLUMNS]
+    pf = pq.ParquetFile(parquet_path)
+    rows: list[dict] = []
+    for rg_idx in range(pf.num_row_groups):
+        if n_max is not None and len(rows) >= n_max:
+            break
+        rg = pf.read_row_group(rg_idx, columns=cols)
+        take = rg.num_rows if n_max is None else min(n_max - len(rows), rg.num_rows)
+        rg = rg.slice(0, take)
+        prompts = rg.column("prompt").to_pylist()
+
+        def to_np(name):
+            col = rg.column(name).combine_chunks()
+            return (col.flatten().to_numpy(zero_copy_only=False)
+                    .astype(np.float32).reshape(len(col), -1))
+
+        acts = {c: to_np(c) for c in SLOT_COLUMNS}
+        for i in range(take):
+            rows.append({"prompt": prompts[i], **{c: acts[c][i] for c in SLOT_COLUMNS}})
+    return rows
+
+
+def prepare_ar_chunk_multi(rows: list[dict], tokenizer, device, *, max_len: int = 1024):
+    """(input_ids, attn, gold[B, N_SLOTS, d]) for an AR-SFT batch.
+
+    Critic prompt tokenized with add_special_tokens=False (matches RL-time
+    scoring; True would prepend BOS on Llama/Gemma -> train/reward mismatch).
+    Over-length rows are SKIPPED (right-truncation would cut the <summary>
+    suffix and the last-token tap would land mid-text). gold is the three RAW
+    activations stacked [prev, centre, next] — normalized in the loss.
+    """
+    ids_list, kept = [], []
+    n_skipped = 0
+    for row in rows:
+        ids = tokenizer.encode(row["prompt"], add_special_tokens=False)
+        if len(ids) > max_len:
+            n_skipped += 1
+            continue
+        ids_list.append(torch.tensor(ids, dtype=torch.long))
+        kept.append(row)
+    assert ids_list, f"all {len(rows)} AR rows exceeded max_len={max_len}"
+    if n_skipped:
+        print(f"[ar] skipped {n_skipped}/{len(rows)} rows over max_len (suffix anchor)")
+    bs = len(ids_list)
+    T = max(t.numel() for t in ids_list)
+    pad = tokenizer.eos_token_id
+    batch_ids = torch.full((bs, T), pad, dtype=torch.long, device=device)
+    attn = torch.zeros((bs, T), dtype=torch.long, device=device)
+    for i, t in enumerate(ids_list):
+        batch_ids[i, :t.numel()] = t.to(device)
+        attn[i, :t.numel()] = 1
+    gold = torch.tensor(
+        np.stack([[np.asarray(r[c], dtype=np.float32) for c in SLOT_COLUMNS] for r in kept]),
+        dtype=torch.float32, device=device,
+    )  # [B, N_SLOTS, d]
+    return batch_ids, attn, gold
