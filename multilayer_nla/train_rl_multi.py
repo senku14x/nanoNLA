@@ -440,6 +440,9 @@ def main():
         print(f"step {step:04d} | loss {loss:.4f} | r {mean_reward:.3f} | FVE {fve_overall*100:.1f}% "
               f"| kl {kl:.4f} | clip {clip:.2%} | ext {log['extraction_rate']:.0%} | "
               f"cjk {mean_cjk:.3f} | t {log['wall_s']:.0f}s", flush=True)
+        if texts:  # show a sample rollout so extraction failures / CJK are visible
+            _s0 = texts[0][:200].replace("\n", " ")
+            print(f"    [sample extracted={expls[0] is not None}] {_s0!r}", flush=True)
         if not args.no_wandb:
             import wandb
             wandb.log(log, step=step)
