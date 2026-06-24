@@ -32,11 +32,23 @@ PUB="$DATA/published"; REGEN="$DATA/published_L${CENTER}x_window"; TRAIN="$DATA/
 mkdir -p "$PUB" "$REGEN" "$TRAIN" "$CKPT"
 
 # ── 1. download published av/ar/rl subsets (text + LABELS, no vectors) ──
+#     This is also the existence/shape GATE: it fails instantly if the dataset id,
+#     a config name, or a required column is wrong — before any GPU work. Eyeball
+#     the printed rows/columns: expect ~247k/247k/500k and detokenized_text_truncated
+#     + n_raw_tokens on all three (av: response; ar: prompt; no activation_vector).
 python - <<PY
 from datasets import load_dataset
+NEED = {"av_sft": {"response", "detokenized_text_truncated", "n_raw_tokens"},
+        "ar_sft": {"prompt", "detokenized_text_truncated", "n_raw_tokens"},
+        "rl":     {"detokenized_text_truncated", "n_raw_tokens"}}
 for name in ("av_sft", "ar_sft", "rl"):
     ds = load_dataset("$DATASET", name, split="train")
-    ds.to_parquet(f"$PUB/{name}.parquet"); print(name, ds.num_rows, flush=True)
+    ds.to_parquet(f"$PUB/{name}.parquet")
+    cols = set(ds.column_names)
+    print(f"{name}: {ds.num_rows} rows | columns = {sorted(cols)}", flush=True)
+    missing = NEED[name] - cols
+    assert not missing, f"{name} is missing expected column(s) {missing} — published schema changed?"
+print("[check] schema OK — proceeding.", flush=True)
 PY
 
 # ════════════════════════════════════════════════════════════════════
