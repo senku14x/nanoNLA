@@ -159,6 +159,35 @@ def append_layer_columns(table: pa.Table, results: list[dict], save_layers: list
     return out
 
 
+def bucketed_extract(texts, n_raw_tokens, extract_fn, *, length_bucket: bool = False):
+    """Run `extract_fn(texts)` and return results aligned to the ORIGINAL order.
+
+    When `length_bucket` is True: sort the chunk's texts ascending by `n_raw_tokens`
+    before the forward (so each internal batch holds similar-length prefixes → far
+    less dynamic-padding waste), then SCATTER the results back to their original
+    positions. The returned list is byte-identical in order and content to the
+    unbucketed path — bucketing only changes the order the extractor sees
+    internally, never the output (every activation stays attached to its source
+    row). Requires `n_raw_tokens` (aligned to `texts`) when enabled.
+
+    Pure (no model) — `extract_fn` is injected, so this is unit-testable offline.
+    """
+    if not length_bucket:
+        return extract_fn(texts)
+    assert n_raw_tokens is not None and len(n_raw_tokens) == len(texts), (
+        "--length-bucket requires the n_raw_tokens column aligned to texts"
+    )
+    order = sorted(range(len(texts)), key=lambda i: n_raw_tokens[i])  # stable ascending
+    res_sorted = extract_fn([texts[i] for i in order])
+    assert len(res_sorted) == len(texts), (
+        f"extractor returned {len(res_sorted)} results for {len(texts)} texts"
+    )
+    out = [None] * len(texts)
+    for j, i in enumerate(order):
+        out[i] = res_sorted[j]          # scatter back to the source-row position
+    return out
+
+
 def _infer_center(pf: pq.ParquetFile, explicit: int | None) -> int:
     """center-layer from CLI, else the (constant) center_layer/activation_layer column."""
     if explicit is not None:
@@ -209,6 +238,11 @@ def main() -> None:
                         "(4096 for the published datasets). Too small right-truncates long rows "
                         "and silently regenerates at the wrong position; the n_raw_tokens "
                         "round-trip check turns that into a hard error.")
+    p.add_argument("--length-bucket", action="store_true", default=False,
+                   help="sort each --chunk-size chunk by n_raw_tokens before the forward to cut "
+                        "dynamic-padding waste, then scatter results back to original order "
+                        "(output byte-identical, just faster). Requires the n_raw_tokens column. "
+                        "Bigger --chunk-size groups more aggressively.")
     p.add_argument("--no-roundtrip-check", action="store_true",
                    help="disable the n_raw_tokens round-trip guard (NOT recommended)")
     p.add_argument("--max-drop-frac", type=float, default=0.0,
@@ -287,7 +321,15 @@ def main() -> None:
                 tbl = pa.Table.from_batches([batch]).slice(o_lo - g, o_hi - o_lo)
                 n_in += tbl.num_rows
                 texts = tbl.column(TEXT_COL).to_pylist()
-                results = extractor.extract_multi(texts, save_layers, final_token_only=True)
+                nrt = (tbl.column("n_raw_tokens").to_pylist()
+                       if "n_raw_tokens" in tbl.schema.names else None)
+                # length-bucket the forward (if enabled), then results come back in
+                # ORIGINAL row order — append_layer_columns + the table stay aligned.
+                results = bucketed_extract(
+                    texts, nrt,
+                    lambda t: extractor.extract_multi(t, save_layers, final_token_only=True),
+                    length_bucket=args.length_bucket,
+                )
                 tbl = append_layer_columns(
                     tbl, results, save_layers, d_model,
                     check_roundtrip=not args.no_roundtrip_check,

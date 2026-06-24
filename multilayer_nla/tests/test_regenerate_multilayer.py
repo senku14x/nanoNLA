@@ -11,6 +11,7 @@ import pyarrow as pa
 
 from multilayer_nla.regenerate_multilayer_activations import (
     append_layer_columns,
+    bucketed_extract,
     layer_col,
     parse_layers,
 )
@@ -165,6 +166,45 @@ def test_gather_last_real_token_equals_slice_last():
     gathered = captured[bidx, last]                  # the fix
     for i in range(B):
         assert torch.allclose(gathered[i], captured[i, : lengths[i]][-1])
+
+
+def test_length_bucket_preserves_order_and_content():
+    # the forward sees ascending-by-n_raw_tokens order; output is original order +
+    # identical content (no row lost/duplicated, each result stays on its source row).
+    texts = ["aaaaa", "b", "ccccccccc", "ddd"]   # lengths 5, 1, 9, 3
+    nrt = [5, 1, 9, 3]
+    seen = []
+
+    def toy(ts):
+        seen.append(list(ts))
+        return [{"tok": t, "hidden": {24: [float(len(t))]}} for t in ts]
+
+    unb = bucketed_extract(texts, nrt, toy, length_bucket=False)
+    buc = bucketed_extract(texts, nrt, toy, length_bucket=True)
+    assert seen[1] == ["b", "ddd", "aaaaa", "ccccccccc"]   # forward got sorted order
+    assert [r["tok"] for r in unb] == texts                # original order
+    assert [r["tok"] for r in buc] == texts                # scattered back to original order
+    assert buc == unb                                      # identical per-row content
+    assert len(buc) == len(texts) and len({r["tok"] for r in buc}) == len(texts)  # no loss/dup
+
+
+def test_length_bucket_is_stable_on_ties():
+    # equal n_raw_tokens must keep relative order (stable sort) so ties are reproducible
+    texts = ["x1", "x2", "x3"]
+    nrt = [7, 7, 7]
+    seen = []
+    bucketed_extract(texts, nrt, lambda ts: (seen.append(list(ts)) or [{"t": t} for t in ts]),
+                     length_bucket=True)
+    assert seen[0] == ["x1", "x2", "x3"]
+
+
+def test_length_bucket_requires_n_raw_tokens():
+    try:
+        bucketed_extract(["a", "b"], None, lambda t: [{} for _ in t], length_bucket=True)
+    except AssertionError as e:
+        assert "n_raw_tokens" in str(e)
+    else:
+        raise AssertionError("expected failure when n_raw_tokens is missing")
 
 
 def test_parse_layers():
