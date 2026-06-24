@@ -111,6 +111,26 @@ def test_heads_are_trainable_and_distinct():
     assert all(p.requires_grad for p in model.heads.parameters())
 
 
+def test_logits_to_keep_preserves_decoder_layer_outputs():
+    """regen passes logits_to_keep=1 to skip the all-position lm_head logits (~60GB +
+    a big vocab matmul at S=4096). The decoder hidden states the hooks capture MUST be
+    unchanged — that's what makes the speedup safe (bitwise-identical taps)."""
+    from transformers import LlamaConfig, LlamaForCausalLM
+    torch.manual_seed(0)
+    cfg = LlamaConfig(vocab_size=128, hidden_size=16, intermediate_size=32,
+                      num_hidden_layers=6, num_attention_heads=2, num_key_value_heads=2)
+    m = LlamaForCausalLM(cfg).eval()
+    ids = torch.randint(0, 120, (2, 7))
+    cap = []
+    h = m.model.layers[3].register_forward_hook(
+        lambda _mod, _in, out: cap.append((out[0] if isinstance(out, tuple) else out).clone()))
+    with torch.no_grad():
+        m(input_ids=ids)                       # full forward (all-position logits)
+        m(input_ids=ids, logits_to_keep=1)     # last-token logits only (the regen path)
+    h.remove()
+    assert torch.allclose(cap[0], cap[1], atol=0), "logits_to_keep changed a decoder layer output"
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

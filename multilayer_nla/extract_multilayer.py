@@ -116,7 +116,15 @@ class MultiLayerHFExtractor(HFExtractor):
             attention_mask = enc["attention_mask"].to(device)
 
             self._captured_multi = {}
-            self.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+            # logits_to_keep=1: compute lm_head logits for ONLY the last position, not
+            # all S. We never use the logits (the hooks capture decoder hidden states),
+            # but the full [B, S, 152k-vocab] logits are the dominant VRAM cost (~60GB at
+            # batch 48, S=4096) AND a large wasted matmul — collapsing them to [B, 1, V]
+            # frees the card to run a much bigger batch and speeds each forward. Decoder
+            # layer outputs (what we tap) are unchanged → captured vectors are
+            # bitwise-identical (re-verify with verify_regen_parity).
+            self.model(input_ids=input_ids, attention_mask=attention_mask,
+                       use_cache=False, logits_to_keep=1)
             for li in layer_indices:
                 assert li in self._captured_multi, (
                     f"forward hook on decoder block {li} did not fire — wrong module path?"
