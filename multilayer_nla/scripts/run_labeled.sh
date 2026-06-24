@@ -118,12 +118,18 @@ for s in av_sft ar_sft rl; do
   for i in $(seq 0 $((NUM_SHARDS-1))); do
     shard=$(printf '%s/%s.shard%02dof%02d.parquet' "$REGEN" "$s" "$i" "$NUM_SHARDS")
     [ -f "$shard" ] && { echo "skip existing $shard"; continue; }
+    # tmp+atomic-rename: an interrupted shard lands at .work_* (never the final name),
+    # so skip-existing can't mistake a partial for done — set -e aborts before the mv,
+    # and the re-run regenerates it cleanly. Safe to Ctrl-C / OOM-kill mid-shard.
+    tmp=$(printf '%s/.work_%s.shard%02dof%02d.parquet' "$REGEN" "$s" "$i" "$NUM_SHARDS")
+    rm -f "$tmp"
     python -m multilayer_nla.regenerate_multilayer_activations \
-        --in "$PUB/$s.parquet" --out "$REGEN/$s.parquet" \
+        --in "$PUB/$s.parquet" --out "$REGEN/.work_$s.parquet" \
         --base-model "$BASE" --center-layer "$CENTER" --save-layers "$SAVE_LAYERS" \
         --max-length "$MAXLEN" --max-drop-frac "$MAXDROP" --batch-size "$REGEN_BATCH" \
         --chunk-size "$CHUNK_SIZE" $BUCKET_FLAG \
         --num-shards "$NUM_SHARDS" --shard-index "$i"
+    mv -f "$tmp" "$shard"
   done
 done
 # NOTE: do NOT merge the shards — that would materialize the full ~180 GB wide
