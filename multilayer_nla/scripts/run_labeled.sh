@@ -30,11 +30,17 @@ REGEN_BATCH="${REGEN_BATCH:-24}"               # regen forward batch. H200 140GB
                                                #   Watch nvidia-smi on the first chunks; back off if it nears the cap.
 MAXDROP="${MAX_DROP_FRAC:-0.02}"               # tolerate benign detokenize->retokenize drift (~0.2% observed
                                                #   per chunk); a much higher rate = systematic error (e.g. wrong --max-length)
+LENGTH_BUCKET="${LENGTH_BUCKET:-0}"            # 1 = sort each chunk by n_raw_tokens before the forward (cuts
+                                               #   dynamic-padding waste; output byte-identical). Safe to enable mid-run —
+                                               #   already-finished shards are unchanged.
+CHUNK_SIZE="${CHUNK_SIZE:-512}"                # rows per chunk; bigger groups bucketing more aggressively (try 2048
+                                               #   with LENGTH_BUCKET=1). Memory is bounded by batch, not chunk.
 RUN_FULL="${RUN_FULL:-0}"                      # 0 = smoke only; 1 = also run the full ~1M-row pipeline
 
 DATA="${DATA:-/data/mlnla}"                    # point at your big-disk mount
 PUB="$DATA/published"; REGEN="$DATA/published_L${CENTER}x_window"; TRAIN="$DATA/labeled"; CKPT="$DATA/ckpt"
 mkdir -p "$PUB" "$REGEN" "$TRAIN" "$CKPT"
+BUCKET_FLAG=""; [ "$LENGTH_BUCKET" = "1" ] && BUCKET_FLAG="--length-bucket"
 
 # Trainers save to {save_dir}/iter_{step+1:07d}/ (the final step always saves), so
 # RL must be pointed at that subdir, not the parent. Resolve the latest one:
@@ -77,7 +83,8 @@ for s in av_sft ar_sft rl; do
   python -m multilayer_nla.regenerate_multilayer_activations \
       --in "$SMK/pub/$s.parquet" --out "$SMK/regen/$s.parquet" \
       --base-model "$BASE" --center-layer "$CENTER" --save-layers "$SAVE_LAYERS" \
-      --max-length "$MAXLEN" --max-drop-frac "$MAXDROP" --batch-size "$REGEN_BATCH"
+      --max-length "$MAXLEN" --max-drop-frac "$MAXDROP" --batch-size "$REGEN_BATCH" \
+      --chunk-size "$CHUNK_SIZE" $BUCKET_FLAG
 done   # a ~0.2% round-trip drop is EXPECTED (benign detokenize drift); a large drop = problem
 python -m multilayer_nla.build_from_published --mode all --center "$CENTER" \
       --in-dir "$SMK/regen" --out-dir "$SMK/train"
@@ -115,6 +122,7 @@ for s in av_sft ar_sft rl; do
         --in "$PUB/$s.parquet" --out "$REGEN/$s.parquet" \
         --base-model "$BASE" --center-layer "$CENTER" --save-layers "$SAVE_LAYERS" \
         --max-length "$MAXLEN" --max-drop-frac "$MAXDROP" --batch-size "$REGEN_BATCH" \
+        --chunk-size "$CHUNK_SIZE" $BUCKET_FLAG \
         --num-shards "$NUM_SHARDS" --shard-index "$i"
   done
 done
