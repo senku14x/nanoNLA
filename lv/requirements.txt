@@ -1,4 +1,0 @@
-# CPU-only deps: pure-math core + sidecar/config handling + self-tests.
-# These are all that is needed to run `bash scripts/run_tests.sh`.
-numpy>=1.26
-pyyaml>=6.0

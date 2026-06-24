@@ -1,1 +1,0 @@
-[critic] layers=25 d_model=4096 mse_scale=64.00
