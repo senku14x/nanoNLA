@@ -28,6 +28,8 @@ SPLIT_SEED="${SPLIT_SEED:-42}"
 DEV_SUBSET="${DEV_SUBSET:-256}"                   # locked dev docs for ckpt selection (cheap)
 TEST_SUBSET="${TEST_SUBSET:-1000}"               # locked test docs for the one-shot final eval
 STEPS="${STEPS:-1000}"; SAVE_EVERY="${SAVE_EVERY:-500}"   # ckpts at 500 and 1000
+EVAL_BATCH="${EVAL_BATCH:-64}"                    # generation batch for the e2e/AR-gold eval
+                                                  #   (pure speed knob — results identical; H200 fits 128-256)
 AR_TAPS="23,24,25"                                # AR reconstruction target — FIXED for every condition
 CONDS=(local duplicate wide single)
 mkdir -p "$SWEEP" "$CKPT" "$EVAL"
@@ -78,7 +80,7 @@ for c in "${CONDS[@]}"; do
       S="$EVAL/dev/dev_${c}_ar${ars}_av${avs}.json"
       [ -f "$S" ] || python -m multilayer_nla.evaluate_e2e --base-ckpt "$BASE" \
           --av-ckpt "$(iterdir "$CKPT/av_$c" "$avs")" --ar-ckpt "$(iterdir "$CKPT/ar" "$ars")" \
-          --eval-parquet "$SWEEP/rl_dev_$c.parquet" --condition "$c" \
+          --eval-parquet "$SWEEP/rl_dev_$c.parquet" --condition "$c" --batch-size "$EVAL_BATCH" \
           --out "$EVAL/dev/dev_${c}_ar${ars}_av${avs}.jsonl" --summary "$S" --seed "$SEED"
     done
   done
@@ -96,13 +98,13 @@ for c in "${CONDS[@]}"; do
   vn="CHOSEN_AV_${c^^}_STEP"; avstep="${!vn}"
   [ -f "$EVAL/test/test_$c.json" ] || python -m multilayer_nla.evaluate_e2e --base-ckpt "$BASE" \
       --av-ckpt "$(iterdir "$CKPT/av_$c" "$avstep")" --ar-ckpt "$ARSEL" \
-      --eval-parquet "$SWEEP/rl_test_$c.parquet" --condition "$c" \
+      --eval-parquet "$SWEEP/rl_test_$c.parquet" --condition "$c" --batch-size "$EVAL_BATCH" \
       --out "$EVAL/test/test_$c.jsonl" --summary "$EVAL/test/test_$c.json" --seed "$SEED"
 done
 [ -f "$EVAL/test/ar_gold_dev.json" ]  || python -m multilayer_nla.eval_ar_gold --base-ckpt "$BASE" \
-    --ar-ckpt "$ARSEL" --eval-parquet "$SWEEP/ar_dev.parquet"  --summary "$EVAL/test/ar_gold_dev.json"
+    --ar-ckpt "$ARSEL" --eval-parquet "$SWEEP/ar_dev.parquet"  --summary "$EVAL/test/ar_gold_dev.json" --batch-size "$EVAL_BATCH"
 [ -f "$EVAL/test/ar_gold_test.json" ] || python -m multilayer_nla.eval_ar_gold --base-ckpt "$BASE" \
-    --ar-ckpt "$ARSEL" --eval-parquet "$SWEEP/ar_test.parquet" --summary "$EVAL/test/ar_gold_test.json"
+    --ar-ckpt "$ARSEL" --eval-parquet "$SWEEP/ar_test.parquet" --summary "$EVAL/test/ar_gold_test.json" --batch-size "$EVAL_BATCH"
 
 # ── 11. result table — STOP (no RL) ──
 python -m multilayer_nla.select_and_report --mode report --test-dir "$EVAL/test" \
