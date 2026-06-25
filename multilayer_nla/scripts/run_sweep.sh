@@ -37,28 +37,37 @@ iterdir() { printf '%s/iter_%07d' "$1" "$2"; }    # trainers save to iter_{step+
 SFT_COMMON=(--base-ckpt "$BASE" --use-lora --quant none --num-steps "$STEPS" \
             --save-every "$SAVE_EVERY" --seed "$SEED" --wandb-project "$WANDB_PROJECT")
 
+# Each step skips if its output already exists, so a re-run RESUMES after a crash/OOM.
+
 # ── 1. document-level splits (rl for end-to-end, ar for AR-only gold) ──
-python -m multilayer_nla.splits --source "$REGEN/rl.shard*of*.parquet" --name rl \
-    --out-dir "$SWEEP" --seed "$SPLIT_SEED" --fracs 0.8,0.1,0.1 \
-    --dev-subset "$DEV_SUBSET" --test-subset "$TEST_SUBSET"
-python -m multilayer_nla.splits --source "$REGEN/ar_sft.shard*of*.parquet" --name ar \
-    --out-dir "$SWEEP" --seed "$SPLIT_SEED" --fracs 0.8,0.1,0.1
+[ -f "$SWEEP/rl_split_manifest.json" ] || \
+  python -m multilayer_nla.splits --source "$REGEN/rl.shard*of*.parquet" --name rl \
+      --out-dir "$SWEEP" --seed "$SPLIT_SEED" --fracs 0.8,0.1,0.1 \
+      --dev-subset "$DEV_SUBSET" --test-subset "$TEST_SUBSET"
+[ -f "$SWEEP/ar_split_manifest.json" ] || \
+  python -m multilayer_nla.splits --source "$REGEN/ar_sft.shard*of*.parquet" --name ar \
+      --out-dir "$SWEEP" --seed "$SPLIT_SEED" --fracs 0.8,0.1,0.1
 
 # ── 2. build datasets (ar_common/dev/test, av_<cond>, rl_dev/test_<cond>) + preflight ──
-python -m multilayer_nla.build_sweep --mode all --in-dir "$REGEN" --out-dir "$SWEEP" \
-    --rl-split-manifest "$SWEEP/rl_split_manifest.json" \
-    --ar-split-manifest "$SWEEP/ar_split_manifest.json" --ar-target-layers "$AR_TAPS" \
-    --base-ckpt "$BASE"
+#     The preflight HALTS the run on any data defect (layer placement, marker count,
+#     fixed-target drift, split leak) — a green build means the datasets are correct.
+[ -f "$SWEEP/sweep_build_manifest.json" ] || \
+  python -m multilayer_nla.build_sweep --mode all --in-dir "$REGEN" --out-dir "$SWEEP" \
+      --rl-split-manifest "$SWEEP/rl_split_manifest.json" \
+      --ar-split-manifest "$SWEEP/ar_split_manifest.json" --ar-target-layers "$AR_TAPS" \
+      --base-ckpt "$BASE" --allow-existing
 
 # ── 3. shared AR (train once on ar_train; gold dev FVE logged during training) ──
-python -m multilayer_nla.train_ar_multi "${SFT_COMMON[@]}" --parquet "$SWEEP/ar_common.parquet" \
-    --save-dir "$CKPT/ar" --tap-layers "$AR_TAPS" --eval-parquet "$SWEEP/ar_dev.parquet" \
-    --wandb-name ar-shared
+[ -d "$(iterdir "$CKPT/ar" "$STEPS")" ] || \
+  python -m multilayer_nla.train_ar_multi "${SFT_COMMON[@]}" --parquet "$SWEEP/ar_common.parquet" \
+      --save-dir "$CKPT/ar" --tap-layers "$AR_TAPS" --eval-parquet "$SWEEP/ar_dev.parquet" \
+      --wandb-name ar-shared
 
 # ── 4-7. four AV conditions (matched settings; the condition lives in the data) ──
 for c in "${CONDS[@]}"; do
-  python -m multilayer_nla.train_av_multi "${SFT_COMMON[@]}" --parquet "$SWEEP/av_$c.parquet" \
-      --save-dir "$CKPT/av_$c" --wandb-name "av-$c"
+  [ -d "$(iterdir "$CKPT/av_$c" "$STEPS")" ] || \
+    python -m multilayer_nla.train_av_multi "${SFT_COMMON[@]}" --parquet "$SWEEP/av_$c.parquet" \
+        --save-dir "$CKPT/av_$c" --wandb-name "av-$c"
 done
 
 # ── 8. dev end-to-end eval grid: AR {500,1000} x AV {500,1000} x condition ──
@@ -66,11 +75,11 @@ mkdir -p "$EVAL/dev"
 for c in "${CONDS[@]}"; do
   for ars in "$SAVE_EVERY" "$STEPS"; do
     for avs in "$SAVE_EVERY" "$STEPS"; do
-      python -m multilayer_nla.evaluate_e2e --base-ckpt "$BASE" \
+      S="$EVAL/dev/dev_${c}_ar${ars}_av${avs}.json"
+      [ -f "$S" ] || python -m multilayer_nla.evaluate_e2e --base-ckpt "$BASE" \
           --av-ckpt "$(iterdir "$CKPT/av_$c" "$avs")" --ar-ckpt "$(iterdir "$CKPT/ar" "$ars")" \
           --eval-parquet "$SWEEP/rl_dev_$c.parquet" --condition "$c" \
-          --out "$EVAL/dev/dev_${c}_ar${ars}_av${avs}.jsonl" \
-          --summary "$EVAL/dev/dev_${c}_ar${ars}_av${avs}.json" --seed "$SEED"
+          --out "$EVAL/dev/dev_${c}_ar${ars}_av${avs}.jsonl" --summary "$S" --seed "$SEED"
     done
   done
 done
@@ -85,15 +94,15 @@ mkdir -p "$EVAL/test"
 ARSEL="$(iterdir "$CKPT/ar" "$CHOSEN_AR_STEP")"
 for c in "${CONDS[@]}"; do
   vn="CHOSEN_AV_${c^^}_STEP"; avstep="${!vn}"
-  python -m multilayer_nla.evaluate_e2e --base-ckpt "$BASE" \
+  [ -f "$EVAL/test/test_$c.json" ] || python -m multilayer_nla.evaluate_e2e --base-ckpt "$BASE" \
       --av-ckpt "$(iterdir "$CKPT/av_$c" "$avstep")" --ar-ckpt "$ARSEL" \
       --eval-parquet "$SWEEP/rl_test_$c.parquet" --condition "$c" \
       --out "$EVAL/test/test_$c.jsonl" --summary "$EVAL/test/test_$c.json" --seed "$SEED"
 done
-python -m multilayer_nla.eval_ar_gold --base-ckpt "$BASE" --ar-ckpt "$ARSEL" \
-    --eval-parquet "$SWEEP/ar_dev.parquet"  --summary "$EVAL/test/ar_gold_dev.json"
-python -m multilayer_nla.eval_ar_gold --base-ckpt "$BASE" --ar-ckpt "$ARSEL" \
-    --eval-parquet "$SWEEP/ar_test.parquet" --summary "$EVAL/test/ar_gold_test.json"
+[ -f "$EVAL/test/ar_gold_dev.json" ]  || python -m multilayer_nla.eval_ar_gold --base-ckpt "$BASE" \
+    --ar-ckpt "$ARSEL" --eval-parquet "$SWEEP/ar_dev.parquet"  --summary "$EVAL/test/ar_gold_dev.json"
+[ -f "$EVAL/test/ar_gold_test.json" ] || python -m multilayer_nla.eval_ar_gold --base-ckpt "$BASE" \
+    --ar-ckpt "$ARSEL" --eval-parquet "$SWEEP/ar_test.parquet" --summary "$EVAL/test/ar_gold_test.json"
 
 # ── 11. result table — STOP (no RL) ──
 python -m multilayer_nla.select_and_report --mode report --test-dir "$EVAL/test" \
