@@ -1,0 +1,36 @@
+# Multi-layer NLA — frozen run parameters (plan Rev 2, §3/§4/§5/§12.6).
+# This file is a provenance reference for the Stage 0 / Stage 1 (pre-NLA) scripts;
+# the scripts are plain CLIs (see multilayer_nla/README.md for exact invocations).
+# Copy + edit the head; keep the seeds fixed once a reportable run starts.
+
+base_model: Qwen/Qwen3-8B          # 36 layers; d_model 4096
+center_layer: 24                   # 2/3 depth; triplet = {23, 24, 25}. "Legacy layer-24"
+                                   #   anchor for the center-tap parity check (§12.5 step 1).
+# Optional §5 layer-selection sweep: re-extract + re-probe per candidate center.
+# Frozen primary path is 24; the others are diagnostics, not the committed choice.
+candidate_centers: [20, 22, 24, 26, 28]
+
+corpus:
+  name: HuggingFaceFW/fineweb      # or m-a-p/FineFineWeb, or a local .parquet
+  config: sample-10BT
+  split: train
+  text_column: text
+  start: 0
+  length: 100000                   # docs; smoke: 2000-5000 (plan §3)
+
+stage0:                            # extract_multilayer.py
+  positions_per_doc: 10
+  chunk_size: 256
+  seed: 42                         # position-sampling seed (keyed per doc_id)
+  keep_text: true                  # needed later for the §9 tail-text baseline
+  extractor_kwargs: {batch_size: 12, max_length: 4096}
+
+stage1_headroom:                   # headroom.py (Gate 0)
+  dev_frac: 0.2
+  split_seed: 0                    # doc-level dev split; pre-register & keep fixed
+  ridge_lambda_grid: [0.1, 1.0, 10.0, 100.0, 1000.0]
+  gate0_headroom_min: 0.05         # STOP iff H_unique < 0.05 (plan §13)
+
+# Reminder (plan §15): this phase makes NO safety / faithfulness / mechanism claims.
+# Stage 2 (AV 3-slot injection, multi-tap AR, Conditions A-D, RL) is NOT built yet —
+# it starts only if Gate 0 returns GO.

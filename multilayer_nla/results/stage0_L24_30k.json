@@ -1,0 +1,73 @@
+{
+  "phase": "FineWeb Multi-Layer NLA \u2014 Stage 0 extraction + parity gate",
+  "plan_revision": "Rev 2 (design frozen)",
+  "recorded_at": "2026-06-24T03:31:23.680025+00:00",
+  "code_commit": "cddc4ec",
+  "branch": "multilayer_working",
+  "host": "vast.ai H200 instance (C.42301536); 141 GB VRAM, ~250 GB system RAM",
+  "model": "Qwen/Qwen3-8B",
+  "center_layer": 24,
+  "layer_triplet": [
+    23,
+    24,
+    25
+  ],
+  "d_model": 4096,
+  "stage0_extract": {
+    "status": "done",
+    "corpus": "HuggingFaceFW/fineweb",
+    "corpus_config": "sample-10BT",
+    "corpus_length": 30000,
+    "positions_per_doc": 10,
+    "seed": 42,
+    "extractor_kwargs": {
+      "batch_size": 24,
+      "max_length": 1024
+    },
+    "keep_text": false,
+    "rows": 299755,
+    "docs_skipped": 13,
+    "docs_short_sampled": 33,
+    "n_chunks": 118,
+    "chunk_size": 256,
+    "output_parquet": "/data/mlnla/qwen3_8b_L24_1k/base_multilayer.parquet",
+    "sidecar": "/data/mlnla/qwen3_8b_L24_1k/base_multilayer.parquet.mlnla_meta.yaml",
+    "sidecar_note": "full \u00a712.6 run manifest (commit, tokenizer hash, package versions incl. pinned transformers) is captured ON THE HOST in the sidecar above, not duplicated here"
+  },
+  "verify_center_parity": {
+    "status": "PASS",
+    "max_abs_diff": 0.0,
+    "atol": 0,
+    "n_positions": 5951,
+    "n_docs": 16,
+    "note": "center tap is bitwise-identical to legacy single-layer layer-24 extraction (plan \u00a712.5 step 1). Every downstream FVE rides on the real layer-24 vector."
+  },
+  "headroom_probe": {
+    "status": "pending",
+    "reason": "deferred by operator until after higher-priority training runs",
+    "gate0": "H_unique = 1 - max(FVE_delta_ridge, FVE_delta_mlp) on dev; STOP/pivot iff H_unique < 0.05 (plan \u00a75.1, \u00a713)",
+    "command": "python -m multilayer_nla.headroom --parquet /data/mlnla/qwen3_8b_L24_1k/base_multilayer.parquet --out-json /data/mlnla/qwen3_8b_L24_1k/headroom_L24.json"
+  },
+  "gates": {
+    "step1_center_parity": "PASS",
+    "gate0_headroom": "PENDING"
+  },
+  "performance": {
+    "wall_clock_s": 2367,
+    "wall_clock_human": "39:27",
+    "s_per_chunk": 20.07,
+    "docs_per_s": 12.67,
+    "patches_per_s": 126.6,
+    "observed_vram_gb": "~40 (heavily underutilized on a 141 GB H200)",
+    "optimization_headroom": [
+      "raise batch_size (24 -> 96+ at max_length 1024; size for worst-case all-max-length batch)",
+      "add length-bucketed batching to MultiLayerHFExtractor to kill padding waste (~1.5-3x, correctness-preserving)",
+      "multi-GPU shard wrapper (keyed RNG already makes disjoint --corpus-start slices bit-reproducible) for the eventual 100k corpus"
+    ]
+  },
+  "notes": [
+    "RAW vectors stored (norm=none); sqrt(d)-normalization is applied only downstream in the headroom probe (FVE) and later as AR target.",
+    "299,755 patches = 30000 docs - 13 skipped, minus a small deficit from 33 short-sampled docs (<10 valid positions each).",
+    "This phase makes NO safety / faithfulness / mechanism claims (plan \u00a715); it is architecture validation on passive FineWeb activations."
+  ]
+}
