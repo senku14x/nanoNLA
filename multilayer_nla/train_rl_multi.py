@@ -28,7 +28,9 @@ import torch.nn.functional as F
 
 from nla.schema import compute_predict_mean_baselines, normalize_activation
 from multilayer_nla.datasets import (
+    CONDITIONS,
     SLOT_COLUMNS,
+    apply_condition_columns,
     build_av_prompt,
     fill_ar_prompt,
 )
@@ -89,7 +91,7 @@ def grpo_surrogate(new_lp, old_lp, ref_lp, advantage, clip_eps=0.2, kl_beta=0.01
 
 # ---- data ----
 
-def load_rl_dataset_multi(parquet_path, n_max=None):
+def load_rl_dataset_multi(parquet_path, n_max=None, condition="coherent"):
     import pyarrow.parquet as pq
     pf = pq.ParquetFile(parquet_path)
     rows = []
@@ -106,7 +108,7 @@ def load_rl_dataset_multi(parquet_path, n_max=None):
             return (col.flatten().to_numpy(zero_copy_only=False)
                     .astype(np.float32).reshape(len(col), -1))
 
-        acts = {c: to_np(c) for c in SLOT_COLUMNS}
+        acts = apply_condition_columns({c: to_np(c) for c in SLOT_COLUMNS}, condition)
         for i in range(take):
             rows.append({"prompt": prompts[i], "acts": np.stack([acts[c][i] for c in SLOT_COLUMNS])})
     return rows
@@ -284,6 +286,8 @@ def main():
     p.add_argument("--base-ckpt", default="Qwen/Qwen3-8B")
     p.add_argument("--quant", choices=["none", "4bit"], default="none")
     p.add_argument("--rl-parquet", required=True)
+    p.add_argument("--condition", choices=list(CONDITIONS), default="coherent",
+                   help="§7 ablation applied to injected vectors AND reward targets (coherent | duplicate)")
     p.add_argument("--save-dir", required=True)
     p.add_argument("--num-steps", type=int, default=500)
     p.add_argument("--batch-prompts", type=int, default=16)
@@ -375,14 +379,14 @@ def main():
     critic.eval()
     print(f"[rl] critic taps={tap_layers} mse_scale={mse_scale:.3f}; loaded {len(_sd)} AR tensors")
 
-    rows = load_rl_dataset_multi(args.rl_parquet, n_max=args.max_rows)
+    rows = load_rl_dataset_multi(args.rl_parquet, n_max=args.max_rows, condition=args.condition)
     # per-tap FVE baselines
     baselines = []
     for j, c in enumerate(SLOT_COLUMNS):
         acts = torch.tensor(np.stack([r["acts"][j] for r in rows[:4000]]), dtype=torch.float32)
         _, rawvar = compute_predict_mean_baselines(acts, mse_scale)
         baselines.append(rawvar)
-    print(f"[rl] {len(rows)} rows; per-tap baselines " +
+    print(f"[rl] condition={args.condition}; {len(rows)} rows; per-tap baselines " +
           ", ".join(f"{nm}={b:.4f}" for nm, b in zip(SLOT_NAMES, baselines)))
 
     try:

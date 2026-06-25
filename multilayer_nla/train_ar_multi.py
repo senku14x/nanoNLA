@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 from nla.schema import compute_predict_mean_baselines, normalize_activation
-from multilayer_nla.datasets import SLOT_COLUMNS, load_ar_sft_dataset, prepare_ar_chunk_multi
+from multilayer_nla.datasets import CONDITIONS, SLOT_COLUMNS, load_ar_sft_dataset, prepare_ar_chunk_multi
 from multilayer_nla.models_multi import (
     DEFAULT_TAP_LAYERS,
     init_multitap_critic_from_base,
@@ -56,6 +56,32 @@ def _per_tap_baselines(rows, mse_scale):
     return bls
 
 
+@torch.no_grad()
+def evaluate_ar(model, eval_rows, tokenizer, mse_scale, baselines, device,
+                max_len, batch_size, max_batches=None):
+    """Held-out per-tap MSE + FVE (no grad). The FVE denominator is the eval set's
+    OWN predict-mean baseline (its target variance), so this is generalization FVE on
+    documents unseen in training. Returns (mse[list], fve[list], mean_loss)."""
+    was_training = model.training
+    model.eval()
+    mse_acc = torch.zeros(len(baselines), device=device)
+    loss_acc, nb = 0.0, 0
+    for cs in range(0, len(eval_rows), batch_size):
+        chunk = eval_rows[cs:cs + batch_size]
+        ids, attn, gold = prepare_ar_chunk_multi(chunk, tokenizer, device, max_len=max_len)
+        loss, pred = ar_compute_loss(model, ids, attn, gold, mse_scale)
+        mse_acc += per_tap_mse(pred, gold, mse_scale)
+        loss_acc += loss.item()
+        nb += 1
+        if max_batches and nb >= max_batches:
+            break
+    if was_training:
+        model.train()
+    mse = (mse_acc / max(nb, 1)).tolist()
+    fve = [1.0 - m / bl for m, bl in zip(mse, baselines)]
+    return mse, fve, loss_acc / max(nb, 1)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--base-ckpt", required=True)
@@ -76,6 +102,14 @@ def main():
     p.add_argument("--lora-alpha", type=int, default=16)
     p.add_argument("--strip-final-norm", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--max-rows", type=int, default=None)
+    p.add_argument("--condition", choices=list(CONDITIONS), default="coherent",
+                   help="§7 ablation on the reconstruction targets (coherent | duplicate)")
+    p.add_argument("--eval-parquet", default=None,
+                   help="held-out ar_sft.eval.parquet (from build_from_published --holdout-frac). "
+                        "Reports per-tap FVE on docs unseen in training — the warm-start comparison "
+                        "metric; the same --condition is applied to its targets.")
+    p.add_argument("--eval-every", type=int, default=250)
+    p.add_argument("--eval-batches", type=int, default=25, help="batches per held-out eval pass (caps cost)")
     p.add_argument("--save-every", type=int, default=500)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--wandb-project", default="mlnla-qwen3-8b")
@@ -122,13 +156,20 @@ def main():
         print(f"[ar] LoRA-injected; trainable {n_tr / 1e6:.1f}M (lora + {len(tap_layers)} heads)")
     model.train()
 
-    rows = load_ar_sft_dataset(args.parquet, n_max=args.max_rows)
+    rows = load_ar_sft_dataset(args.parquet, n_max=args.max_rows, condition=args.condition)
+    print(f"[ar] condition={args.condition} | {len(rows)} rows")
     d_model = int(np.asarray(rows[0][SLOT_COLUMNS[0]]).shape[-1])
     mse_scale = math.sqrt(d_model)
     print(f"[ar] {len(rows)} rows, d_model={d_model}, mse_scale={mse_scale:.3f}, taps={tap_layers}")
     baselines = _per_tap_baselines(rows, mse_scale)
     print("[ar] per-tap predict-mean baselines: " +
           ", ".join(f"{nm}={b:.4f}" for nm, b in zip(SLOT_NAMES, baselines)))
+    eval_rows = eval_baselines = None
+    if args.eval_parquet:
+        eval_rows = load_ar_sft_dataset(args.eval_parquet, condition=args.condition)
+        eval_baselines = _per_tap_baselines(eval_rows, mse_scale)
+        print(f"[ar] held-out eval: {len(eval_rows)} rows from {args.eval_parquet}; baselines " +
+              ", ".join(f"{nm}={b:.4f}" for nm, b in zip(SLOT_NAMES, eval_baselines)))
 
     try:
         import bitsandbytes as bnb
@@ -187,6 +228,21 @@ def main():
         if not args.no_wandb:
             import wandb
             wandb.log(log, step=step)
+
+        if eval_rows is not None and ((step + 1) % args.eval_every == 0 or (step + 1) == args.num_steps):
+            ev_mse, ev_fve, ev_loss = evaluate_ar(
+                model, eval_rows, tokenizer, mse_scale, eval_baselines,
+                device, args.max_len, args.batch_size, args.eval_batches)
+            elog = {"eval/loss": ev_loss, "eval/fve/overall": sum(ev_fve) / len(ev_fve)}
+            for nm, m, f in zip(SLOT_NAMES, ev_mse, ev_fve):
+                elog[f"eval/loss/{nm}"] = m
+                elog[f"eval/fve/{nm}"] = f
+            print(f"  [eval] held-out FVE p/c/n "
+                  f"{ev_fve[0]*100:.1f}/{ev_fve[1]*100:.1f}/{ev_fve[2]*100:.1f}% "
+                  f"| overall {elog['eval/fve/overall']*100:.1f}% | loss {ev_loss:.4f}", flush=True)
+            if not args.no_wandb:
+                import wandb
+                wandb.log(elog, step=step)
 
         if (step + 1) % args.save_every == 0 or (step + 1) == args.num_steps:
             out = save_dir / f"iter_{step + 1:07d}"

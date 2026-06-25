@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from multilayer_nla.datasets import N_SLOTS, load_av_sft_dataset, prepare_av_chunk_multi
+from multilayer_nla.datasets import CONDITIONS, N_SLOTS, load_av_sft_dataset, prepare_av_chunk_multi
 from multilayer_nla.injection_multi import register_multislot_hook
 
 
@@ -70,6 +70,28 @@ def av_compute_loss(model, batch_ids, attn, loss_mask, vectors, vectors_ref, pro
     return loss, int(n_resp.item())
 
 
+@torch.no_grad()
+def evaluate_av(model, eval_rows, tokenizer, inject_char, inj_id, vectors_ref, device,
+                max_len, batch_size, max_batches=None):
+    """Held-out response CE on docs unseen in training (no grad), token-weighted mean."""
+    was_training = model.training
+    model.eval()
+    tot_loss, tot_resp, nb = 0.0, 0, 0
+    for cs in range(0, len(eval_rows), batch_size):
+        chunk = eval_rows[cs:cs + batch_size]
+        ids, attn, loss_mask, vectors, plens = prepare_av_chunk_multi(
+            chunk, tokenizer, inject_char, inj_id, device, max_len=max_len)
+        loss, n_resp = av_compute_loss(model, ids, attn, loss_mask, vectors, vectors_ref, plens)
+        tot_loss += loss.item() * n_resp
+        tot_resp += n_resp
+        nb += 1
+        if max_batches and nb >= max_batches:
+            break
+    if was_training:
+        model.train()
+    return tot_loss / max(tot_resp, 1)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--base-ckpt", required=True)
@@ -90,6 +112,13 @@ def main():
     p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--attn-implementation", default="sdpa")
     p.add_argument("--max-rows", type=int, default=None)
+    p.add_argument("--condition", choices=list(CONDITIONS), default="coherent",
+                   help="§7 ablation on the injected activations (coherent | duplicate)")
+    p.add_argument("--eval-parquet", default=None,
+                   help="held-out av_sft.eval.parquet (from build_from_published --holdout-frac); "
+                        "reports response CE on docs unseen in training.")
+    p.add_argument("--eval-every", type=int, default=250)
+    p.add_argument("--eval-batches", type=int, default=25, help="batches per held-out eval pass (caps cost)")
     p.add_argument("--save-every", type=int, default=500)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--wandb-project", default="mlnla-qwen3-8b")
@@ -141,8 +170,12 @@ def main():
         model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
 
-    rows = load_av_sft_dataset(args.parquet, n_max=args.max_rows)
-    print(f"[av] {len(rows)} rows")
+    rows = load_av_sft_dataset(args.parquet, n_max=args.max_rows, condition=args.condition)
+    print(f"[av] condition={args.condition} | {len(rows)} rows")
+    eval_rows = None
+    if args.eval_parquet:
+        eval_rows = load_av_sft_dataset(args.eval_parquet, condition=args.condition)
+        print(f"[av] held-out eval: {len(eval_rows)} rows from {args.eval_parquet}")
 
     try:
         import bitsandbytes as bnb
@@ -198,6 +231,14 @@ def main():
         if not args.no_wandb:
             import wandb
             wandb.log(log, step=step)
+
+        if eval_rows is not None and ((step + 1) % args.eval_every == 0 or (step + 1) == args.num_steps):
+            ev_loss = evaluate_av(model, eval_rows, tokenizer, inject_char, inj_id, vectors_ref,
+                                  device, args.max_len, args.batch_size, args.eval_batches)
+            print(f"  [eval] held-out loss {ev_loss:.4f}", flush=True)
+            if not args.no_wandb:
+                import wandb
+                wandb.log({"eval/loss": ev_loss}, step=step)
 
         if (step + 1) % args.save_every == 0 or (step + 1) == args.num_steps:
             out = save_dir / f"iter_{step + 1:07d}"

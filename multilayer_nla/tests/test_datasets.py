@@ -13,7 +13,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from multilayer_nla.datasets import (
+    CONDITIONS,
     SLOT_COLUMNS,
+    apply_condition_columns,
     doc_bucket,
     split_by_document,
     stack_slot_vectors,
@@ -137,6 +139,42 @@ def test_stack_slot_vectors_order():
     assert np.allclose(v[3], np.arange(d) + 100.0)
     assert np.allclose(v[4], np.arange(d) + 110.0)
     assert np.allclose(v[5], np.arange(d) + 120.0)
+
+
+def test_apply_condition_columns():
+    """§7 ablation transform: coherent is identity; duplicate makes every slot the
+    centre column (for BOTH injected vectors and AR targets, since both read these
+    columns); the input is never mutated; unknown conditions raise."""
+    n, d = 6, 8
+    rng = np.random.default_rng(1)
+    acts = {c: rng.standard_normal((n, d)).astype(np.float32) for c in SLOT_COLUMNS}
+    centre = acts["activation_centre"]
+    assert not np.array_equal(acts["activation_prev"], centre), "fixture must have distinct slots"
+
+    # coherent = identity
+    coh = apply_condition_columns(acts, "coherent")
+    for c in SLOT_COLUMNS:
+        assert np.array_equal(coh[c], acts[c])
+
+    # duplicate = every slot is the centre column; the input dict is left intact
+    dup = apply_condition_columns(acts, "duplicate")
+    for c in SLOT_COLUMNS:
+        assert np.array_equal(dup[c], centre), f"{c} != centre under duplicate"
+    assert not np.array_equal(acts["activation_prev"], acts["activation_centre"]), "input was mutated"
+
+    # the transform propagates through slot-stacking: a duplicated row stacks to centre x3
+    dup_rows = [{c: dup[c][i] for c in SLOT_COLUMNS} for i in range(n)]
+    v = stack_slot_vectors(dup_rows, k=3)  # [n*3, d], example-major [prev, centre, next]
+    for i in range(n):
+        for slot in range(3):
+            assert np.allclose(v[3 * i + slot], centre[i]), "duplicate slot != centre after stacking"
+
+    assert set(CONDITIONS) == {"coherent", "duplicate"}
+    try:
+        apply_condition_columns(acts, "bogus")
+        assert False, "unknown condition must raise"
+    except ValueError:
+        pass
 
 
 def _run_all():

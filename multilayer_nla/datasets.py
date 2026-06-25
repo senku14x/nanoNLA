@@ -43,6 +43,34 @@ N_SLOTS = 3
 SLOT_COLUMNS = ("activation_prev", "activation_centre", "activation_next")
 
 
+# ---- §7 condition ablations (centre == SLOT_COLUMNS index 1) ----
+# Applied at LOAD time to the per-row activation columns, so the SAME transform
+# flows into BOTH the injected vectors (AV-SFT inject, RL rollout) AND the
+# reconstruction / reward targets (AR-SFT gold, RL critic). That makes the
+# condition the ONLY variable vs the coherent run; the text labels (prompt /
+# response) are never touched.
+CONDITIONS = ("coherent", "duplicate")
+
+
+def apply_condition_columns(acts: dict, condition: str = "coherent") -> dict:
+    """Transform a dict of per-row activation columns under a §7 ablation.
+
+    `acts` maps each name in SLOT_COLUMNS -> ndarray [n, d]. Returns a NEW dict;
+    the input is never mutated.
+      coherent  : identity — the real adjacent layers [prev, centre, next].
+      duplicate : every slot := centre. The control for "do the *distinct*
+                  neighbour layers carry recoverable signal, or does the centre
+                  alone explain the reconstruction?" If duplicate FVE ≈ coherent
+                  FVE, the multi-layer structure is not being used.
+    """
+    if condition == "coherent":
+        return acts
+    if condition == "duplicate":
+        centre = acts["activation_centre"]
+        return {c: centre for c in SLOT_COLUMNS}
+    raise ValueError(f"unknown condition {condition!r}; choose from {CONDITIONS}")
+
+
 def av_user_content(placeholder: str = INJECT_PLACEHOLDER) -> str:
     return AV_USER_TEMPLATE.format(m=placeholder)
 
@@ -88,6 +116,23 @@ def doc_bucket(doc_id: str, fracs: tuple[float, ...], seed: int) -> int:
         if u < cum:
             return i
     return len(fracs) - 1
+
+
+def doc_holdout(doc_id: str, frac: float, seed: int = 42) -> bool:
+    """True iff this doc falls in the held-out eval fraction `frac` (deterministic).
+
+    Independent of `doc_bucket`'s av/ar/rl routing (distinct salt), so the eval carve
+    is orthogonal to the inherited split. Document-level: every position of a doc
+    shares its doc_id, so a whole doc lands train-side OR eval-side — never split, so
+    no other position of an eval doc leaks into training (and vice versa). Same
+    (seed, frac) -> same carve on every box, so coherent and duplicate arms evaluate
+    on the identical held-out documents.
+    """
+    if frac <= 0.0:
+        return False
+    h = hashlib.sha256(f"{seed}|holdout|{doc_id}".encode()).digest()
+    u = int.from_bytes(h[:8], "big") / float(1 << 64)
+    return u < frac
 
 
 def split_by_document(base_parquet: str, out_dir: str, *,
@@ -150,7 +195,8 @@ def stack_slot_vectors(rows: list[dict], k: int = N_SLOTS) -> np.ndarray:
 
 # ---- Loading + AV-SFT chunk prep ----
 
-def load_av_sft_dataset(parquet_path: str, n_max: int | None = None) -> list[dict]:
+def load_av_sft_dataset(parquet_path: str, n_max: int | None = None,
+                        condition: str = "coherent") -> list[dict]:
     """Load AV-SFT rows: prompt (list[msg]) + response (str) + 3 activations.
 
     Activations via flatten->numpy (zero-copy-ish), same pattern as nla/. Slices
@@ -173,7 +219,7 @@ def load_av_sft_dataset(parquet_path: str, n_max: int | None = None) -> list[dic
             return (col.flatten().to_numpy(zero_copy_only=False)
                     .astype(np.float32).reshape(len(col), -1))
 
-        acts = {c: to_np(c) for c in SLOT_COLUMNS}
+        acts = apply_condition_columns({c: to_np(c) for c in SLOT_COLUMNS}, condition)
         for i in range(take):
             rows.append({
                 "prompt": prompts[i],
@@ -259,7 +305,8 @@ def fill_ar_prompt(explanation: str) -> str:
     return AR_CRITIC_TEMPLATE.format(explanation=explanation)
 
 
-def load_ar_sft_dataset(parquet_path: str, n_max: int | None = None) -> list[dict]:
+def load_ar_sft_dataset(parquet_path: str, n_max: int | None = None,
+                        condition: str = "coherent") -> list[dict]:
     """Load AR-SFT rows: prompt (filled critic text, str) + 3 activations."""
     cols = ["prompt", *SLOT_COLUMNS]
     pf = pq.ParquetFile(parquet_path)
@@ -277,7 +324,7 @@ def load_ar_sft_dataset(parquet_path: str, n_max: int | None = None) -> list[dic
             return (col.flatten().to_numpy(zero_copy_only=False)
                     .astype(np.float32).reshape(len(col), -1))
 
-        acts = {c: to_np(c) for c in SLOT_COLUMNS}
+        acts = apply_condition_columns({c: to_np(c) for c in SLOT_COLUMNS}, condition)
         for i in range(take):
             rows.append({"prompt": prompts[i], **{c: acts[c][i] for c in SLOT_COLUMNS}})
     return rows
