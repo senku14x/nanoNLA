@@ -219,19 +219,20 @@ def assert_conditions(out_dir: Path, fracs, seed) -> dict:
     report = {}
 
     # 1) AV training datasets local/duplicate/wide: identical source rows
-    #    (doc_id, src_row_id, response, prompt) and ONLY av_in_* differ.
-    base_key = None
+    #    (doc_id, src_row_id, response) AND identical prompt; ONLY av_in_* differ.
+    base_key = base_prompt = None
     for c in IDENTITY_CONDS:
         p = out_dir / f"av_{c}.parquet"
         t = pq.read_table(p, columns=["doc_id", "src_row_id", "response"])
         key = (t.column("doc_id").to_pylist(),
                t.column("src_row_id").to_pylist(),
                t.column("response").to_pylist())
+        prompt0 = pq.read_table(p, columns=["prompt"]).column("prompt")[0].as_py()
         if base_key is None:
-            base_key = key
+            base_key, base_prompt = key, prompt0
         else:
             assert key == base_key, f"av_{c}: source rows differ from av_{IDENTITY_CONDS[0]}"
-        # prompt is the same constant 3-marker prompt across these three
+            assert prompt0 == base_prompt, f"av_{c}: AV prompt differs from av_{IDENTITY_CONDS[0]}"
     report["av_identity_rows"] = len(base_key[0])
 
     # 2) av_in_* layer correctness per condition + duplicate-slot equality.
@@ -294,8 +295,62 @@ def assert_conditions(out_dir: Path, fracs, seed) -> dict:
                 inter = ar_sets[a] & ar_sets[b]
                 assert not inter, f"ar_{a} and ar_{b} share {len(inter)} docs"
 
+    # 5) absolute layer identity (overlapping layers): in rl_dev_<cond>, an av_in slot
+    #    whose layer IS a target layer must byte-equal that target column — proves the
+    #    builder poured the RIGHT bank layer into the slot (covers every L24 slot + the
+    #    full local triplet; non-target layers L20/L28 are construction + unit-tested).
+    tgt_of = {23: AR_TARGET_COLUMNS[0], 24: AR_TARGET_COLUMNS[1], 25: AR_TARGET_COLUMNS[2]}
+    for c, layers in CONDITIONS.items():
+        p = out_dir / f"rl_dev_{c}.parquet"
+        if not p.exists():
+            continue
+        slots = av_in_columns(len(layers))
+        for i, L in enumerate(layers):
+            if L in tgt_of:
+                assert np.array_equal(_col_np(p, slots[i]), _col_np(p, tgt_of[L])), (
+                    f"rl_dev_{c}: av_in_{i} (should be L{L}) != target {tgt_of[L]} — wrong "
+                    f"bank layer poured into the slot")
+
+    # 6) cross-subset document disjointness (inherited published split): the AV, AR and
+    #    end-to-end-eval corpora must not share documents.
+    def _docs(name):
+        pth = out_dir / name
+        return (set(pq.read_table(pth, columns=["doc_id"]).column("doc_id").to_pylist())
+                if pth.exists() else set())
+    corpora = {"av": _docs("av_local.parquet"),
+               "ar": _docs("ar_common.parquet") | _docs("ar_dev.parquet") | _docs("ar_test.parquet"),
+               "rl": _docs("rl_dev_local.parquet") | _docs("rl_test_local.parquet")}
+    cn = list(corpora)
+    for x in range(len(cn)):
+        for y in range(x + 1, len(cn)):
+            inter = corpora[cn[x]] & corpora[cn[y]]
+            assert not inter, f"{cn[x]} and {cn[y]} corpora share {len(inter)} docs (split leak)"
+
     print(f"[sweep:preflight] OK  {report}")
     return report
+
+
+def assert_marker_counts(out_dir, base_ckpt) -> None:
+    """Render each condition's AV prompt through the REAL tokenizer + chat template and
+    assert it has exactly k injection markers — the runtime invariant prepare_av_chunk_multi
+    enforces, lifted to preflight so template/tokenizer drift is caught before training.
+    Needs the base tokenizer; build_all skips it when base_ckpt is None (offline tests)."""
+    from transformers import AutoTokenizer
+    from nla.datagen.injection_tokens import find_injection_token
+    from nla.schema import INJECT_PLACEHOLDER
+    from multilayer_nla.datasets import apply_chat_template_no_think
+    tok = AutoTokenizer.from_pretrained(base_ckpt)
+    inject_char, inj_id = find_injection_token(tok)
+    for c, layers in CONDITIONS.items():
+        p = Path(out_dir) / f"av_{c}.parquet"
+        msgs = pq.read_table(p, columns=["prompt"]).column("prompt")[0].as_py()
+        msgs = [{**m, "content": m["content"].replace(INJECT_PLACEHOLDER, inject_char)} for m in msgs]
+        ids = tok.encode(apply_chat_template_no_think(tok, msgs), add_special_tokens=False)
+        n_mark = sum(1 for t in ids if t == inj_id)
+        assert n_mark == len(layers), (
+            f"av_{c}: rendered prompt has {n_mark} markers, expected {len(layers)} "
+            f"(template/tokenizer drift would break injection)")
+    print("[sweep:preflight] marker counts OK (rendered k matches each condition)")
 
 
 # ------------------------------------------------------------------ orchestration
@@ -312,7 +367,7 @@ def _read_split(manifest_path):
 
 
 def build_all(in_dir, out_dir, rl_manifest, ar_manifest, *, ar_target_layers=AR_TARGET_LAYERS,
-              batch_size=4096, allow_existing=False):
+              batch_size=4096, allow_existing=False, marker_check_ckpt=None):
     in_dir, out_dir = Path(in_dir), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     existing = list(out_dir.glob("*.parquet"))
@@ -350,6 +405,8 @@ def build_all(in_dir, out_dir, rl_manifest, ar_manifest, *, ar_target_layers=AR_
                 subset=rl_sub.get(b), batch_size=batch_size)
 
     report = assert_conditions(out_dir, rl_fracs, rl_seed)
+    if marker_check_ckpt:
+        assert_marker_counts(out_dir, marker_check_ckpt)
     (out_dir / "sweep_build_manifest.json").write_text(json.dumps({
         "in_dir": str(in_dir),
         "conditions": CONDITIONS,
@@ -379,6 +436,9 @@ def main():
     p.add_argument("--ar-split-manifest", help="ar split manifest (--mode all)")
     p.add_argument("--batch-size", type=int, default=4096)
     p.add_argument("--allow-existing", action="store_true", help="permit writing into a non-empty out-dir")
+    p.add_argument("--base-ckpt", default=None,
+                   help="if set (--mode all), preflight renders each AV prompt through this tokenizer "
+                        "and asserts the marker count matches the condition")
     args = p.parse_args()
 
     def _layers(s):
@@ -390,7 +450,7 @@ def main():
             "--mode all needs --in-dir --out-dir --rl-split-manifest --ar-split-manifest"
         build_all(args.in_dir, args.out_dir, args.rl_split_manifest, args.ar_split_manifest,
                   ar_target_layers=_layers(args.ar_target_layers), batch_size=args.batch_size,
-                  allow_existing=args.allow_existing)
+                  allow_existing=args.allow_existing, marker_check_ckpt=args.base_ckpt)
         return
 
     assert args.inp and args.out, f"--mode {args.mode} needs --in and --out"

@@ -264,10 +264,28 @@ def evaluate(actor, tokenizer, critic, inject_char, inj_id, vectors_ref, eos_ids
                                eos_ids, device, max_new_tokens)
         texts.extend(t); lens.extend(ln)
 
-    expls = [extract_explanation(t) for t in texts]
+    expls = []
+    for t in texts:
+        e = extract_explanation(t)
+        expls.append(e if (e and e.strip()) else None)  # empty/whitespace == failed extraction
     errs = [ar_sqerr(critic, tokenizer, e, r["gold"], mse_scale, device)
             for e, r in zip(expls, rows)]
     return texts, lens, expls, errs
+
+
+def _doc_derangement(doc_ids, seed):
+    """A permutation p with doc_ids[p[i]] != doc_ids[i] wherever possible, so the
+    shuffled control pairs each doc's target with ANOTHER document's generation
+    (the spec's negative control is across documents, not rows)."""
+    n = len(doc_ids)
+    perm = list(np.random.default_rng(seed).permutation(n))
+    for i in range(n):
+        if doc_ids[perm[i]] == doc_ids[i]:
+            for j in range(n):
+                if doc_ids[perm[j]] != doc_ids[i] and doc_ids[perm[i]] != doc_ids[j]:
+                    perm[i], perm[j] = perm[j], perm[i]
+                    break
+    return perm
 
 
 def main():
@@ -313,7 +331,7 @@ def main():
     # shuffled control: permute generated explanations across docs; FVE must collapse.
     shuffled_pen = float("nan")
     if args.shuffle_control and len(rows) > 1:
-        perm = np.random.default_rng(args.seed + 1).permutation(len(rows))
+        perm = _doc_derangement([r["doc_id"] for r in rows], args.seed + 1)
         sh_errs = [ar_sqerr(critic, tokenizer, expls[perm[i]], rows[i]["gold"], mse_scale, device)
                    for i in range(len(rows))]
         shuffled_pen = aggregate(sh_errs, baselines)["pen_fve_overall"]
@@ -340,7 +358,7 @@ def main():
     Path(args.summary).write_text(json.dumps(summary, indent=2))
 
     with open(args.out, "w") as f:
-        for r, t, e, err in zip(rows, texts, expls, errs):
+        for r, t, ln, e, err in zip(rows, texts, lens, expls, errs):
             per_tap_fve = (None if err is None
                            else [1.0 - err[j] / baselines[j] for j in range(len(baselines))])
             f.write(json.dumps({
@@ -350,7 +368,7 @@ def main():
                 "fve_centre": per_tap_fve[1] if per_tap_fve else None,
                 "fve_next": per_tap_fve[2] if per_tap_fve else None,
                 "fve_overall": (None if per_tap_fve is None else sum(per_tap_fve) / len(per_tap_fve)),
-                "generation_length": len(t),
+                "generation_length": ln,  # generated TOKENS (matches mean/median_generated_tokens)
             }) + "\n")
 
     print(f"[eval:{args.condition}] ext={summary['successful_extraction_rate']:.1%} "

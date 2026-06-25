@@ -38,6 +38,15 @@ def test_bootstrap_resamples_documents():
     assert np.isclose(lo, 0.9) and np.isclose(hi, 0.9)
 
 
+def test_doc_derangement_avoids_same_doc():
+    from multilayer_nla.evaluate_e2e import _doc_derangement
+    doc_ids = [f"d{i // 3}" for i in range(30)]  # 10 docs, 3 rows each
+    perm = _doc_derangement(doc_ids, seed=0)
+    assert sorted(perm) == list(range(30)), "not a valid permutation"
+    # the shuffled control must pair each doc's target with ANOTHER doc's generation
+    assert all(doc_ids[perm[i]] != doc_ids[i] for i in range(30))
+
+
 def test_select_uses_dev_grid_only():
     grid = {
         "local":     {500: {500: 0.30, 1000: 0.40}, 1000: {500: 0.50, 1000: 0.55}},

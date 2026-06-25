@@ -50,6 +50,8 @@ def select(grid, conds):
     """Return (chosen_ar_step, {cond: chosen_av_step}, diagnostics). Dev only."""
     ar_steps = sorted({ar for c in grid for ar in grid[c]})
     assert ar_steps, "no dev summaries found"
+    for c in conds:
+        assert grid.get(c), f"dev grid missing condition {c!r} — incomplete eval grid"
     # mean over conditions of each condition's best-AV dev metric, per AR ckpt
     mean_by_ar = {}
     for ar in ar_steps:
@@ -66,6 +68,9 @@ def select(grid, conds):
         avs = grid.get(c, {}).get(chosen_ar, {})
         avs = {k: v for k, v in avs.items() if v is not None}
         chosen_av[c] = max(avs, key=lambda k: avs[k]) if avs else None
+    missing = [c for c in conds if chosen_av.get(c) is None]
+    assert not missing, (f"no valid dev metric for {missing} at AR step {chosen_ar} — the dev "
+                         f"grid is incomplete (need AR{{500,1000}} x AV{{500,1000}} per condition)")
     return chosen_ar, chosen_av, {"mean_dev_metric_by_ar": mean_by_ar}
 
 

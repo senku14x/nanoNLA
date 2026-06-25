@@ -47,7 +47,8 @@ python -m multilayer_nla.splits --source "$REGEN/ar_sft.shard*of*.parquet" --nam
 # ── 2. build datasets (ar_common/dev/test, av_<cond>, rl_dev/test_<cond>) + preflight ──
 python -m multilayer_nla.build_sweep --mode all --in-dir "$REGEN" --out-dir "$SWEEP" \
     --rl-split-manifest "$SWEEP/rl_split_manifest.json" \
-    --ar-split-manifest "$SWEEP/ar_split_manifest.json" --ar-target-layers "$AR_TAPS"
+    --ar-split-manifest "$SWEEP/ar_split_manifest.json" --ar-target-layers "$AR_TAPS" \
+    --base-ckpt "$BASE"
 
 # ── 3. shared AR (train once on ar_train; gold dev FVE logged during training) ──
 python -m multilayer_nla.train_ar_multi "${SFT_COMMON[@]}" --parquet "$SWEEP/ar_common.parquet" \
