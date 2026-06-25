@@ -1,0 +1,364 @@
+"""End-to-end evaluator for the §7 SFT control sweep (no training, no RL update).
+
+For one condition's checkpoints on a held-out rl_<bucket>_<cond>.parquet:
+
+    av_in_* activations
+      -> AV generation (greedy, injection active)
+      -> explanation extraction (<explanation>...</explanation>)
+      -> shared AR reconstruction
+      -> FVE against the FIXED targets [L23,L24,L25] (activation_prev/centre/next)
+
+The AV input has k slots (k=3 local/duplicate/wide, k=1 single); the AR target is the
+same fixed triplet for every condition. Predict-the-mean baselines are computed from
+THIS eval split's targets only (never AR training rows).
+
+Reports (JSON summary + per-example JSONL):
+  fve_prev/centre/next, fve_overall                          (successful extractions only)
+  pen_fve_prev/centre/next, pen_fve_overall                  (failures := mean-predictor, FVE 0)
+  successful_extraction_rate, failed_generation_count
+  mean_generated_tokens, median_generated_tokens
+  bootstrap CIs on fve_overall + pen_fve_overall (resampling DOCUMENTS, not rows)
+  shuffled_pen_fve_overall                                   (gens permuted across docs -> ~0)
+
+Run:
+  python -m multilayer_nla.evaluate_e2e --base-ckpt Qwen/Qwen3-8B \
+      --av-ckpt $CKPT/av_local/iter_0001000 --ar-ckpt $CKPT/ar/iter_0001000 \
+      --eval-parquet $SWEEP/rl_dev_local.parquet --condition local \
+      --out $EVAL/dev_local.jsonl --summary $EVAL/dev_local.json
+"""
+
+import argparse
+import json
+import math
+from pathlib import Path
+
+import numpy as np
+import pyarrow.parquet as pq
+import torch
+
+from nla.schema import (
+    compute_predict_mean_baselines,
+    extract_explanation,
+    normalize_activation,
+)
+from multilayer_nla.datasets import (
+    AR_TARGET_COLUMNS,
+    apply_chat_template_no_think,
+    build_av_prompt,
+    detect_av_slots,
+    fill_ar_prompt,
+)
+from multilayer_nla.injection_multi import register_multislot_hook
+from multilayer_nla.models_multi import init_multitap_critic_from_base, multitap_predict
+
+SLOT_NAMES = ("prev", "centre", "next")
+
+
+# ----------------------------------------------------------------- data
+
+def load_eval_rows(parquet_path):
+    """Rows with av_in (acts [k,d]), gold ([3,d] = L23/24/25), doc_id, src_row_id."""
+    slot_cols = detect_av_slots(parquet_path)
+    cols = ["doc_id", "src_row_id", *slot_cols, *AR_TARGET_COLUMNS]
+    pf = pq.ParquetFile(parquet_path)
+    rows = []
+    for rg in range(pf.num_row_groups):
+        t = pf.read_row_group(rg, columns=cols)
+
+        def to_np(name):
+            c = t.column(name).combine_chunks()
+            return c.flatten().to_numpy(zero_copy_only=False).astype(np.float32).reshape(len(c), -1)
+
+        av = {c: to_np(c) for c in slot_cols}
+        gd = {c: to_np(c) for c in AR_TARGET_COLUMNS}
+        dids = t.column("doc_id").to_pylist()
+        srcs = t.column("src_row_id").to_pylist()
+        for i in range(t.num_rows):
+            rows.append({
+                "doc_id": dids[i],
+                "src_row_id": int(srcs[i]),
+                "acts": np.stack([av[c][i] for c in slot_cols]),      # [k, d]
+                "gold": np.stack([gd[c][i] for c in AR_TARGET_COLUMNS]),  # [3, d]
+            })
+    return rows, len(slot_cols)
+
+
+# ----------------------------------------------------------------- models
+
+def load_actor(base_ckpt, av_ckpt, k, quant, device):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from nla.datagen.injection_tokens import find_injection_token
+    tokenizer = AutoTokenizer.from_pretrained(base_ckpt)
+    inject_char, inj_id = find_injection_token(tokenizer)
+    quant_config = _quant_cfg(quant)
+    base = AutoModelForCausalLM.from_pretrained(
+        base_ckpt, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
+        quantization_config=quant_config, device_map=({"": 0} if quant_config else None))
+    if quant_config is None:
+        base = base.to(device)
+    from peft import PeftModel
+    actor = PeftModel.from_pretrained(base, av_ckpt, adapter_name="default", is_trainable=False)
+    actor.set_adapter("default")
+    actor.eval()
+    vectors_ref = [None]
+    register_multislot_hook(actor, vectors_ref, inj_id, k, layer_idx=1)
+    eos_ids = {tokenizer.eos_token_id}
+    _gc = getattr(getattr(actor, "generation_config", None), "eos_token_id", None)
+    if _gc is not None:
+        eos_ids.update(_gc if isinstance(_gc, (list, tuple)) else [_gc])
+    eos_ids.discard(None)
+    return actor, tokenizer, inject_char, inj_id, vectors_ref, eos_ids
+
+
+def load_critic(base_ckpt, ar_ckpt, quant, device):
+    import json as _json
+    from safetensors.torch import load_file
+    from peft import LoraConfig, inject_adapter_in_model
+    ar_meta = _json.loads((Path(ar_ckpt) / "ar_meta.json").read_text())
+    tap_layers = tuple(ar_meta["tap_layers"])
+    mse_scale = ar_meta.get("mse_scale") or math.sqrt(ar_meta["d_model"])
+    quant_config = _quant_cfg(quant) if ar_meta.get("quant") == "4bit" else None
+    critic = init_multitap_critic_from_base(
+        base_ckpt, tap_layers, torch.bfloat16, quant_config,
+        device_map=({"": 0} if quant_config else None),
+        strip_final_norm=ar_meta.get("strip_final_norm", True))
+    if quant_config is None:
+        critic = critic.to(device)
+    inject_adapter_in_model(LoraConfig(
+        r=ar_meta["lora_r"], lora_alpha=ar_meta["lora_alpha"], lora_dropout=0.0, bias="none",
+        task_type="CAUSAL_LM", use_rslora=True, target_modules=ar_meta["target_modules"]), critic.backbone)
+    sd = load_file(str(Path(ar_ckpt) / "ar_multitap.safetensors"))
+    _, unexp = critic.load_state_dict(sd, strict=False)
+    assert not unexp, f"AR load: unexpected keys {unexp[:3]}"
+    for p_ in critic.parameters():
+        p_.requires_grad_(False)
+    critic.eval()
+    return critic, mse_scale
+
+
+def _quant_cfg(quant):
+    if quant != "4bit":
+        return None
+    from transformers import BitsAndBytesConfig
+    return BitsAndBytesConfig(
+        load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True, bnb_4bit_quant_storage=torch.bfloat16)
+
+
+# ----------------------------------------------------------------- generate + score
+
+@torch.no_grad()
+def generate_batch(actor, tokenizer, prompt_text, acts_bk, vectors_ref, eos_ids, device, max_new_tokens):
+    """One greedy generation per row. acts_bk: [B,k,d] injected example-major at the
+    B identical k-marker prompts. Returns (texts[B], n_tokens[B])."""
+    B, k = acts_bk.shape[0], acts_bk.shape[1]
+    prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+    prompt_t = torch.tensor([prompt_ids], dtype=torch.long, device=device).expand(B, -1).contiguous()
+    plen = prompt_t.shape[1]
+    v_batch = torch.as_tensor(acts_bk, dtype=torch.float32, device=device).reshape(B * k, -1)
+    vectors_ref[0] = {"vectors": v_batch,
+                      "prompt_lens": torch.full((B,), plen, dtype=torch.long, device=device)}
+    try:
+        gen = actor.generate(
+            input_ids=prompt_t, attention_mask=torch.ones_like(prompt_t),
+            max_new_tokens=max_new_tokens, do_sample=False,
+            pad_token_id=tokenizer.eos_token_id, return_dict_in_generate=True)
+    finally:
+        vectors_ref[0] = None
+    seqs = gen.sequences
+    texts, lens = [], []
+    for b in range(B):
+        resp_ids = seqs[b, plen:].tolist()
+        n_real = next((i + 1 for i, t in enumerate(resp_ids) if t in eos_ids), len(resp_ids))
+        resp_ids = resp_ids[:n_real]
+        texts.append(tokenizer.decode(resp_ids, skip_special_tokens=True))
+        lens.append(len(resp_ids))
+    return texts, lens
+
+
+@torch.no_grad()
+def ar_sqerr(critic, tokenizer, expl, gold, mse_scale, device, max_len=1024):
+    """Per-tap √d-normalized squared error [3] for one explanation vs gold[3,d].
+    None if extraction failed (expl is None) or the critic prompt is over-length."""
+    if expl is None:
+        return None
+    ids = tokenizer.encode(fill_ar_prompt(expl), add_special_tokens=False)
+    if not 0 < len(ids) <= max_len:
+        return None
+    x = torch.tensor([ids], dtype=torch.long, device=device)
+    pred = multitap_predict(critic, x, None, mse_scale)              # [1,3,d] raw
+    g = torch.as_tensor(gold, dtype=torch.float32, device=device).unsqueeze(0)
+    pn, gn = normalize_activation(pred, mse_scale), normalize_activation(g, mse_scale)
+    return ((pn - gn) ** 2).mean(dim=(0, 2)).tolist()               # [3]
+
+
+# ----------------------------------------------------------------- FVE aggregation
+
+def _fve(mse_per_tap, baselines):
+    fv = [1.0 - m / b for m, b in zip(mse_per_tap, baselines)]
+    return fv, sum(fv) / len(fv)
+
+
+def aggregate(errs, baselines):
+    """errs: list of [3] per-row sqerr or None (failed). Returns success-only and
+    failure-penalized (failed := baseline, i.e. per-row FVE 0) tap MSE + FVE."""
+    ok = [e for e in errs if e is not None]
+    n_taps = len(baselines)
+    succ_mse = [float(np.mean([e[j] for e in ok])) if ok else float("nan") for j in range(n_taps)]
+    pen_rows = [e if e is not None else list(baselines) for e in errs]
+    pen_mse = [float(np.mean([e[j] for e in pen_rows])) for j in range(n_taps)]
+    succ_fve, succ_ov = _fve(succ_mse, baselines)
+    pen_fve, pen_ov = _fve(pen_mse, baselines)
+    return {
+        "n_total": len(errs), "n_success": len(ok),
+        "fve": succ_fve, "fve_overall": succ_ov,
+        "pen_fve": pen_fve, "pen_fve_overall": pen_ov,
+    }
+
+
+def bootstrap_overall(errs, doc_ids, baselines, n_boot, seed, penalized):
+    """Resample DOCUMENTS (not rows) with replacement; recompute the overall FVE each
+    time. Returns (lo, hi) 95% percentile CI. penalized=True -> failures count as 0."""
+    by_doc = {}
+    for e, d in zip(errs, doc_ids):
+        by_doc.setdefault(d, []).append(e)
+    docs = list(by_doc.keys())
+    if not docs:
+        return (float("nan"), float("nan"))
+    rng = np.random.default_rng(seed)
+    n_taps = len(baselines)
+    vals = []
+    for _ in range(n_boot):
+        pick = rng.choice(len(docs), size=len(docs), replace=True)
+        rows = [e for idx in pick for e in by_doc[docs[idx]]]
+        if penalized:
+            rows = [e if e is not None else list(baselines) for e in rows]
+        else:
+            rows = [e for e in rows if e is not None]
+        if not rows:
+            continue
+        mse = [float(np.mean([r[j] for r in rows])) for j in range(n_taps)]
+        vals.append(_fve(mse, baselines)[1])
+    if not vals:
+        return (float("nan"), float("nan"))
+    return (float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5)))
+
+
+# ----------------------------------------------------------------- driver
+
+def evaluate(actor, tokenizer, critic, inject_char, inj_id, vectors_ref, eos_ids,
+             rows, k, mse_scale, device, *, max_new_tokens=150, batch_size=32,
+             shuffle_seed=0):
+    """Run the full pipeline; return (per_example list, generated_texts, expls)."""
+    from nla.schema import INJECT_PLACEHOLDER
+    prompt_msgs = build_av_prompt(k)
+    prompt_text = apply_chat_template_no_think(
+        tokenizer, [{**m, "content": m["content"].replace(INJECT_PLACEHOLDER, inject_char)}
+                    for m in prompt_msgs])
+
+    texts, lens = [], []
+    for cs in range(0, len(rows), batch_size):
+        chunk = rows[cs:cs + batch_size]
+        acts_bk = np.stack([r["acts"] for r in chunk])  # [B,k,d]
+        t, ln = generate_batch(actor, tokenizer, prompt_text, acts_bk, vectors_ref,
+                               eos_ids, device, max_new_tokens)
+        texts.extend(t); lens.extend(ln)
+
+    expls = [extract_explanation(t) for t in texts]
+    errs = [ar_sqerr(critic, tokenizer, e, r["gold"], mse_scale, device)
+            for e, r in zip(expls, rows)]
+    return texts, lens, expls, errs
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--base-ckpt", default="Qwen/Qwen3-8B")
+    p.add_argument("--av-ckpt", required=True, help="AV-SFT LoRA dir for this condition")
+    p.add_argument("--ar-ckpt", required=True, help="shared AR multitap dir")
+    p.add_argument("--eval-parquet", required=True, help="rl_<bucket>_<cond>.parquet")
+    p.add_argument("--condition", required=True)
+    p.add_argument("--out", required=True, help="per-example JSONL")
+    p.add_argument("--summary", required=True, help="summary JSON")
+    p.add_argument("--quant", choices=["none", "4bit"], default="none")
+    p.add_argument("--max-new-tokens", type=int, default=150)
+    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--bootstrap", type=int, default=1000)
+    p.add_argument("--shuffle-control", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--seed", type=int, default=0)
+    args = p.parse_args()
+
+    device = "cuda"
+    torch.manual_seed(args.seed); np.random.seed(args.seed)
+    rows, k = load_eval_rows(args.eval_parquet)
+    print(f"[eval:{args.condition}] {len(rows)} rows, k={k} AV slots, ar_target=[L23,L24,L25]")
+
+    actor, tokenizer, inject_char, inj_id, vectors_ref, eos_ids = load_actor(
+        args.base_ckpt, args.av_ckpt, k, args.quant, device)
+    critic, mse_scale = load_critic(args.base_ckpt, args.ar_ckpt, args.quant, device)
+    # predict-the-mean baselines from THIS eval split's targets only, per tap, at the
+    # critic's mse_scale (NEVER from AR training rows).
+    baselines = [compute_predict_mean_baselines(
+        torch.tensor(np.stack([r["gold"][j] for r in rows]), dtype=torch.float32), mse_scale)[1]
+        for j in range(len(AR_TARGET_COLUMNS))]
+
+    texts, lens, expls, errs = evaluate(
+        actor, tokenizer, critic, inject_char, inj_id, vectors_ref, eos_ids, rows, k,
+        mse_scale, device, max_new_tokens=args.max_new_tokens, batch_size=args.batch_size)
+
+    agg = aggregate(errs, baselines)
+    doc_ids = [r["doc_id"] for r in rows]
+    boot_succ = bootstrap_overall(errs, doc_ids, baselines, args.bootstrap, args.seed, penalized=False)
+    boot_pen = bootstrap_overall(errs, doc_ids, baselines, args.bootstrap, args.seed, penalized=True)
+
+    # shuffled control: permute generated explanations across docs; FVE must collapse.
+    shuffled_pen = float("nan")
+    if args.shuffle_control and len(rows) > 1:
+        perm = np.random.default_rng(args.seed + 1).permutation(len(rows))
+        sh_errs = [ar_sqerr(critic, tokenizer, expls[perm[i]], rows[i]["gold"], mse_scale, device)
+                   for i in range(len(rows))]
+        shuffled_pen = aggregate(sh_errs, baselines)["pen_fve_overall"]
+
+    n_failed = sum(1 for e in errs if e is None)
+    summary = {
+        "condition": args.condition,
+        "ar_target_layers": [23, 24, 25],
+        "av_ckpt": args.av_ckpt, "ar_ckpt": args.ar_ckpt, "eval_parquet": args.eval_parquet,
+        "n_total": agg["n_total"], "n_success": agg["n_success"],
+        "successful_extraction_rate": agg["n_success"] / max(agg["n_total"], 1),
+        "failed_generation_count": n_failed,
+        "fve_prev": agg["fve"][0], "fve_centre": agg["fve"][1], "fve_next": agg["fve"][2],
+        "fve_overall": agg["fve_overall"],
+        "pen_fve_prev": agg["pen_fve"][0], "pen_fve_centre": agg["pen_fve"][1],
+        "pen_fve_next": agg["pen_fve"][2], "pen_fve_overall": agg["pen_fve_overall"],
+        "fve_overall_ci95": list(boot_succ), "pen_fve_overall_ci95": list(boot_pen),
+        "shuffled_pen_fve_overall": shuffled_pen,
+        "mean_generated_tokens": float(np.mean(lens)) if lens else 0.0,
+        "median_generated_tokens": float(np.median(lens)) if lens else 0.0,
+        "baselines": baselines, "mse_scale": mse_scale, "bootstrap": args.bootstrap,
+    }
+    Path(args.summary).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.summary).write_text(json.dumps(summary, indent=2))
+
+    with open(args.out, "w") as f:
+        for r, t, e, err in zip(rows, texts, expls, errs):
+            per_tap_fve = (None if err is None
+                           else [1.0 - err[j] / baselines[j] for j in range(len(baselines))])
+            f.write(json.dumps({
+                "doc_id": r["doc_id"], "condition": args.condition, "src_row_id": r["src_row_id"],
+                "generated_text": t, "parse_success": e is not None,
+                "fve_prev": per_tap_fve[0] if per_tap_fve else None,
+                "fve_centre": per_tap_fve[1] if per_tap_fve else None,
+                "fve_next": per_tap_fve[2] if per_tap_fve else None,
+                "fve_overall": (None if per_tap_fve is None else sum(per_tap_fve) / len(per_tap_fve)),
+                "generation_length": len(t),
+            }) + "\n")
+
+    print(f"[eval:{args.condition}] ext={summary['successful_extraction_rate']:.1%} "
+          f"FVE p/c/n {agg['fve'][0]*100:.1f}/{agg['fve'][1]*100:.1f}/{agg['fve'][2]*100:.1f}% "
+          f"overall {agg['fve_overall']*100:.1f}% | penalized {agg['pen_fve_overall']*100:.1f}% "
+          f"| shuffled {shuffled_pen*100:.1f}% | tok~{summary['mean_generated_tokens']:.0f}")
+    print(f"[eval:{args.condition}] summary -> {args.summary}  per-example -> {args.out}")
+
+
+if __name__ == "__main__":
+    main()
