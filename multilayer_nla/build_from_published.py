@@ -40,7 +40,6 @@ import argparse
 import json
 from pathlib import Path
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -49,7 +48,6 @@ from multilayer_nla.datasets import (
     AR_CRITIC_TEMPLATE,
     SLOT_COLUMNS,
     build_av_prompt,
-    doc_holdout,
     fill_ar_prompt,
 )
 
@@ -64,12 +62,6 @@ _AR_PREFIX, _AR_SUFFIX = AR_CRITIC_TEMPLATE.split("{explanation}")
 
 def _layer_col(k: int) -> str:
     return f"activation_L{k}"
-
-
-def _eval_path(out_path: str) -> str:
-    """Sibling held-out path: foo.parquet -> foo.eval.parquet."""
-    p = Path(out_path)
-    return str(p.with_suffix("")) + ".eval" + p.suffix
 
 
 def _triplet_names(schema_names, center: int) -> list:
@@ -182,10 +174,8 @@ def _subset_inputs(in_dir: Path, name: str) -> list:
 
 
 def build_one(in_paths, mode: str, out_path: str, center: int = 24,
-              batch_size: int = 4096, holdout_frac: float = 0.0,
-              holdout_seed: int = 42) -> tuple:
-    """Stream regenerated shard(s) -> one training parquet (+ optional held-out eval),
-    batch by batch.
+              batch_size: int = 4096) -> int:
+    """Stream regenerated shard(s) -> one training parquet, batch by batch.
 
     `in_paths` is a path or list of shard paths (the authoritative layer bank —
     NEVER merged into one wide file). Projects ONLY the columns build needs (the
@@ -193,11 +183,6 @@ def build_one(in_paths, mode: str, out_path: str, center: int = 24,
     layers are never read and the full ~180 GB archive never lands in RAM.
     Mirrors split_by_document's streaming idiom; appends every shard through one
     ParquetWriter.
-
-    holdout_frac > 0 carves a DOCUMENT-disjoint held-out eval parquet next to
-    out_path (foo.parquet -> foo.eval.parquet) by hashing doc_id (doc_holdout): a
-    whole doc goes train-side or eval-side, so no position of an eval doc leaks into
-    training. Returns (n_train, n_eval); n_eval == 0 when holdout is off.
     """
     if isinstance(in_paths, str):
         in_paths = [in_paths]
@@ -208,46 +193,24 @@ def build_one(in_paths, mode: str, out_path: str, center: int = 24,
              if c in schema_names]
     projection = list(dict.fromkeys(tri + extra))  # dedup, preserve order
 
-    do_holdout = holdout_frac > 0.0
-    if do_holdout and "doc_id" not in schema_names:
-        raise SystemExit("--holdout-frac needs a doc_id column in the archive for a "
-                         "document-disjoint eval carve, but none was found.")
-    eval_path = _eval_path(out_path) if do_holdout else None
-
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    writer = eval_writer = None
-    n = n_eval = 0
+    writer = None
+    n = 0
     try:
         for in_path in in_paths:
             for batch in pq.ParquetFile(in_path).iter_batches(batch_size=batch_size, columns=projection):
                 out = assemble_published(pa.Table.from_batches([batch]), mode, center)
-                if do_holdout:
-                    dids = out.column("doc_id").to_pylist()
-                    is_ev = np.fromiter((doc_holdout(d, holdout_frac, holdout_seed) for d in dids),
-                                        dtype=bool, count=len(dids))
-                    tr, ev = out.filter(pa.array(~is_ev)), out.filter(pa.array(is_ev))
-                    if tr.num_rows:
-                        if writer is None:
-                            writer = pq.ParquetWriter(out_path, out.schema)
-                        writer.write_table(tr); n += tr.num_rows
-                    if ev.num_rows:
-                        if eval_writer is None:
-                            eval_writer = pq.ParquetWriter(eval_path, out.schema)
-                        eval_writer.write_table(ev); n_eval += ev.num_rows
-                else:
-                    if writer is None:
-                        writer = pq.ParquetWriter(out_path, out.schema)
-                    writer.write_table(out); n += out.num_rows
+                if writer is None:
+                    writer = pq.ParquetWriter(out_path, out.schema)
+                writer.write_table(out)
+                n += out.num_rows
     finally:
         if writer is not None:
             writer.close()
-        if eval_writer is not None:
-            eval_writer.close()
     src = in_paths[0] if len(in_paths) == 1 else f"{len(in_paths)} shards"
-    tail = f" + {n_eval} held-out -> {Path(eval_path).name}" if do_holdout else ""
     print(f"[from-published:{mode}] center={center} {src} -> {out_path}  "
-          f"({n} rows{tail}; streamed; read {len(projection)} of {len(schema_names)} cols)")
-    return n, n_eval
+          f"({n} rows, streamed; read {len(projection)} of {len(schema_names)} cols)")
+    return n
 
 
 def _assert_docs_disjoint(out_dir: Path) -> dict:
@@ -274,25 +237,6 @@ def _assert_docs_disjoint(out_dir: Path) -> dict:
     return counts
 
 
-def _assert_train_eval_disjoint(out_dir: Path, names=("av_sft", "ar_sft", "rl")) -> dict:
-    """Per subset, the held-out eval docs must be disjoint from the train docs (the
-    document-level carve guarantees it; this is the cheap proof). Returns eval
-    unique-doc counts for subsets that have an eval file."""
-    ev_counts = {}
-    for name in names:
-        tr_p, ev_p = out_dir / f"{name}.parquet", out_dir / f"{name}.eval.parquet"
-        if not ev_p.exists() or "doc_id" not in pq.ParquetFile(tr_p).schema_arrow.names:
-            continue
-        ts = set(pq.read_table(tr_p, columns=["doc_id"]).column("doc_id").to_pylist())
-        es = set(pq.read_table(ev_p, columns=["doc_id"]).column("doc_id").to_pylist())
-        inter = ts & es
-        assert not inter, (f"{name}: {len(inter)} doc_id(s) in BOTH train and held-out eval "
-                           f"(e.g. {sorted(inter)[:3]}) — holdout leak.")
-        ev_counts[name] = len(es)
-        print(f"[from-published] {name}: held-out {len(es)} docs disjoint from {len(ts)} train docs")
-    return ev_counts
-
-
 def main() -> None:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -307,48 +251,33 @@ def main() -> None:
     p.add_argument("--in-dir", help="for --mode all: dir with regenerated av_sft/ar_sft/rl "
                                     "(shards *.shardNNofMM.parquet are used directly — no merge)")
     p.add_argument("--out-dir", help="for --mode all: output dir")
-    p.add_argument("--holdout-frac", type=float, default=0.0,
-                   help="carve this fraction of DOCUMENTS into a held-out eval parquet per subset "
-                        "(foo.parquet -> foo.eval.parquet); doc-disjoint, deterministic. 0 = off.")
-    p.add_argument("--holdout-seed", type=int, default=42)
     args = p.parse_args()
 
     if args.mode == "all":
         assert args.in_dir and args.out_dir, "--mode all needs --in-dir and --out-dir"
         ind, outd = Path(args.in_dir), Path(args.out_dir)
         outd.mkdir(parents=True, exist_ok=True)
-        counts, eval_counts = {}, {}
+        counts = {}
         for mode, fname in (("av", "av_sft"), ("ar", "ar_sft"), ("rl", "rl")):
-            nt, ne = build_one(_subset_inputs(ind, fname), mode, str(outd / f"{fname}.parquet"),
-                               args.center, holdout_frac=args.holdout_frac, holdout_seed=args.holdout_seed)
-            counts[mode] = nt
-            if ne:
-                eval_counts[mode] = ne
+            counts[mode] = build_one(_subset_inputs(ind, fname), mode,
+                                     str(outd / f"{fname}.parquet"), args.center)
         docs = _assert_docs_disjoint(outd)  # av/ar/rl must be document-disjoint
-        ev_docs = _assert_train_eval_disjoint(outd) if args.holdout_frac > 0 else {}
         (outd / "build_manifest.json").write_text(json.dumps({
             "source": "build_from_published",
             "in_dir": str(ind),
             "counts": counts,
-            "eval_counts": eval_counts,
             "unique_docs": docs,
-            "eval_unique_docs": ev_docs,
             "center_layer": args.center,
-            "holdout_frac": args.holdout_frac,
-            "holdout_seed": args.holdout_seed,
-            "split": "inherited from the published av/ar/rl subsets (not re-split); doc-disjoint asserted. "
-                     "held-out eval carved per subset by doc_id hash (train/eval doc-disjoint).",
+            "split": "inherited from the published av/ar/rl subsets (not re-split); doc-disjoint asserted",
             "note": "labels reused from ceselder/qwen3-8b-nla-L24-finefineweb-100k; "
                     "activations regenerated locally (no API).",
         }, indent=2))
-        print(f"[from-published] av/ar/rl (center {args.center}) -> {outd}  counts={counts}"
-              + (f"  held-out={eval_counts}" if eval_counts else ""))
+        print(f"[from-published] av/ar/rl (center {args.center}) -> {outd}  counts={counts}")
     else:
         assert args.inp and args.out, "--mode av/ar/rl needs --in and --out"
         import glob
         ins = sorted(glob.glob(args.inp)) or [args.inp]  # expand a shard glob if given
-        build_one(ins, args.mode, args.out, args.center,
-                  holdout_frac=args.holdout_frac, holdout_seed=args.holdout_seed)
+        build_one(ins, args.mode, args.out, args.center)
 
 
 if __name__ == "__main__":

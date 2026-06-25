@@ -13,9 +13,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from multilayer_nla.datasets import (
-    CONDITIONS,
     SLOT_COLUMNS,
-    apply_condition_columns,
+    av_in_columns,
+    av_user_content,
+    build_av_prompt,
+    detect_av_slots,
     doc_bucket,
     split_by_document,
     stack_slot_vectors,
@@ -121,60 +123,65 @@ def test_doc_bucket_routing_and_balance():
 
 def test_stack_slot_vectors_order():
     d = 4
+    cols = av_in_columns(3)  # av_in_0/1/2 (positional AV-input slots)
     rows = [
-        {"activation_prev": np.arange(d) + 0.0,
-         "activation_centre": np.arange(d) + 10.0,
-         "activation_next": np.arange(d) + 20.0},
-        {"activation_prev": np.arange(d) + 100.0,
-         "activation_centre": np.arange(d) + 110.0,
-         "activation_next": np.arange(d) + 120.0},
+        {cols[0]: np.arange(d) + 0.0, cols[1]: np.arange(d) + 10.0, cols[2]: np.arange(d) + 20.0},
+        {cols[0]: np.arange(d) + 100.0, cols[1]: np.arange(d) + 110.0, cols[2]: np.arange(d) + 120.0},
     ]
-    v = stack_slot_vectors(rows, k=3)  # [B*k, d] = [6, d]
+    v = stack_slot_vectors(rows, cols)  # [B*k, d] = [6, d]
     assert v.shape == (6, d)
-    # example-major, slot order [prev, centre, next] — the exact order the injection
-    # scan (row-major over markers) walks.
+    # example-major, slot order [0,1,2] — the exact order the injection scan
+    # (row-major over markers) walks.
     assert np.allclose(v[0], np.arange(d) + 0.0)
     assert np.allclose(v[1], np.arange(d) + 10.0)
     assert np.allclose(v[2], np.arange(d) + 20.0)
     assert np.allclose(v[3], np.arange(d) + 100.0)
     assert np.allclose(v[4], np.arange(d) + 110.0)
     assert np.allclose(v[5], np.arange(d) + 120.0)
+    # k=1 (single condition): one slot per example, example-major
+    c1 = av_in_columns(1)
+    v1 = stack_slot_vectors([{c1[0]: np.arange(d) + 7.0}, {c1[0]: np.arange(d) + 8.0}], c1)
+    assert v1.shape == (2, d)
+    assert np.allclose(v1[0], np.arange(d) + 7.0) and np.allclose(v1[1], np.arange(d) + 8.0)
 
 
-def test_apply_condition_columns():
-    """§7 ablation transform: coherent is identity; duplicate makes every slot the
-    centre column (for BOTH injected vectors and AR targets, since both read these
-    columns); the input is never mutated; unknown conditions raise."""
-    n, d = 6, 8
-    rng = np.random.default_rng(1)
-    acts = {c: rng.standard_normal((n, d)).astype(np.float32) for c in SLOT_COLUMNS}
-    centre = acts["activation_centre"]
-    assert not np.array_equal(acts["activation_prev"], centre), "fixture must have distinct slots"
+def test_av_prompt_slot_counts():
+    """The AV prompt carries exactly k marker placeholders: 3 for local/duplicate/wide,
+    1 for single. Marker-count drift breaks injection, so k != {1,3} must raise."""
+    from nla.schema import INJECT_PLACEHOLDER
+    assert av_user_content(3).count(INJECT_PLACEHOLDER) == 3
+    assert av_user_content(1).count(INJECT_PLACEHOLDER) == 1
+    assert build_av_prompt(3)[0]["content"].count(INJECT_PLACEHOLDER) == 3
+    assert build_av_prompt(1)[0]["content"].count(INJECT_PLACEHOLDER) == 1
+    for bad in (0, 2, 4):
+        try:
+            av_user_content(bad)
+            assert False, f"k={bad} must raise"
+        except ValueError:
+            pass
 
-    # coherent = identity
-    coh = apply_condition_columns(acts, "coherent")
-    for c in SLOT_COLUMNS:
-        assert np.array_equal(coh[c], acts[c])
 
-    # duplicate = every slot is the centre column; the input dict is left intact
-    dup = apply_condition_columns(acts, "duplicate")
-    for c in SLOT_COLUMNS:
-        assert np.array_equal(dup[c], centre), f"{c} != centre under duplicate"
-    assert not np.array_equal(acts["activation_prev"], acts["activation_centre"]), "input was mutated"
+def test_detect_av_slots_order_and_isolation():
+    """detect_av_slots returns the av_in_* columns in slot order (0,1,2,...) and
+    ignores everything else (the prompt, the response, the AR-target columns)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = str(Path(tmp) / "av.parquet")
+        d = 4
 
-    # the transform propagates through slot-stacking: a duplicated row stacks to centre x3
-    dup_rows = [{c: dup[c][i] for c in SLOT_COLUMNS} for i in range(n)]
-    v = stack_slot_vectors(dup_rows, k=3)  # [n*3, d], example-major [prev, centre, next]
-    for i in range(n):
-        for slot in range(3):
-            assert np.allclose(v[3 * i + slot], centre[i]), "duplicate slot != centre after stacking"
+        def fsl(vals):
+            flat = np.asarray(vals, np.float32).reshape(-1)
+            return pa.FixedSizeListArray.from_arrays(pa.array(flat), d)
 
-    assert set(CONDITIONS) == {"coherent", "duplicate"}
-    try:
-        apply_condition_columns(acts, "bogus")
-        assert False, "unknown condition must raise"
-    except ValueError:
-        pass
+        tbl = pa.table({
+            "prompt": pa.array(["p", "p"]),
+            "response": pa.array(["a", "b"]),
+            "av_in_0": fsl([[1] * d, [2] * d]),
+            "av_in_2": fsl([[5] * d, [6] * d]),          # out of order on disk
+            "av_in_1": fsl([[3] * d, [4] * d]),
+            "activation_centre": fsl([[9] * d, [9] * d]),  # AR-target col -> must be ignored
+        })
+        pq.write_table(tbl, path)
+        assert detect_av_slots(path) == ["av_in_0", "av_in_1", "av_in_2"]
 
 
 def _run_all():

@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from multilayer_nla.datasets import CONDITIONS, N_SLOTS, load_av_sft_dataset, prepare_av_chunk_multi
+from multilayer_nla.datasets import detect_av_slots, load_av_sft_dataset, prepare_av_chunk_multi
 from multilayer_nla.injection_multi import register_multislot_hook
 
 
@@ -72,7 +72,7 @@ def av_compute_loss(model, batch_ids, attn, loss_mask, vectors, vectors_ref, pro
 
 @torch.no_grad()
 def evaluate_av(model, eval_rows, tokenizer, inject_char, inj_id, vectors_ref, device,
-                max_len, batch_size, max_batches=None):
+                max_len, batch_size, slot_cols, max_batches=None):
     """Held-out response CE on docs unseen in training (no grad), token-weighted mean."""
     was_training = model.training
     model.eval()
@@ -80,7 +80,7 @@ def evaluate_av(model, eval_rows, tokenizer, inject_char, inj_id, vectors_ref, d
     for cs in range(0, len(eval_rows), batch_size):
         chunk = eval_rows[cs:cs + batch_size]
         ids, attn, loss_mask, vectors, plens = prepare_av_chunk_multi(
-            chunk, tokenizer, inject_char, inj_id, device, max_len=max_len)
+            chunk, tokenizer, inject_char, inj_id, device, max_len=max_len, slot_cols=slot_cols)
         loss, n_resp = av_compute_loss(model, ids, attn, loss_mask, vectors, vectors_ref, plens)
         tot_loss += loss.item() * n_resp
         tot_resp += n_resp
@@ -112,11 +112,10 @@ def main():
     p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--attn-implementation", default="sdpa")
     p.add_argument("--max-rows", type=int, default=None)
-    p.add_argument("--condition", choices=list(CONDITIONS), default="coherent",
-                   help="§7 ablation on the injected activations (coherent | duplicate)")
     p.add_argument("--eval-parquet", default=None,
-                   help="held-out av_sft.eval.parquet (from build_from_published --holdout-frac); "
-                        "reports response CE on docs unseen in training.")
+                   help="optional held-out AV parquet (response CE on unseen docs); the headline AV "
+                        "metric is end-to-end (evaluate_e2e), not this CE. The condition lives in the "
+                        "data (av_in_* slot layers), so there is no --condition flag.")
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-batches", type=int, default=25, help="batches per held-out eval pass (caps cost)")
     p.add_argument("--save-every", type=int, default=500)
@@ -137,7 +136,9 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.base_ckpt)
     from nla.datagen.injection_tokens import find_injection_token
     inject_char, inj_id = find_injection_token(tokenizer)
-    print(f"[av] marker {inject_char!r} -> id {inj_id}; {N_SLOTS} slots")
+    slot_cols = detect_av_slots(args.parquet)
+    k = len(slot_cols)
+    print(f"[av] marker {inject_char!r} -> id {inj_id}; k={k} AV-input slots {slot_cols}")
 
     quant_config = None
     if args.quant == "4bit":
@@ -165,16 +166,16 @@ def main():
         model.print_trainable_parameters()
 
     vectors_ref = [None]
-    register_multislot_hook(model, vectors_ref, inj_id, N_SLOTS, layer_idx=1)
+    register_multislot_hook(model, vectors_ref, inj_id, k, layer_idx=1)
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
 
-    rows = load_av_sft_dataset(args.parquet, n_max=args.max_rows, condition=args.condition)
-    print(f"[av] condition={args.condition} | {len(rows)} rows")
+    rows = load_av_sft_dataset(args.parquet, n_max=args.max_rows, slot_cols=slot_cols)
+    print(f"[av] {len(rows)} rows")
     eval_rows = None
     if args.eval_parquet:
-        eval_rows = load_av_sft_dataset(args.eval_parquet, condition=args.condition)
+        eval_rows = load_av_sft_dataset(args.eval_parquet, slot_cols=slot_cols)
         print(f"[av] held-out eval: {len(eval_rows)} rows from {args.eval_parquet}")
 
     try:
@@ -210,7 +211,7 @@ def main():
             chunk = [rows[i] for i in perm[cursor:cursor + args.batch_size]]
             cursor += args.batch_size
             ids, attn, loss_mask, vectors, plens = prepare_av_chunk_multi(
-                chunk, tokenizer, inject_char, inj_id, device, max_len=args.max_len)
+                chunk, tokenizer, inject_char, inj_id, device, max_len=args.max_len, slot_cols=slot_cols)
             loss, n_resp = av_compute_loss(model, ids, attn, loss_mask, vectors, vectors_ref, plens)
             (loss / grad_accum).backward()
             accum_loss += loss.item(); accum_resp += n_resp
@@ -234,7 +235,7 @@ def main():
 
         if eval_rows is not None and ((step + 1) % args.eval_every == 0 or (step + 1) == args.num_steps):
             ev_loss = evaluate_av(model, eval_rows, tokenizer, inject_char, inj_id, vectors_ref,
-                                  device, args.max_len, args.batch_size, args.eval_batches)
+                                  device, args.max_len, args.batch_size, slot_cols, args.eval_batches)
             print(f"  [eval] held-out loss {ev_loss:.4f}", flush=True)
             if not args.no_wandb:
                 import wandb

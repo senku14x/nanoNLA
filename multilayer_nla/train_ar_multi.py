@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 from nla.schema import compute_predict_mean_baselines, normalize_activation
-from multilayer_nla.datasets import CONDITIONS, SLOT_COLUMNS, load_ar_sft_dataset, prepare_ar_chunk_multi
+from multilayer_nla.datasets import SLOT_COLUMNS, load_ar_sft_dataset, prepare_ar_chunk_multi
 from multilayer_nla.models_multi import (
     DEFAULT_TAP_LAYERS,
     init_multitap_critic_from_base,
@@ -102,12 +102,10 @@ def main():
     p.add_argument("--lora-alpha", type=int, default=16)
     p.add_argument("--strip-final-norm", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--max-rows", type=int, default=None)
-    p.add_argument("--condition", choices=list(CONDITIONS), default="coherent",
-                   help="§7 ablation on the reconstruction targets (coherent | duplicate)")
     p.add_argument("--eval-parquet", default=None,
-                   help="held-out ar_sft.eval.parquet (from build_from_published --holdout-frac). "
-                        "Reports per-tap FVE on docs unseen in training — the warm-start comparison "
-                        "metric; the same --condition is applied to its targets.")
+                   help="held-out AR eval parquet (ar_dev.parquet / ar_test.parquet). Reports per-tap "
+                        "gold FVE on docs unseen in AR training: gold explanation -> shared AR -> fixed "
+                        "[L23,L24,L25]. Baseline is the eval split's own predict-the-mean (not train rows).")
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-batches", type=int, default=25, help="batches per held-out eval pass (caps cost)")
     p.add_argument("--save-every", type=int, default=500)
@@ -156,8 +154,7 @@ def main():
         print(f"[ar] LoRA-injected; trainable {n_tr / 1e6:.1f}M (lora + {len(tap_layers)} heads)")
     model.train()
 
-    rows = load_ar_sft_dataset(args.parquet, n_max=args.max_rows, condition=args.condition)
-    print(f"[ar] condition={args.condition} | {len(rows)} rows")
+    rows = load_ar_sft_dataset(args.parquet, n_max=args.max_rows)
     d_model = int(np.asarray(rows[0][SLOT_COLUMNS[0]]).shape[-1])
     mse_scale = math.sqrt(d_model)
     print(f"[ar] {len(rows)} rows, d_model={d_model}, mse_scale={mse_scale:.3f}, taps={tap_layers}")
@@ -166,7 +163,7 @@ def main():
           ", ".join(f"{nm}={b:.4f}" for nm, b in zip(SLOT_NAMES, baselines)))
     eval_rows = eval_baselines = None
     if args.eval_parquet:
-        eval_rows = load_ar_sft_dataset(args.eval_parquet, condition=args.condition)
+        eval_rows = load_ar_sft_dataset(args.eval_parquet)
         eval_baselines = _per_tap_baselines(eval_rows, mse_scale)
         print(f"[ar] held-out eval: {len(eval_rows)} rows from {args.eval_parquet}; baselines " +
               ", ".join(f"{nm}={b:.4f}" for nm, b in zip(SLOT_NAMES, eval_baselines)))

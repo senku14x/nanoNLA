@@ -28,56 +28,68 @@ import torch
 
 from nla.schema import INJECT_PLACEHOLDER
 
-# ---- AV prompt: three depth slots, same marker char (order = slot) ----
-# Kept as a module constant so datagen (build) and training (prep) use the SAME
-# string — drift here moves the marker positions and breaks injection.
+# ---- AV prompt: k depth slots, same marker char (order = slot) ----
+# Kept as module constants so the builder and training prep use the SAME strings —
+# drift moves the marker positions and breaks injection. Across the §7 conditions
+# ONLY the AV *input* changes: which layers fill the slots, and k=3 (local /
+# duplicate / wide) vs k=1 (single). The AR reconstruction target is INDEPENDENT
+# and ALWAYS the [L23,L24,L25] triplet (AR_TARGET_COLUMNS below).
 AV_USER_TEMPLATE = (
     "Earlier depth: {m}\n"
     "Centre depth: {m}\n"
     "Later depth: {m}\n"
     "Describe the information represented across these local computational stages."
 )
+# One-marker variant for the `single` condition (standard single-layer baseline):
+# same task framing, one slot. `single` thus differs from the 3-marker conditions
+# in marker structure as well as layer count (hence a secondary comparison).
+AV_USER_TEMPLATE_SINGLE = (
+    "Depth: {m}\n"
+    "Describe the information represented at this local computational stage."
+)
 N_SLOTS = 3
-# Scan/stack order — MUST match inject_multislot_in_residual's example-major,
-# ascending-position walk: the prompt lists prev, centre, next top-to-bottom.
-SLOT_COLUMNS = ("activation_prev", "activation_centre", "activation_next")
 
 
-# ---- §7 condition ablations (centre == SLOT_COLUMNS index 1) ----
-# Applied at LOAD time to the per-row activation columns, so the SAME transform
-# flows into BOTH the injected vectors (AV-SFT inject, RL rollout) AND the
-# reconstruction / reward targets (AR-SFT gold, RL critic). That makes the
-# condition the ONLY variable vs the coherent run; the text labels (prompt /
-# response) are never touched.
-CONDITIONS = ("coherent", "duplicate")
+def av_in_columns(k: int) -> list:
+    """Positional AV-input slot column names (slot identity is by order)."""
+    return [f"av_in_{i}" for i in range(k)]
 
 
-def apply_condition_columns(acts: dict, condition: str = "coherent") -> dict:
-    """Transform a dict of per-row activation columns under a §7 ablation.
+def detect_av_slots(parquet_path: str) -> list:
+    """The AV-input slot columns present in a parquet, in slot order.
 
-    `acts` maps each name in SLOT_COLUMNS -> ndarray [n, d]. Returns a NEW dict;
-    the input is never mutated.
-      coherent  : identity — the real adjacent layers [prev, centre, next].
-      duplicate : every slot := centre. The control for "do the *distinct*
-                  neighbour layers carry recoverable signal, or does the centre
-                  alone explain the reconstruction?" If duplicate FVE ≈ coherent
-                  FVE, the multi-layer structure is not being used.
+    Prefers the sweep's positional av_in_* columns. Falls back to the legacy
+    prev/centre/next triplet (build_from_published / build_datasets output, used by
+    the preserved smoke pipeline) so old-format AV parquets still load as k=3.
     """
-    if condition == "coherent":
-        return acts
-    if condition == "duplicate":
-        centre = acts["activation_centre"]
-        return {c: centre for c in SLOT_COLUMNS}
-    raise ValueError(f"unknown condition {condition!r}; choose from {CONDITIONS}")
+    names = pq.ParquetFile(parquet_path).schema_arrow.names
+    cols = sorted((n for n in names if n.startswith("av_in_")),
+                  key=lambda s: int(s.rsplit("_", 1)[-1]))
+    if cols:
+        return cols
+    if all(c in names for c in SLOT_COLUMNS):
+        return list(SLOT_COLUMNS)
+    raise AssertionError(f"{parquet_path} has no av_in_* or {SLOT_COLUMNS} AV-input slot columns")
 
 
-def av_user_content(placeholder: str = INJECT_PLACEHOLDER) -> str:
-    return AV_USER_TEMPLATE.format(m=placeholder)
+# AR reconstruction targets — ALWAYS these three (the center-24 triplet
+# L23/L24/L25), for EVERY condition. The AV-input slots (av_in_*) are a SEPARATE,
+# condition-specific set; keeping the names distinct is what guarantees the AR
+# target never silently changes when the AV input does.
+SLOT_COLUMNS = ("activation_prev", "activation_centre", "activation_next")
+AR_TARGET_COLUMNS = SLOT_COLUMNS
 
 
-def build_av_prompt(placeholder: str = INJECT_PLACEHOLDER) -> list[dict]:
-    """The constant AV chat prompt (one user turn with three marker slots)."""
-    return [{"role": "user", "content": av_user_content(placeholder)}]
+def av_user_content(k: int = N_SLOTS, placeholder: str = INJECT_PLACEHOLDER) -> str:
+    if k not in (1, N_SLOTS):
+        raise ValueError(f"unsupported AV slot count k={k}; expected 1 or {N_SLOTS}")
+    tmpl = AV_USER_TEMPLATE if k == N_SLOTS else AV_USER_TEMPLATE_SINGLE
+    return tmpl.format(m=placeholder)
+
+
+def build_av_prompt(k: int = N_SLOTS, placeholder: str = INJECT_PLACEHOLDER) -> list:
+    """The constant AV chat prompt (one user turn with k marker slots)."""
+    return [{"role": "user", "content": av_user_content(k, placeholder)}]
 
 
 def apply_chat_template_no_think(tokenizer, msgs, *, add_generation_prompt=True) -> str:
@@ -116,23 +128,6 @@ def doc_bucket(doc_id: str, fracs: tuple[float, ...], seed: int) -> int:
         if u < cum:
             return i
     return len(fracs) - 1
-
-
-def doc_holdout(doc_id: str, frac: float, seed: int = 42) -> bool:
-    """True iff this doc falls in the held-out eval fraction `frac` (deterministic).
-
-    Independent of `doc_bucket`'s av/ar/rl routing (distinct salt), so the eval carve
-    is orthogonal to the inherited split. Document-level: every position of a doc
-    shares its doc_id, so a whole doc lands train-side OR eval-side — never split, so
-    no other position of an eval doc leaks into training (and vice versa). Same
-    (seed, frac) -> same carve on every box, so coherent and duplicate arms evaluate
-    on the identical held-out documents.
-    """
-    if frac <= 0.0:
-        return False
-    h = hashlib.sha256(f"{seed}|holdout|{doc_id}".encode()).digest()
-    u = int.from_bytes(h[:8], "big") / float(1 << 64)
-    return u < frac
 
 
 def split_by_document(base_parquet: str, out_dir: str, *,
@@ -177,34 +172,38 @@ def split_by_document(base_parquet: str, out_dir: str, *,
 
 # ---- Slot-vector stacking (the correctness-critical bit) ----
 
-def stack_slot_vectors(rows: list[dict], k: int = N_SLOTS) -> np.ndarray:
-    """Stack the three per-row activations into [B*k, d] in injection scan order.
+def stack_slot_vectors(rows: list, slot_cols) -> np.ndarray:
+    """Stack each row's AV-input activations into [B*k, d] in injection scan order.
 
-    For row b: [row[prev], row[centre], row[next]] -> rows 0..k-1.
+    For row b: [row[slot_cols[0]], ..., row[slot_cols[k-1]]] -> rows 0..k-1.
     Flatten is example-major ([b0 slots..., b1 slots..., ...]), matching
-    inject_multislot_in_residual's row-major marker walk.
+    inject_multislot_in_residual's row-major marker walk. `slot_cols` is the ordered
+    av_in_* list (k=3 for local/duplicate/wide, k=1 for single).
     """
     per_row = np.stack(
-        [np.stack([np.asarray(r[c], dtype=np.float32) for c in SLOT_COLUMNS[:k]])
+        [np.stack([np.asarray(r[c], dtype=np.float32) for c in slot_cols])
          for r in rows]
     )  # [B, k, d]
-    B, kk, d = per_row.shape
-    assert kk == k
+    B, k, d = per_row.shape
     return per_row.reshape(B * k, d)
 
 
 # ---- Loading + AV-SFT chunk prep ----
 
 def load_av_sft_dataset(parquet_path: str, n_max: int | None = None,
-                        condition: str = "coherent") -> list[dict]:
-    """Load AV-SFT rows: prompt (list[msg]) + response (str) + 3 activations.
+                        slot_cols=None) -> list:
+    """Load AV-SFT rows: prompt (list[msg]) + response (str) + k AV-input activations.
 
-    Activations via flatten->numpy (zero-copy-ish), same pattern as nla/. Slices
-    row-groups so n_max takes exactly n_max rows, not the whole first group.
+    The condition lives in the DATA: `slot_cols` (default: the av_in_* columns
+    present) are this dataset's AV-input layers — [L23,L24,L25] for local, [L24]x3
+    for duplicate, [L20,L24,L28] for wide, [L24] for single. No load-time transform.
+    Activations via flatten->numpy; slices row-groups so n_max is exact.
     """
-    cols = ["prompt", "response", *SLOT_COLUMNS]
+    if slot_cols is None:
+        slot_cols = detect_av_slots(parquet_path)
+    cols = ["prompt", "response", *slot_cols]
     pf = pq.ParquetFile(parquet_path)
-    rows: list[dict] = []
+    rows: list = []
     for rg_idx in range(pf.num_row_groups):
         if n_max is not None and len(rows) >= n_max:
             break
@@ -219,23 +218,23 @@ def load_av_sft_dataset(parquet_path: str, n_max: int | None = None,
             return (col.flatten().to_numpy(zero_copy_only=False)
                     .astype(np.float32).reshape(len(col), -1))
 
-        acts = apply_condition_columns({c: to_np(c) for c in SLOT_COLUMNS}, condition)
+        acts = {c: to_np(c) for c in slot_cols}
         for i in range(take):
             rows.append({
                 "prompt": prompts[i],
                 "response": responses[i],
-                **{c: acts[c][i] for c in SLOT_COLUMNS},
+                **{c: acts[c][i] for c in slot_cols},
             })
     return rows
 
 
-def prepare_av_chunk_multi(rows: list[dict], tokenizer, inject_char: str, inj_id: int,
-                           device, *, max_len: int = 1024, k: int = N_SLOTS):
+def prepare_av_chunk_multi(rows: list, tokenizer, inject_char: str, inj_id: int,
+                           device, *, max_len: int = 1024, slot_cols=None):
     """Build (input_ids, attn, loss_mask, vectors[B*k, d], prompt_lens[B]) for a multi-slot AV-SFT batch.
 
-    prompt_lens lets the injection hook bound injection to the prompt span (the gold
-    response is marker-free, so it's belt-and-suspenders here, but keeps the payload
-    protocol identical to RL).
+    `slot_cols` is the ordered av_in_* list for this dataset (k = len). prompt_lens
+    lets the injection hook bound injection to the prompt span (the gold response is
+    marker-free, so belt-and-suspenders here, but keeps the payload protocol == RL).
 
     - prompt: chat-templated, with INJECT_PLACEHOLDER x k swapped to inject_char.
     - per-example guard: assert exactly k marker tokens in the prompt (complements
@@ -244,6 +243,11 @@ def prepare_av_chunk_multi(rows: list[dict], tokenizer, inject_char: str, inj_id
       tokens only (CE is response-only).
     - vectors: stack_slot_vectors -> [B*k, d] in scan order.
     """
+    if slot_cols is None:
+        avs = sorted((c for c in rows[0] if c.startswith("av_in_")),
+                     key=lambda s: int(s.rsplit("_", 1)[-1]))
+        slot_cols = avs if avs else [c for c in SLOT_COLUMNS if c in rows[0]]
+    k = len(slot_cols)
     full_ids_list, prompt_lens = [], []
     for row in rows:
         msgs = [
@@ -278,7 +282,7 @@ def prepare_av_chunk_multi(rows: list[dict], tokenizer, inject_char: str, inj_id
         attn[i, :L] = 1
         loss_mask[i, prompt_lens[i]:L] = 1  # response-only (in target-token space; CE shift applied in loss)
 
-    vectors = torch.tensor(stack_slot_vectors(rows, k), dtype=torch.float32, device=device)
+    vectors = torch.tensor(stack_slot_vectors(rows, slot_cols), dtype=torch.float32, device=device)
     prompt_lens_t = torch.tensor(prompt_lens, dtype=torch.long, device=device)
     return batch_ids, attn, loss_mask, vectors, prompt_lens_t
 
@@ -305,12 +309,16 @@ def fill_ar_prompt(explanation: str) -> str:
     return AR_CRITIC_TEMPLATE.format(explanation=explanation)
 
 
-def load_ar_sft_dataset(parquet_path: str, n_max: int | None = None,
-                        condition: str = "coherent") -> list[dict]:
-    """Load AR-SFT rows: prompt (filled critic text, str) + 3 activations."""
-    cols = ["prompt", *SLOT_COLUMNS]
+def load_ar_sft_dataset(parquet_path: str, n_max: int | None = None) -> list:
+    """Load AR-SFT rows: prompt (filled critic text, str) + the 3 fixed targets.
+
+    Targets are AR_TARGET_COLUMNS (activation_prev/centre/next == L23/L24/L25) for
+    EVERY condition — the AR reconstructs the same local state regardless of what the
+    AV saw. No condition transform.
+    """
+    cols = ["prompt", *AR_TARGET_COLUMNS]
     pf = pq.ParquetFile(parquet_path)
-    rows: list[dict] = []
+    rows: list = []
     for rg_idx in range(pf.num_row_groups):
         if n_max is not None and len(rows) >= n_max:
             break
@@ -324,9 +332,9 @@ def load_ar_sft_dataset(parquet_path: str, n_max: int | None = None,
             return (col.flatten().to_numpy(zero_copy_only=False)
                     .astype(np.float32).reshape(len(col), -1))
 
-        acts = apply_condition_columns({c: to_np(c) for c in SLOT_COLUMNS}, condition)
+        acts = {c: to_np(c) for c in AR_TARGET_COLUMNS}
         for i in range(take):
-            rows.append({"prompt": prompts[i], **{c: acts[c][i] for c in SLOT_COLUMNS}})
+            rows.append({"prompt": prompts[i], **{c: acts[c][i] for c in AR_TARGET_COLUMNS}})
     return rows
 
 
