@@ -192,6 +192,39 @@ def ar_sqerr(critic, tokenizer, expl, gold, mse_scale, device, max_len=1024):
     return ((pn - gn) ** 2).mean(dim=(0, 2)).tolist()               # [3]
 
 
+@torch.no_grad()
+def ar_sqerr_batch(critic, tokenizer, expls, golds, mse_scale, device, max_len=1024, batch_size=64):
+    """BATCHED per-tap √d-normalized squared error [3] per row; None for a failed
+    extraction (expl is None) or an over-length critic prompt. Right-pads + passes the
+    attention mask so multitap_predict taps each row's true last token (it uses
+    attn.sum(1)-1). Aligned with the input order. ~B× fewer forwards than per-row."""
+    out = [None] * len(expls)
+    items = []  # (orig_idx, ids) for scorable rows
+    for i, e in enumerate(expls):
+        if e is None:
+            continue
+        ids = tokenizer.encode(fill_ar_prompt(e), add_special_tokens=False)
+        if 0 < len(ids) <= max_len:
+            items.append((i, ids))
+    pad = tokenizer.eos_token_id
+    for cs in range(0, len(items), batch_size):
+        chunk = items[cs:cs + batch_size]
+        T = max(len(ids) for _, ids in chunk)
+        bids = torch.full((len(chunk), T), pad, dtype=torch.long, device=device)
+        attn = torch.zeros((len(chunk), T), dtype=torch.long, device=device)
+        for r, (_, ids) in enumerate(chunk):
+            bids[r, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+            attn[r, :len(ids)] = 1
+        pred = multitap_predict(critic, bids, attn, mse_scale)                       # [bs,3,d]
+        g = torch.stack([torch.as_tensor(golds[oi], dtype=torch.float32, device=device)
+                         for oi, _ in chunk])                                        # [bs,3,d]
+        pn, gn = normalize_activation(pred, mse_scale), normalize_activation(g, mse_scale)
+        se = ((pn - gn) ** 2).mean(dim=2)                                            # [bs,3]
+        for r, (oi, _) in enumerate(chunk):
+            out[oi] = se[r].tolist()
+    return out
+
+
 # ----------------------------------------------------------------- FVE aggregation
 
 def _fve(mse_per_tap, baselines):
@@ -268,8 +301,8 @@ def evaluate(actor, tokenizer, critic, inject_char, inj_id, vectors_ref, eos_ids
     for t in texts:
         e = extract_explanation(t)
         expls.append(e if (e and e.strip()) else None)  # empty/whitespace == failed extraction
-    errs = [ar_sqerr(critic, tokenizer, e, r["gold"], mse_scale, device)
-            for e, r in zip(expls, rows)]
+    errs = ar_sqerr_batch(critic, tokenizer, expls, [r["gold"] for r in rows],
+                          mse_scale, device, batch_size=batch_size)
     return texts, lens, expls, errs
 
 
@@ -332,8 +365,9 @@ def main():
     shuffled_pen = float("nan")
     if args.shuffle_control and len(rows) > 1:
         perm = _doc_derangement([r["doc_id"] for r in rows], args.seed + 1)
-        sh_errs = [ar_sqerr(critic, tokenizer, expls[perm[i]], rows[i]["gold"], mse_scale, device)
-                   for i in range(len(rows))]
+        sh_errs = ar_sqerr_batch(critic, tokenizer, [expls[perm[i]] for i in range(len(rows))],
+                                 [rows[i]["gold"] for i in range(len(rows))],
+                                 mse_scale, device, batch_size=args.batch_size)
         shuffled_pen = aggregate(sh_errs, baselines)["pen_fve_overall"]
 
     n_failed = sum(1 for e in errs if e is None)
