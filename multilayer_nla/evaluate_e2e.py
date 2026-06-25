@@ -290,12 +290,16 @@ def evaluate(actor, tokenizer, critic, inject_char, inj_id, vectors_ref, eos_ids
                     for m in prompt_msgs])
 
     texts, lens = [], []
-    for cs in range(0, len(rows), batch_size):
+    nb = (len(rows) + batch_size - 1) // batch_size
+    for bi, cs in enumerate(range(0, len(rows), batch_size)):
         chunk = rows[cs:cs + batch_size]
         acts_bk = np.stack([r["acts"] for r in chunk])  # [B,k,d]
         t, ln = generate_batch(actor, tokenizer, prompt_text, acts_bk, vectors_ref,
                                eos_ids, device, max_new_tokens)
         texts.extend(t); lens.extend(ln)
+        if bi % 5 == 0 or bi == nb - 1:
+            print(f"    gen batch {bi + 1}/{nb}  ({len(texts)}/{len(rows)} rows)", flush=True)
+    print(f"    scoring {len(rows)} explanations (batched)...", flush=True)
 
     expls = []
     for t in texts:
