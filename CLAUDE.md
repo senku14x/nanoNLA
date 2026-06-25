@@ -36,6 +36,46 @@
   `mse_scale`, `d_model` — all loaded from `nla_meta.yaml` and asserted
   against the live tokenizer at startup. Never hardcode them.
 
+## §7 SFT control sweep — CURRENT FOCUS (see `multilayer_nla/SWEEP_STATUS.md`)
+
+The active experiment. A coherent RL run reported ~48% FVE but **on training
+rollouts with no held-out set** — untrustworthy. We pivoted to a **pre-registered,
+held-out SFT control sweep** (one H200, sequential, **no RL, no re-extraction**) that
+compares the cheap SFT warm-starts first; RL only if the warm-start gap justifies it.
+As of this writing the real sweep is **running** (branch `multilayer_working`, PR #3).
+
+**Core question:** does multi-layer AV *input* improve end-to-end reconstruction of
+the SAME fixed target state? Four conditions vary ONLY the AV input layers:
+`local` [23,24,25] · `duplicate` [24,24,24] · `wide` [20,24,28] · `single` [24].
+Headline test = **local vs duplicate**. `single`/`wide` are secondary (marker-count /
+span-vs-depth confounds).
+
+Invariants (do not break — they are what make the comparison causal):
+
+- **AR reconstruction target is FIXED at [L23,L24,L25] for EVERY condition.** Only the
+  AV input varies. `--ar-target-layers` must stay `23,24,25`.
+- **The condition lives in the DATA, not a train-time flag.** AV input = positional
+  `av_in_*` columns (k=3 local/duplicate/wide, k=1 single, via the 1-marker prompt);
+  AR targets = `activation_prev/centre/next` (== L23/24/25). Distinct names so the
+  target can't follow the input. There is NO `--condition` flag (the old
+  `apply_condition_columns` transform was removed — it wrongly rewrote the target).
+- **Shared AR is trained ONCE on `ar_train`, frozen, identical for all conditions.**
+  Do NOT co-train AV+AR per condition — that gives each condition its own AR and
+  confounds the gap (co-training == the deferred RL phase).
+- **Document-level 80/10/10 splits** (`splits.py`, reuses `doc_bucket`): rl for
+  end-to-end eval, ar for AR-only gold eval. Never train on dev/test; never select on
+  test. Predict-the-mean baselines from the **eval split only**.
+- **Evaluator (`evaluate_e2e.py`)**: AV emits TEXT only, AR reconstructs from TEXT only
+  (no activation crosses). Two FVE variants (success-only; failure-penalized = FVE 0).
+  Bootstrap CIs resample **documents**; the shuffled control permutes **across
+  documents** and must collapse. AR-gold (`eval_ar_gold.py`) localises the bottleneck
+  (verbalizer vs reconstructor).
+- **Bank is L19-L29** (`$REGEN`); covers every sweep layer. Re-probing within 19-29 is
+  a CPU `build_sweep` re-run; a layer outside 19-29 needs GPU re-extraction.
+- Entry point: `scripts/run_sweep.sh` (resumable, no RL, writes only to `sweep*`
+  dirs). RL-per-condition is NOT wired (`train_rl_multi` still uses the fixed 3-slot
+  scheme; it needs the same `av_in_*`/fixed-target decoupling as the evaluator).
+
 ## RL training: two trainers
 
 - The **verified recipe is single-GPU 4-bit** with HF `generate()` rollouts:
