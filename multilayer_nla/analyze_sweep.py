@@ -58,10 +58,13 @@ def _load_jsonl(path):
     return rows
 
 
-def load_results(eval_dir):
-    """Return {cond: {"summary": dict, "rows": [per-example dicts]}} for whatever exists."""
-    eval_dir = Path(eval_dir)
-    test_dir = eval_dir / "test"
+def load_results(eval_dir, test_dir=None):
+    """Return {cond: {"summary": dict, "rows": [per-example dicts]}} for whatever exists.
+
+    test_dir overrides the default <eval_dir>/test — used to analyze a sibling result
+    directory such as the L24-only-AR experiment ($EVALC/test_arL24), whose summaries
+    are named test_<cond>.json just like the main sweep."""
+    test_dir = Path(test_dir) if test_dir else Path(eval_dir) / "test"
     out = {}
     for c in CONDS:
         sj, jl = test_dir / f"test_{c}.json", test_dir / f"test_{c}.jsonl"
@@ -218,6 +221,46 @@ def headline(results, n_boot=2000, seed=0):
         d = paired_bootstrap_diff(pairs, tap=tap, penalized=True, n_boot=n_boot, seed=seed)
         out.append(f"    {tap:6s} Δ = {d['mean_diff']*100:+.2f}%  CI95 [{d['ci_lo']*100:+.2f}, {d['ci_hi']*100:+.2f}]"
                    f"  P(Δ>0)={d['frac_boot_gt0']:.3f}")
+    return "\n".join(out)
+
+
+# ----------------------------------------------------------------- 2b. key paired contrasts
+
+# Each contrast is (A, B, what-it-isolates). All paired over the SAME test docs/rows, so
+# the only thing that differs between A and B is the AV input config. Δ = A − B.
+KEY_CONTRASTS = (
+    ("local", "duplicate", "layer DIVERSITY @ fixed k=3 markers — 3 distinct adjacent vs 1 layer ×3 (PRE-REGISTERED headline)"),
+    ("duplicate", "single", "marker COUNT @ fixed single layer — 3 redundant markers vs 1 (pure injection bandwidth)"),
+    ("wide", "local", "SPAN @ 3 distinct layers — wide (20,24,28) vs narrow (23,24,25)"),
+    ("s2_20_22_24", "local", "SPAN — stride-2 (20,22,24) vs narrow adjacent (23,24,25)"),
+    ("s2_20_22_24", "s2_19_21_23", "target PROXIMITY @ equal span-4 stride-2 — (20,22,24, incl. L24) vs (19,21,23, below target)"),
+    ("wide", "duplicate", "diversity+span combined vs redundant baseline"),
+)
+
+
+def contrasts(results, n_boot=2000, seed=0):
+    """Paired bootstrap (over documents) for the specific A−B pairs that decompose the
+    effect into marker-count vs layer-diversity vs span vs target-proximity. Penalized
+    (failure→0, every matched row) — the failure-honest contrast."""
+    out = ["## Key paired contrasts (Δ = A − B, penalized, bootstrapped over shared test documents)\n",
+           "_Each pair runs on the SAME docs/rows; only the AV input config differs. "
+           "A positive CI that excludes 0 means A reliably reconstructs the fixed target better than B._\n"]
+    for a, b, desc in KEY_CONTRASTS:
+        if a not in results or b not in results:
+            continue
+        ra, rb = results[a].get("rows"), results[b].get("rows")
+        if not ra or not rb:
+            out.append(f"- **{a} − {b}**: (per-example jsonl missing — cannot pair)  _{desc}_")
+            continue
+        pairs, oa, ob = _join(ra, rb)
+        d = paired_bootstrap_diff(pairs, tap=None, penalized=True, n_boot=n_boot, seed=seed)
+        verdict = (f"{a} > {b} (CI excludes 0)" if d["ci_lo"] > 0
+                   else f"{b} > {a} (CI excludes 0)" if d["ci_hi"] < 0
+                   else "no detectable difference (CI includes 0)")
+        warn = f"  ⚠ unmatched a={oa} b={ob}" if (oa or ob) else ""
+        out.append(f"- **{a} − {b}**  Δ={d['mean_diff']*100:+.2f}%  "
+                   f"CI95 [{d['ci_lo']*100:+.2f}, {d['ci_hi']*100:+.2f}]  "
+                   f"P(Δ>0)={d['frac_boot_gt0']:.3f}  → {verdict}{warn}\n  _{desc}_")
     return "\n".join(out)
 
 
@@ -434,11 +477,14 @@ def leakage_checks(results, eval_dir, split_seed=None, fracs=(0.8, 0.1, 0.1)):
     out.append("")
 
     # test/dev doc disjointness (uses dev jsonls if present)
-    eval_dir = Path(eval_dir)
-    dev_dir = eval_dir / "dev"
     out.append("### Test vs dev document disjointness")
+    if eval_dir is None:
+        out.append("- (no --eval-dir given; dev cross-check skipped)\n")
+        dev_dir = None
+    else:
+        dev_dir = Path(eval_dir) / "dev"
     for c in CONDS:
-        if c not in results or not results[c].get("rows"):
+        if dev_dir is None or c not in results or not results[c].get("rows"):
             continue
         test_docs = {r["doc_id"] for r in results[c]["rows"]}
         dev_jl = sorted(glob.glob(str(dev_dir / f"dev_{c}*.jsonl")))
@@ -466,10 +512,14 @@ def leakage_checks(results, eval_dir, split_seed=None, fracs=(0.8, 0.1, 0.1)):
 
 # ----------------------------------------------------------------- 5. bottleneck
 
-def bottleneck(results, eval_dir):
+def bottleneck(results, eval_dir, test_dir=None):
     out = ["## Bottleneck: end-to-end vs AR-gold ceiling\n"]
-    test_dir = Path(eval_dir) / "test"
+    # ar_gold lives next to the summaries; for a --test-dir override that has no gold of
+    # its own (e.g. the L24-only dir) fall back to the canonical <eval_dir>/test gold.
+    test_dir = Path(test_dir) if test_dir else Path(eval_dir) / "test"
     ar_gold = test_dir / "ar_gold_test.json"
+    if not ar_gold.exists() and eval_dir is not None:
+        ar_gold = Path(eval_dir) / "test" / "ar_gold_test.json"
     if not ar_gold.exists():
         return "## Bottleneck\n\n(ar_gold_test.json missing)\n"
     g = _load_json(ar_gold)
@@ -488,15 +538,17 @@ def bottleneck(results, eval_dir):
 
 # ----------------------------------------------------------------- driver / selftest
 
-def run(eval_dir, split_seed=None, n_boot=2000, seed=0, compare_k=4, bank_dir=None):
-    results = load_results(eval_dir)
+def run(eval_dir, split_seed=None, n_boot=2000, seed=0, compare_k=4, bank_dir=None, test_dir=None):
+    results = load_results(eval_dir, test_dir)
     if not results:
-        return (f"No test_<cond>.json found under {Path(eval_dir)/'test'}. "
-                f"This box has no sweep results — copy $DATA/sweep_eval here or run on the H200.")
+        where = Path(test_dir) if test_dir else Path(eval_dir) / "test"
+        return (f"No test_<cond>.json found under {where}. "
+                f"This box has no sweep results — copy the eval dir here or run on the H200.")
     parts = [table(results), "", headline(results, n_boot, seed), "",
+             contrasts(results, n_boot, seed), "",
              distributions(results), "", compare(results, compare_k, bank_dir), "",
              leakage_checks(results, eval_dir, split_seed), "",
-             bottleneck(results, eval_dir)]
+             bottleneck(results, eval_dir, test_dir)]
     return "\n".join(parts)
 
 
@@ -574,6 +626,9 @@ def _selftest():
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--eval-dir", help="sweep_eval dir (expects test/ subdir with test_<cond>.json[l])")
+    p.add_argument("--test-dir", help="override the test/ dir directly (e.g. the L24-only-AR dir "
+                                      "$EVALC/test_arL24); --eval-dir is then optional and only used "
+                                      "for the dev cross-check + canonical AR-gold ceiling")
     p.add_argument("--split-seed", type=int, default=None, help="if given, re-derive the doc split to verify test bucket")
     p.add_argument("--n-boot", type=int, default=2000)
     p.add_argument("--seed", type=int, default=0)
@@ -585,9 +640,10 @@ def main():
     if args.selftest:
         _selftest()
         return
-    if not args.eval_dir:
-        raise SystemExit("--eval-dir required (or --selftest)")
-    report = run(args.eval_dir, args.split_seed, args.n_boot, args.seed, args.examples, args.bank)
+    if not args.eval_dir and not args.test_dir:
+        raise SystemExit("--eval-dir or --test-dir required (or --selftest)")
+    report = run(args.eval_dir, args.split_seed, args.n_boot, args.seed, args.examples,
+                 args.bank, args.test_dir)
     print(report)
     if args.out:
         Path(args.out).write_text(report + "\n")
