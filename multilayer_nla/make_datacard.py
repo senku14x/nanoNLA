@@ -170,6 +170,47 @@ def build_card(eval_dir, arl24_dir=None, sweep_dir=None, weights_repo=None,
     return "\n".join(parts)
 
 
+def build_model_card(weights_repo=None, results_repo=None, ar_step=3000, av_step=1000,
+                     base="Qwen/Qwen3-8B", weights_prefix=""):
+    """README/model card for the WEIGHTS repo: base model, adapter inventory, how to load,
+    cross-link to the dataset repo. Standalone — needs no eval outputs."""
+    def rp(p):
+        return f"{weights_prefix}/{p}" if weights_prefix else p
+    title = weights_repo or "NLA multi-layer sweep"
+    lines = [f"# {title} — LoRA adapters", "",
+             f"LoRA adapters for the §7 multi-layer NLA SFT control sweep, all on base "
+             f"**[`{base}`](https://huggingface.co/{base})**.", "",
+             "An NLA pairs an **AV** (activation→text verbalizer) with an **AR** (text→activation "
+             "reconstructor) through a natural-language bottleneck. The base model is NOT included — "
+             "load it from the Hub and apply an adapter.", "",
+             "## Adapter inventory", "",
+             "| path | role | detail |", "| --- | --- | --- |",
+             f"| `{rp('ar/iter_%07d' % ar_step)}` | shared AR | reconstructs the FIXED target "
+             f"[L23,L24,L25]; used by every condition's 3-tap eval |",
+             f"| `{rp('ar_L24')}` | L24-only AR | reconstructs just [L24] (single-target cut) |"]
+    for c in CONDS:
+        lines.append(f"| `{rp('av_%s/iter_%07d' % (c, av_step))}` | AV ({c}) | verbalizer; "
+                     f"AV input layers {AV_INPUT_LAYERS[c]} |")
+    lines += ["",
+        "Each **AR** dir also contains `ar_multitap.safetensors` (per-tap identity-init heads) and "
+        "`ar_meta.json` (tap layers, mse_scale, d_model) — both required to reconstruct; see "
+        "`multilayer_nla/evaluate_e2e.py:load_critic`.", "",
+        "## Load an AV (verbalizer)", "",
+        "```python", "from peft import PeftModel",
+        "from transformers import AutoModelForCausalLM, AutoTokenizer",
+        f"base = AutoModelForCausalLM.from_pretrained('{base}', dtype='auto', device_map='auto')",
+        f"tok  = AutoTokenizer.from_pretrained('{base}')",
+        f"av = PeftModel.from_pretrained(base, '{weights_repo or 'REPO'}', "
+        f"subfolder='{rp('av_local/iter_%07d' % av_step)}')",
+        "```", ""]
+    if results_repo:
+        lines += ["## Results & datacard", "",
+                  f"Held-out results, paired contrasts, qualitative samples and the datacard live in "
+                  f"the dataset repo [`{results_repo}`]"
+                  f"(https://huggingface.co/datasets/{results_repo}) under `results/sft_control_sweep/`."]
+    return "\n".join(lines)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -178,6 +219,7 @@ def main():
     p.add_argument("--sweep-dir", help="built-datasets dir ($SWEEP) for row counts, optional")
     p.add_argument("--weights-repo", help="HF model repo id (weights pointer in the card), optional")
     p.add_argument("--results-repo", help="HF dataset repo id (results pointer in the card), optional")
+    p.add_argument("--model-card-out", help="also write the WEIGHTS-repo model card (README.md) here")
     p.add_argument("--n-boot", type=int, default=2000)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", required=True)
@@ -187,6 +229,10 @@ def main():
     Path(args.out).write_text(card + "\n")
     print(card)
     print(f"\n[datacard] -> {args.out}")
+    if args.model_card_out:
+        mc = build_model_card(args.weights_repo, args.results_repo)
+        Path(args.model_card_out).write_text(mc + "\n")
+        print(f"[model-card] -> {args.model_card_out}")
 
 
 if __name__ == "__main__":

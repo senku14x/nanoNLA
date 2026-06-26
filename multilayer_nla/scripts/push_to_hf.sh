@@ -54,7 +54,7 @@ if [ -d "$ARL24" ]; then
 fi
 python -m multilayer_nla.make_datacard --eval-dir "$EVALC" "${ARL24_ARGS[@]}" \
     --sweep-dir "$SWEEP" --weights-repo "$WEIGHTS_REPO" --results-repo "$RESULTS_REPO" \
-    --out "$EVALC/DATACARD.md"
+    --out "$EVALC/DATACARD.md" --model-card-out "$EVALC/MODEL_CARD.md"
 
 # ── 2. results + datacard -> DATASET repo (separate folder; additive) ──
 if [ "$SKIP_RESULTS" != 1 ]; then
@@ -79,6 +79,10 @@ if [ "$SKIP_WEIGHTS" != 1 ]; then
     echo "Set AR_CKPT=/abs/path/to/ar/iter_XXXXXXX (and AV_BASE=... if AVs live elsewhere), then re-run."
     exit 1
   fi
+  # model card (README.md) at the weights repo root, so the HF page explains the adapters
+  [ -f "$EVALC/MODEL_CARD.md" ] && hf upload "$WEIGHTS_REPO" "$EVALC/MODEL_CARD.md" \
+      "$(rjoin "$WEIGHTS_PREFIX" "README.md")" --repo-type "$WEIGHTS_REPO_TYPE" \
+      --commit-message "model card"
   hf upload "$WEIGHTS_REPO" "$AR_CKPT" \
       "$(rjoin "$WEIGHTS_PREFIX" "ar/iter_$(printf '%07d' "$AR_STEP")")" \
       --repo-type "$WEIGHTS_REPO_TYPE" --commit-message "shared AR (step $AR_STEP)"
