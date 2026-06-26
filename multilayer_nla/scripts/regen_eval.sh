@@ -38,15 +38,15 @@ mkdir -p "$SWEEP" "$EVAL/test"
 if [ -z "${HF_TOKEN:-}" ]; then
   echo "!! HF_TOKEN not set. Do:  export HF_TOKEN=hf_xxxxx   then   bash $0"; exit 1
 fi
-huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential >/dev/null
-echo "[hf] logged in as $(huggingface-cli whoami)"
+hf auth login --token "$HF_TOKEN" --add-to-git-credential
+echo "[hf] logged in as $(hf auth whoami)"
 pip install -q hf_transfer 2>/dev/null && export HF_HUB_ENABLE_HF_TRANSFER=1 || true   # parallel chunked pulls
 
 # ── 0b. fetch bank + checkpoints IN PARALLEL (the bank is large; SKIP_DOWNLOAD=1 to reuse) ──
 DL_WORKERS="${DL_WORKERS:-16}"
 if [ -z "${SKIP_DOWNLOAD:-}" ]; then
-  huggingface-cli download "$HF_DATASET" --repo-type dataset --local-dir "$REGEN" --max-workers "$DL_WORKERS"
-  huggingface-cli download "$HF_CKPTS"                      --local-dir "$CKPT"   --max-workers "$DL_WORKERS"
+  hf download "$HF_DATASET" --repo-type dataset --local-dir "$REGEN" --max-workers "$DL_WORKERS"
+  hf download "$HF_CKPTS"                       --local-dir "$CKPT"  --max-workers "$DL_WORKERS"
 fi
 echo "[check] checkpoint tree under $CKPT:"; find "$CKPT" -maxdepth 2 -type d | sort
 [ -f "$(iterdir "$CKPT/ar" "$AR_STEP")/ar_meta.json" ] || {
@@ -90,6 +90,6 @@ python -m multilayer_nla.select_and_report --mode report --test-dir "$EVAL/test"
     --ar-gold-test "$EVAL/test/ar_gold_test.json" --out "$EVAL/result_table.md"
 
 # ── 4. push eval outputs back to HF so they survive the box (SKIP_UPLOAD=1 to skip) ──
-[ -n "${SKIP_UPLOAD:-}" ] || huggingface-cli upload "$HF_DATASET" "$EVAL" sweep_eval --repo-type dataset
+[ -n "${SKIP_UPLOAD:-}" ] || hf upload "$HF_DATASET" "$EVAL" sweep_eval --repo-type dataset
 echo "[regen] DONE -> $EVAL/test/test_<cond>.jsonl (generated_text preserved); table -> $EVAL/result_table.md"
 echo "[regen] sanity: regenerated test_<cond>.json FVE should match result_table.md to the decimal."
