@@ -36,8 +36,9 @@ from pathlib import Path
 
 import numpy as np
 
-CONDS = ("local", "duplicate", "wide", "single")
-AV_INPUT_LAYERS = {"local": "23,24,25", "duplicate": "24,24,24", "wide": "20,24,28", "single": "24"}
+CONDS = ("local", "duplicate", "wide", "single", "s2_19_21_23", "s2_20_22_24")
+AV_INPUT_LAYERS = {"local": "23,24,25", "duplicate": "24,24,24", "wide": "20,24,28", "single": "24",
+                   "s2_19_21_23": "19,21,23", "s2_20_22_24": "20,22,24"}
 TAPS = ("prev", "centre", "next")
 
 
@@ -514,7 +515,7 @@ def _selftest():
             mu = rng.uniform(0.1, 0.6)
             parsed = rng.random() > 0.03
             for c in CONDS:
-                bump = {"local": 0.05, "wide": 0.04, "duplicate": 0.0, "single": -0.03}[c]
+                bump = {"local": 0.05, "wide": 0.04, "duplicate": 0.0, "single": -0.03}.get(c, 0.01)
                 fve = mu + bump + rng.normal(0, 0.02) if parsed else None
                 taps = None
                 rows_by_cond[c].append({

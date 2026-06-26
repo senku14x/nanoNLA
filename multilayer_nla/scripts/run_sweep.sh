@@ -31,7 +31,7 @@ STEPS="${STEPS:-1000}"; SAVE_EVERY="${SAVE_EVERY:-500}"   # ckpts at 500 and 100
 EVAL_BATCH="${EVAL_BATCH:-64}"                    # generation batch for the e2e/AR-gold eval
                                                   #   (pure speed knob — results identical; H200 fits 128-256)
 AR_TAPS="23,24,25"                                # AR reconstruction target — FIXED for every condition
-CONDS=(local duplicate wide single)
+CONDS=(local duplicate wide single s2_19_21_23 s2_20_22_24)
 mkdir -p "$SWEEP" "$CKPT" "$EVAL"
 
 iterdir() { printf '%s/iter_%07d' "$1" "$2"; }    # trainers save to iter_{step+1:07d}

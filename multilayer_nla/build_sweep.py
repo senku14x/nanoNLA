@@ -43,10 +43,15 @@ CONDITIONS = {
     "duplicate": [24, 24, 24],
     "wide":      [20, 24, 28],
     "single":    [24],
+    # stride-2 spans: do MORE-separated layers carry more distinct info than the adjacent
+    # local triplet? AR target stays fixed [23,24,25]; only the AV input slots change.
+    "s2_19_21_23": [19, 21, 23],
+    "s2_20_22_24": [20, 22, 24],
 }
-# The three conditions that share source rows + AR targets and differ ONLY in av_in_*
-# (single has a different marker count, so it's excluded from that identity check).
-IDENTITY_CONDS = ("local", "duplicate", "wide")
+# Conditions that share source rows + AR targets and differ ONLY in av_in_* (all k=3), so
+# the preflight asserts byte-identical targets + source-row identity across them. (single is
+# k=1 — different marker count — so it's excluded from that identity check.)
+IDENTITY_CONDS = ("local", "duplicate", "wide", "s2_19_21_23", "s2_20_22_24")
 AR_TARGET_LAYERS = [23, 24, 25]
 
 
