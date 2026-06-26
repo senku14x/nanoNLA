@@ -178,7 +178,12 @@ def build_model_card(weights_repo=None, results_repo=None, ar_step=3000, av_step
     def rp(p):
         return f"{weights_prefix}/{p}" if weights_prefix else p
     title = weights_repo or "NLA multi-layer sweep"
-    lines = [f"# {title} — LoRA adapters", "",
+    # HF model-card YAML frontmatter (base_model link, peft library, tags) — silences the
+    # "empty or missing yaml metadata" warning and renders the base-model relationship.
+    lines = ["---", f"base_model: {base}", "library_name: peft", "license: apache-2.0",
+             "tags:", "- nla", "- interpretability", "- mechanistic-interpretability",
+             "- lora", "- qwen3", "---", "",
+             f"# {title} — LoRA adapters", "",
              f"LoRA adapters for the §7 multi-layer NLA SFT control sweep, all on base "
              f"**[`{base}`](https://huggingface.co/{base})**.", "",
              "An NLA pairs an **AV** (activation→text verbalizer) with an **AR** (text→activation "
