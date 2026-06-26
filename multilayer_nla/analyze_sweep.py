@@ -334,22 +334,14 @@ def _cmp_block(row, conds):
     return "\n".join(lines)
 
 
-def compare(results, k=4, bank_dir=None):
-    """Side-by-side generated explanations across conditions for the SAME doc/row, sampled at
-    the local-vs-duplicate extremes, the median, and the widest cross-condition disagreement.
-    If bank_dir is given, the source prefix (ending at the verbalized final token) is shown."""
-    conds, joined = _join_conditions(results)
-    if not joined:
-        return "## Cross-condition comparison\n\n(need >=2 conditions' jsonl with matching rows)\n"
-    src_texts = _load_source_texts(bank_dir, {x["src_row_id"] for x in joined}) if bank_dir else {}
-    out = [f"## Cross-condition comparison — same doc/row ({len(joined)} joined; conds: {', '.join(conds)})",
-           "_Read whether the AV input config actually changes the explanation's CONTENT, or just",
-           "produces near-identical boilerplate that scores by distributional luck._\n"]
+def _compare_buckets(joined, conds, k):
+    """The sampled row buckets for the cross-condition view: local-vs-all extremes, the
+    honest counterweight, the typical (median) case, and widest disagreement. Returned as
+    [(title, [rows])] so the compare table AND the next-token probe show the SAME rows."""
     buckets = []
     if "local" in conds and len(conds) > 1:
-        # Cherry-pick rows where local beats ALL other conditions by the most (and the
-        # honest counterweight: where it LOSES to all by the most). These are extremes
-        # selected to favour/disfavour local — a SELECTION EFFECT, illustrative not evidence.
+        # Rows where local beats ALL others by the most (and loses to all by the most).
+        # Extremes selected to favour/disfavour local — a SELECTION EFFECT, not evidence.
         others = [c for c in conds if c != "local"]
         margin = lambda x: _row_fve(x["by_cond"]["local"]) - max(_row_fve(x["by_cond"][o]) for o in others)
         by_margin = sorted(joined, key=margin)
@@ -366,6 +358,21 @@ def compare(results, k=4, bank_dir=None):
         buckets = [("sample rows", joined[:k])]
     spread = lambda x: (lambda vs: max(vs) - min(vs))([_row_fve(x["by_cond"][c]) for c in conds])
     buckets.append(("widest spread across conditions", sorted(joined, key=spread, reverse=True)[:k]))
+    return buckets
+
+
+def compare(results, k=4, bank_dir=None):
+    """Side-by-side generated explanations across conditions for the SAME doc/row, sampled at
+    the local-vs-duplicate extremes, the median, and the widest cross-condition disagreement.
+    If bank_dir is given, the source prefix (ending at the verbalized final token) is shown."""
+    conds, joined = _join_conditions(results)
+    if not joined:
+        return "## Cross-condition comparison\n\n(need >=2 conditions' jsonl with matching rows)\n"
+    src_texts = _load_source_texts(bank_dir, {x["src_row_id"] for x in joined}) if bank_dir else {}
+    out = [f"## Cross-condition comparison — same doc/row ({len(joined)} joined; conds: {', '.join(conds)})",
+           "_Read whether the AV input config actually changes the explanation's CONTENT, or just",
+           "produces near-identical boilerplate that scores by distributional luck._\n"]
+    buckets = _compare_buckets(joined, conds, k)
     for title, rows in buckets:
         out.append(f"### {title}")
         for x in rows:
