@@ -29,6 +29,7 @@ from multilayer_nla.analyze_sweep import (
     _row_fve,
     _src_tail,
     load_results,
+    verify_source_join,
 )
 
 
@@ -67,6 +68,11 @@ def main():
     rows = [(title, r) for title, rs in buckets for r in rs]
     need = {r["src_row_id"] for _, r in rows}
     src = _load_source_texts(args.bank, need)
+    ok, tot, miss = verify_source_join([r for _, r in rows], src)
+    if ok != tot or miss:
+        raise SystemExit(f"source-join MISMATCH ({ok}/{tot} doc_ids match, {miss} missing) — "
+                         f"src_row_id->bank alignment is wrong; refusing to print misleading rows.")
+    print(f"[probe] source-join verified: {ok}/{tot} bank doc_ids match the eval doc_ids ✓")
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -78,7 +84,7 @@ def main():
     probe = {}
     with torch.no_grad():
         for sid in sorted(need):
-            probe[sid] = _probe(model, tok, torch, src.get(sid), device, args.max_ctx, args.topk)
+            probe[sid] = _probe(model, tok, torch, (src.get(sid) or {}).get("text"), device, args.max_ctx, args.topk)
 
     out = ["# Next-token probe on the cross-condition cherry-pick",
            f"_base={args.base_ckpt}; conds: {', '.join(conds)}; the MODEL-next line is the ground-truth "
@@ -89,7 +95,7 @@ def main():
             sid = r["src_row_id"]
             summ = " / ".join(f"{c} {_row_fve(r['by_cond'][c])*100:+.0f}" for c in conds)
             out.append(f"\n**doc {r['doc_id']} · row {sid}**  ({summ})")
-            out.append(f"- SOURCE: {_src_tail(src.get(sid))}")
+            out.append(f"- SOURCE: {_src_tail((src.get(sid) or {}).get('text'))}")
             pr = probe.get(sid)
             if pr:
                 ft, nxt = pr

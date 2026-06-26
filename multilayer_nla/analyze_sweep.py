@@ -274,9 +274,10 @@ def _expl_text(generated, maxchars=400):
 
 
 def _load_source_texts(bank_dir, needed_ids):
-    """Map src_row_id -> detokenized_text_truncated by streaming the rl bank in order.
-    src_row_id is the global ordinal over the rl stream (build_sweep.build_rl_eval), so the
-    Nth row across the sorted rl shards has src_row_id == N. Only `needed_ids` are kept."""
+    """Map src_row_id -> {text, doc_id} by streaming the rl bank in the SAME sorted-glob
+    order build_sweep.build_rl_eval used, so the Nth row has src_row_id == N. doc_id is
+    carried so the caller can verify the join (bank doc_id must == the eval row's doc_id).
+    Only `needed_ids` are kept."""
     import glob as _glob
     import pyarrow.parquet as _pq
     paths = sorted(_glob.glob(str(Path(bank_dir) / "rl.shard*of*.parquet")))
@@ -286,14 +287,31 @@ def _load_source_texts(bank_dir, needed_ids):
     out, gidx = {}, 0
     for p in paths:
         pf = _pq.ParquetFile(p)
-        cols = [c for c in ("detokenized_text_truncated", "n_raw_tokens") if c in pf.schema_arrow.names]
+        names = pf.schema_arrow.names
+        cols = [c for c in ("detokenized_text_truncated", "doc_id") if c in names]
         for b in pf.iter_batches(batch_size=8192, columns=cols):
-            txt = b.column("detokenized_text_truncated").to_pylist() if "detokenized_text_truncated" in cols else [None] * b.num_rows
-            for i, t in enumerate(txt):
+            txt = (b.column("detokenized_text_truncated").to_pylist()
+                   if "detokenized_text_truncated" in cols else [None] * b.num_rows)
+            dids = b.column("doc_id").to_pylist() if "doc_id" in cols else [None] * b.num_rows
+            for i in range(b.num_rows):
                 if gidx + i in needed:
-                    out[gidx + i] = t
+                    out[gidx + i] = {"text": txt[i], "doc_id": dids[i]}
             gidx += b.num_rows
     return out
+
+
+def verify_source_join(joined, src_texts):
+    """Cross-check the src_row_id->bank join: the bank row's doc_id MUST equal the eval
+    row's doc_id (a misordered shard read would land in a different doc). Returns
+    (n_ok, n_total, n_missing)."""
+    n_ok = n_missing = 0
+    for x in joined:
+        rec = src_texts.get(x["src_row_id"])
+        if rec is None:
+            n_missing += 1
+        elif rec.get("doc_id") == x["doc_id"]:
+            n_ok += 1
+    return n_ok, len(joined), n_missing
 
 
 def _src_tail(text, chars=260):
@@ -372,6 +390,10 @@ def compare(results, k=4, bank_dir=None):
     out = [f"## Cross-condition comparison — same doc/row ({len(joined)} joined; conds: {', '.join(conds)})",
            "_Read whether the AV input config actually changes the explanation's CONTENT, or just",
            "produces near-identical boilerplate that scores by distributional luck._\n"]
+    if src_texts:
+        ok, tot, miss = verify_source_join(joined, src_texts)
+        flag = "✓ aligned" if (ok == tot and miss == 0) else f"⚠ {tot - ok} MISMATCH / {miss} missing — SOURCE TEXT UNRELIABLE"
+        out.append(f"_source-join check: bank doc_id matches eval doc_id for {ok}/{tot} rows — {flag}_\n")
     buckets = _compare_buckets(joined, conds, k)
     for title, rows in buckets:
         out.append(f"### {title}")
@@ -379,7 +401,7 @@ def compare(results, k=4, bank_dir=None):
             summ = " / ".join(f"{c} {_row_fve(x['by_cond'][c])*100:+.0f}" for c in conds)
             out.append(f"\n**doc {x['doc_id']} · row {x['src_row_id']}**  ({summ})")
             if src_texts:
-                out.append(f"- _SOURCE (ends at the verbalized final token)_: {_src_tail(src_texts.get(x['src_row_id']))}")
+                out.append(f"- _SOURCE (ends at the verbalized final token)_: {_src_tail((src_texts.get(x['src_row_id']) or {}).get('text'))}")
             out.append(_cmp_block(x, conds))
         out.append("")
     return "\n".join(out)
