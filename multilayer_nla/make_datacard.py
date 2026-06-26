@@ -165,6 +165,7 @@ def build_card(eval_dir, arl24_dir=None, sweep_dir=None, weights_repo=None,
         art += ["- Raw per-condition summaries: `test/test_<cond>.json`; per-example: `test/test_<cond>.jsonl`.",
                 "- Full analysis (distributions, qualitative samples, leakage): `analysis.md`"
                 + (", `analysis_arL24.md`" if arl24_dir else "") + ".",
+                "- Best-verbalization showcase (top-FVE per multi-layer condition): `best_samples.md`.",
                 "- Headline table: `result_table.md`."]
         parts += art
     return "\n".join(parts)

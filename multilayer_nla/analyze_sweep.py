@@ -477,6 +477,52 @@ def compare(results, k=4, bank_dir=None, src_chars=600):
     return "\n".join(out)
 
 
+# ----------------------------------------------------------------- 3c. best-samples showcase
+
+def _distinct(cond):
+    return len({int(t) for t in AV_INPUT_LAYERS[cond].split(",")})
+
+
+def best_samples(results, k=10, bank_dir=None, conds=None, src_chars=600):
+    """Top-k highest-FVE (held-out, parsed) verbalizations per condition — a showcase of where
+    the verbalizer→reconstructor pipeline recovered the token's activation best, each with its
+    source context. Defaults to the MULTI-LAYER-input conditions (>1 distinct AV input layer)."""
+    if conds is None:
+        conds = [c for c in CONDS if c in results and _distinct(c) > 1]
+    conds = [c for c in conds if results.get(c, {}).get("rows")]
+    if not conds:
+        return "# Best multi-layer NLA samples\n\n(no per-example jsonl found for the requested conditions)\n"
+    rowmap, needed = {}, set()
+    for c in conds:
+        rows = [r for r in results[c]["rows"]
+                if r.get("parse_success") and r.get("fve_overall") is not None]
+        rows.sort(key=lambda r: r["fve_overall"], reverse=True)
+        rowmap[c] = rows[:k]
+        needed |= {r.get("src_row_id") for r in rowmap[c]}
+    src_texts = _load_source_texts(bank_dir, needed) if bank_dir else {}
+    out = ["# Best multi-layer NLA samples", "",
+           f"Top-{k} highest-FVE (held-out, parsed) verbalizations per condition — where the "
+           "activation→text→activation pipeline reconstructed a single token's activation best. "
+           "FVE is that row's end-to-end reconstruction score; these are the *successes*, "
+           "selected by FVE, so they are illustrative of the ceiling, not the average.", ""]
+    if src_texts:
+        chk = [{"src_row_id": r.get("src_row_id"), "doc_id": r.get("doc_id")}
+               for c in conds for r in rowmap[c]]
+        ok, tot, miss = verify_source_join(chk, src_texts)
+        out.append(f"_source-join check: bank doc_id matches eval doc_id for {ok}/{tot} shown rows — "
+                   f"{'✓ aligned' if (ok == tot and miss == 0) else '⚠ MISMATCH — source text unreliable'}._\n")
+    for c in conds:
+        out.append(f"## {c}  (AV input layers {AV_INPUT_LAYERS[c]}, {_distinct(c)} distinct)\n")
+        for r in rowmap[c]:
+            out.append(f"**doc {r['doc_id']} · row {r.get('src_row_id')}** — FVE {r['fve_overall']*100:+.1f}%")
+            if src_texts:
+                txt = (src_texts.get(r.get('src_row_id')) or {}).get('text')
+                out.append(f"- _SOURCE_ (ends at verbalized **[token]**): {_src_context(txt, src_chars)}")
+            out.append(f"- _verbalization_: {_expl_text(r.get('generated_text'), maxchars=700)}")
+            out.append("")
+    return "\n".join(out)
+
+
 # ----------------------------------------------------------------- 4. leakage / sanity
 
 def doc_bucket(doc_id, fracs, seed):
@@ -665,6 +711,10 @@ def main():
     p.add_argument("--src-chars", type=int, default=600,
                    help="chars of trailing sentence context per cherry-picked row (with --bank); "
                         "0 = show the ENTIRE source prefix")
+    p.add_argument("--best-samples-out", help="also write a best-samples showcase md here "
+                                              "(top-FVE verbalizations per multi-layer condition)")
+    p.add_argument("--best-k", type=int, default=10, help="samples per condition in the showcase")
+    p.add_argument("--best-conds", help="comma-sep conditions for the showcase (default: multi-layer ones)")
     p.add_argument("--selftest", action="store_true", help="run on fabricated data; no real results needed")
     args = p.parse_args()
     if args.selftest:
@@ -678,6 +728,12 @@ def main():
     if args.out:
         Path(args.out).write_text(report + "\n")
         print(f"\n[analyze] -> {args.out}")
+    if args.best_samples_out:
+        results = load_results(args.eval_dir, args.test_dir)
+        conds = [c.strip() for c in args.best_conds.split(",")] if args.best_conds else None
+        bs = best_samples(results, k=args.best_k, bank_dir=args.bank, conds=conds, src_chars=args.src_chars)
+        Path(args.best_samples_out).write_text(bs + "\n")
+        print(f"[best-samples] -> {args.best_samples_out}")
 
 
 if __name__ == "__main__":

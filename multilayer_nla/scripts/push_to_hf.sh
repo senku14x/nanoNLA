@@ -45,7 +45,8 @@ AV_BASE="${AV_BASE:-$CKPT}"                              # dir holding av_<cond>
 
 # ── 1. (re)generate analysis WITH source tokens, then the datacard (numbers from disk) ──
 python -m multilayer_nla.analyze_sweep --eval-dir "$EVALC" --split-seed 42 \
-    --bank "$REGEN" --out "$EVALC/analysis.md"
+    --bank "$REGEN" --out "$EVALC/analysis.md" \
+    --best-samples-out "$EVALC/best_samples.md" --best-k 10
 ARL24_ARGS=()
 if [ -d "$ARL24" ]; then
   python -m multilayer_nla.analyze_sweep --test-dir "$ARL24" --eval-dir "$EVALC" \
