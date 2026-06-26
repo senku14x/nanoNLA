@@ -273,6 +273,37 @@ def _expl_text(generated, maxchars=400):
     return (t[:maxchars] + "…") if len(t) > maxchars else t
 
 
+def _load_source_texts(bank_dir, needed_ids):
+    """Map src_row_id -> detokenized_text_truncated by streaming the rl bank in order.
+    src_row_id is the global ordinal over the rl stream (build_sweep.build_rl_eval), so the
+    Nth row across the sorted rl shards has src_row_id == N. Only `needed_ids` are kept."""
+    import glob as _glob
+    import pyarrow.parquet as _pq
+    paths = sorted(_glob.glob(str(Path(bank_dir) / "rl.shard*of*.parquet")))
+    if not paths:
+        return {}
+    needed = set(needed_ids)
+    out, gidx = {}, 0
+    for p in paths:
+        pf = _pq.ParquetFile(p)
+        cols = [c for c in ("detokenized_text_truncated", "n_raw_tokens") if c in pf.schema_arrow.names]
+        for b in pf.iter_batches(batch_size=8192, columns=cols):
+            txt = b.column("detokenized_text_truncated").to_pylist() if "detokenized_text_truncated" in cols else [None] * b.num_rows
+            for i, t in enumerate(txt):
+                if gidx + i in needed:
+                    out[gidx + i] = t
+            gidx += b.num_rows
+    return out
+
+
+def _src_tail(text, chars=260):
+    """The END of the source prefix (the activation sits at its final token), collapsed."""
+    if not text:
+        return "(source text unavailable)"
+    t = " ".join(text.split())
+    return ("…" + t[-chars:]) if len(t) > chars else t
+
+
 def _join_conditions(results):
     """Inner-join per-example rows across all available conditions on (doc_id, src_row_id).
     Returns (conds_present, [{doc_id, src_row_id, by_cond:{cond:row}}]) — only rows that exist
@@ -303,12 +334,14 @@ def _cmp_block(row, conds):
     return "\n".join(lines)
 
 
-def compare(results, k=4):
+def compare(results, k=4, bank_dir=None):
     """Side-by-side generated explanations across conditions for the SAME doc/row, sampled at
-    the local-vs-duplicate extremes, the median, and the widest cross-condition disagreement."""
+    the local-vs-duplicate extremes, the median, and the widest cross-condition disagreement.
+    If bank_dir is given, the source prefix (ending at the verbalized final token) is shown."""
     conds, joined = _join_conditions(results)
     if not joined:
         return "## Cross-condition comparison\n\n(need >=2 conditions' jsonl with matching rows)\n"
+    src_texts = _load_source_texts(bank_dir, {x["src_row_id"] for x in joined}) if bank_dir else {}
     out = [f"## Cross-condition comparison — same doc/row ({len(joined)} joined; conds: {', '.join(conds)})",
            "_Read whether the AV input config actually changes the explanation's CONTENT, or just",
            "produces near-identical boilerplate that scores by distributional luck._\n"]
@@ -338,6 +371,8 @@ def compare(results, k=4):
         for x in rows:
             summ = " / ".join(f"{c} {_row_fve(x['by_cond'][c])*100:+.0f}" for c in conds)
             out.append(f"\n**doc {x['doc_id']} · row {x['src_row_id']}**  ({summ})")
+            if src_texts:
+                out.append(f"- _SOURCE (ends at the verbalized final token)_: {_src_tail(src_texts.get(x['src_row_id']))}")
             out.append(_cmp_block(x, conds))
         out.append("")
     return "\n".join(out)
@@ -423,13 +458,13 @@ def bottleneck(results, eval_dir):
 
 # ----------------------------------------------------------------- driver / selftest
 
-def run(eval_dir, split_seed=None, n_boot=2000, seed=0, compare_k=4):
+def run(eval_dir, split_seed=None, n_boot=2000, seed=0, compare_k=4, bank_dir=None):
     results = load_results(eval_dir)
     if not results:
         return (f"No test_<cond>.json found under {Path(eval_dir)/'test'}. "
                 f"This box has no sweep results — copy $DATA/sweep_eval here or run on the H200.")
     parts = [table(results), "", headline(results, n_boot, seed), "",
-             distributions(results), "", compare(results, compare_k), "",
+             distributions(results), "", compare(results, compare_k, bank_dir), "",
              leakage_checks(results, eval_dir, split_seed), "",
              bottleneck(results, eval_dir)]
     return "\n".join(parts)
@@ -514,6 +549,7 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", help="write the report markdown here too")
     p.add_argument("--examples", type=int, default=4, help="rows per bucket in the cross-condition compare")
+    p.add_argument("--bank", help="rl bank dir (REGEN); if set, shows the source prefix per cherry-picked row")
     p.add_argument("--selftest", action="store_true", help="run on fabricated data; no real results needed")
     args = p.parse_args()
     if args.selftest:
@@ -521,7 +557,7 @@ def main():
         return
     if not args.eval_dir:
         raise SystemExit("--eval-dir required (or --selftest)")
-    report = run(args.eval_dir, args.split_seed, args.n_boot, args.seed, args.examples)
+    report = run(args.eval_dir, args.split_seed, args.n_boot, args.seed, args.examples, args.bank)
     print(report)
     if args.out:
         Path(args.out).write_text(report + "\n")
