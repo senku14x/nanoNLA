@@ -359,17 +359,19 @@ def verify_source_join(joined, src_texts):
 
 
 def _src_context(text, maxchars=600):
-    """Trailing context of the source prefix, which ends EXACTLY at the verbalized token.
-    Trimmed to BEGIN at a sentence boundary (so it reads as whole sentences, not a mid-word
-    cut) and with the final token — the activation's position — wrapped in **[...]** so the
-    eye can see what was verbalized in its surrounding context."""
+    """The source prefix, which ends EXACTLY at the verbalized token. With maxchars>0 the
+    trailing window is trimmed to BEGIN at a sentence boundary (whole sentences, not a
+    mid-word cut); maxchars<=0 returns the ENTIRE prefix. The final token — the activation's
+    position — is wrapped in **[...]** so the eye finds what was verbalized in context."""
     if not text:
         return "(source text unavailable)"
     t = " ".join(text.split())
-    tail = t[-maxchars:]
-    if len(t) > maxchars:
+    if maxchars and maxchars > 0 and len(t) > maxchars:
+        tail = t[-maxchars:]
         m = re.search(r"(?<=[.!?])\s+", tail)   # first sentence boundary inside the window
         tail = "… " + (tail[m.end():] if m else tail)
+    else:
+        tail = t
     head, _, last = tail.rpartition(" ")
     return f"{head} **[{last}]**" if last else f"**[{tail}]**"
 
@@ -466,10 +468,10 @@ def compare(results, k=4, bank_dir=None, src_chars=600):
             out.append(f"\n**doc {x['doc_id']} · row {x['src_row_id']}**  ({summ})")
             if src_texts:
                 _txt = (src_texts.get(x['src_row_id']) or {}).get('text')
-                out.append(f"- _VERBALIZED TOKEN_ (the activation's position) ≈ **«{_final_token(_txt)}»**  "
-                           f"_(last word of the prefix; exact subword needs the tokenizer)_")
-                out.append(f"- _CONTEXT_ (source sentences leading up to & ending at the **[token]**): "
-                           f"{_src_context(_txt, src_chars)}")
+                out.append(f"- _SOURCE_ — the text the model read, ending at the verbalized token "
+                           f"**[bracketed]** (≈ «{_final_token(_txt)}»; exact subword needs the tokenizer):")
+                out.append(f"  > {_src_context(_txt, src_chars)}")
+                out.append("- _NLA verbalizations of that token's activation, by condition:_")
             out.append(_cmp_block(x, conds))
         out.append("")
     return "\n".join(out)
@@ -661,7 +663,8 @@ def main():
     p.add_argument("--examples", type=int, default=4, help="rows per bucket in the cross-condition compare")
     p.add_argument("--bank", help="rl bank dir (REGEN); if set, shows the source prefix per cherry-picked row")
     p.add_argument("--src-chars", type=int, default=600,
-                   help="chars of trailing sentence context shown per cherry-picked row (with --bank)")
+                   help="chars of trailing sentence context per cherry-picked row (with --bank); "
+                        "0 = show the ENTIRE source prefix")
     p.add_argument("--selftest", action="store_true", help="run on fabricated data; no real results needed")
     args = p.parse_args()
     if args.selftest:
