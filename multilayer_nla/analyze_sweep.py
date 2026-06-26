@@ -313,13 +313,23 @@ def compare(results, k=4):
            "_Read whether the AV input config actually changes the explanation's CONTENT, or just",
            "produces near-identical boilerplate that scores by distributional luck._\n"]
     buckets = []
+    if "local" in conds and len(conds) > 1:
+        # Cherry-pick rows where local beats ALL other conditions by the most (and the
+        # honest counterweight: where it LOSES to all by the most). These are extremes
+        # selected to favour/disfavour local — a SELECTION EFFECT, illustrative not evidence.
+        others = [c for c in conds if c != "local"]
+        margin = lambda x: _row_fve(x["by_cond"]["local"]) - max(_row_fve(x["by_cond"][o]) for o in others)
+        by_margin = sorted(joined, key=margin)
+        buckets.append(("local >> ALL others — cherry-picked FOR local (selection effect; illustrative, NOT evidence)",
+                        by_margin[-k:][::-1]))
+        buckets.append(("local << ALL others — cherry-picked AGAINST local (the honest counterweight)",
+                        by_margin[:k]))
     if "local" in conds and "duplicate" in conds:
         joined.sort(key=lambda x: _row_fve(x["by_cond"]["local"]) - _row_fve(x["by_cond"]["duplicate"]))
         m = len(joined) // 2
-        buckets = [("duplicate >> local (local loses most)", joined[:k]),
-                   ("local >> duplicate (local wins most)", joined[-k:][::-1]),
-                   ("near-median local-duplicate", joined[max(0, m - k // 2): m + (k - k // 2)])]
-    else:
+        buckets += [("near-median local-duplicate (the typical case, not an extreme)",
+                     joined[max(0, m - k // 2): m + (k - k // 2)])]
+    if not buckets:
         buckets = [("sample rows", joined[:k])]
     spread = lambda x: (lambda vs: max(vs) - min(vs))([_row_fve(x["by_cond"][c]) for c in conds])
     buckets.append(("widest spread across conditions", sorted(joined, key=spread, reverse=True)[:k]))
