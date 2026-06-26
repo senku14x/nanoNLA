@@ -32,6 +32,8 @@ WEIGHTS_REPO_TYPE="${WEIGHTS_REPO_TYPE:-model}"
 WEIGHTS_PREFIX="${WEIGHTS_PREFIX:-}"             # "" = repo root; e.g. "weights" to nest
 
 AR_STEP="${AR_STEP:-3000}"; AV_STEP="${AV_STEP:-1000}"   # the SELECTED checkpoints in the table
+BEST_CONDS="${BEST_CONDS:-local,duplicate,wide,single,s2_19_21_23,s2_20_22_24}"  # best_samples.md scope
+BEST_SRC_CHARS="${BEST_SRC_CHARS:-600}"                  # context per best sample (0 = full prefix)
 SKIP_RESULTS="${SKIP_RESULTS:-0}"               # 1 -> don't re-upload results (already on HF)
 SKIP_WEIGHTS="${SKIP_WEIGHTS:-0}"               # 1 -> only push results
 CONDS=(local duplicate wide single s2_19_21_23 s2_20_22_24)
@@ -46,7 +48,8 @@ AV_BASE="${AV_BASE:-$CKPT}"                              # dir holding av_<cond>
 # ── 1. (re)generate analysis WITH source tokens, then the datacard (numbers from disk) ──
 python -m multilayer_nla.analyze_sweep --eval-dir "$EVALC" --split-seed 42 \
     --bank "$REGEN" --out "$EVALC/analysis.md" \
-    --best-samples-out "$EVALC/best_samples.md" --best-k 10
+    --best-samples-out "$EVALC/best_samples.md" --best-k 10 \
+    --best-conds "$BEST_CONDS" --src-chars "$BEST_SRC_CHARS"
 ARL24_ARGS=()
 if [ -d "$ARL24" ]; then
   python -m multilayer_nla.analyze_sweep --test-dir "$ARL24" --eval-dir "$EVALC" \
