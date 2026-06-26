@@ -82,6 +82,12 @@ if [ "$SKIP_WEIGHTS" != 1 ]; then
   hf upload "$WEIGHTS_REPO" "$AR_CKPT" \
       "$(rjoin "$WEIGHTS_PREFIX" "ar/iter_$(printf '%07d' "$AR_STEP")")" \
       --repo-type "$WEIGHTS_REPO_TYPE" --commit-message "shared AR (step $AR_STEP)"
+  # optional: the L24-only reconstructor used for the test_arL24 cut (set AR_L24_CKPT to push)
+  if [ -n "${AR_L24_CKPT:-}" ]; then
+    [ -d "$AR_L24_CKPT" ] || { echo "MISSING AR_L24 ckpt: $AR_L24_CKPT"; exit 1; }
+    hf upload "$WEIGHTS_REPO" "$AR_L24_CKPT" "$(rjoin "$WEIGHTS_PREFIX" "ar_L24")" \
+        --repo-type "$WEIGHTS_REPO_TYPE" --commit-message "L24-only AR"
+  fi
   for c in "${CONDS[@]}"; do
     hf upload "$WEIGHTS_REPO" "$(iterdir "$AV_BASE/av_$c" "$AV_STEP")" \
         "$(rjoin "$WEIGHTS_PREFIX" "av_$c/iter_$(printf '%07d' "$AV_STEP")")" \

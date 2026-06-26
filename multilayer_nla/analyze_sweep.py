@@ -358,12 +358,20 @@ def verify_source_join(joined, src_texts):
     return n_ok, len(joined), n_missing
 
 
-def _src_tail(text, chars=260):
-    """The END of the source prefix (the activation sits at its final token), collapsed."""
+def _src_context(text, maxchars=600):
+    """Trailing context of the source prefix, which ends EXACTLY at the verbalized token.
+    Trimmed to BEGIN at a sentence boundary (so it reads as whole sentences, not a mid-word
+    cut) and with the final token — the activation's position — wrapped in **[...]** so the
+    eye can see what was verbalized in its surrounding context."""
     if not text:
         return "(source text unavailable)"
     t = " ".join(text.split())
-    return ("…" + t[-chars:]) if len(t) > chars else t
+    tail = t[-maxchars:]
+    if len(t) > maxchars:
+        m = re.search(r"(?<=[.!?])\s+", tail)   # first sentence boundary inside the window
+        tail = "… " + (tail[m.end():] if m else tail)
+    head, _, last = tail.rpartition(" ")
+    return f"{head} **[{last}]**" if last else f"**[{tail}]**"
 
 
 def _final_token(text):
@@ -434,10 +442,11 @@ def _compare_buckets(joined, conds, k):
     return buckets
 
 
-def compare(results, k=4, bank_dir=None):
+def compare(results, k=4, bank_dir=None, src_chars=600):
     """Side-by-side generated explanations across conditions for the SAME doc/row, sampled at
     the local-vs-duplicate extremes, the median, and the widest cross-condition disagreement.
-    If bank_dir is given, the source prefix (ending at the verbalized final token) is shown."""
+    If bank_dir is given, the source prefix (ending at the verbalized final token) is shown,
+    with `src_chars` of trailing sentence context."""
     conds, joined = _join_conditions(results)
     if not joined:
         return "## Cross-condition comparison\n\n(need >=2 conditions' jsonl with matching rows)\n"
@@ -459,7 +468,8 @@ def compare(results, k=4, bank_dir=None):
                 _txt = (src_texts.get(x['src_row_id']) or {}).get('text')
                 out.append(f"- _VERBALIZED TOKEN_ (the activation's position) ≈ **«{_final_token(_txt)}»**  "
                            f"_(last word of the prefix; exact subword needs the tokenizer)_")
-                out.append(f"- _source prefix → ends AT that token_: {_src_tail(_txt)}")
+                out.append(f"- _CONTEXT_ (source sentences leading up to & ending at the **[token]**): "
+                           f"{_src_context(_txt, src_chars)}")
             out.append(_cmp_block(x, conds))
         out.append("")
     return "\n".join(out)
@@ -552,7 +562,8 @@ def bottleneck(results, eval_dir, test_dir=None):
 
 # ----------------------------------------------------------------- driver / selftest
 
-def run(eval_dir, split_seed=None, n_boot=2000, seed=0, compare_k=4, bank_dir=None, test_dir=None):
+def run(eval_dir, split_seed=None, n_boot=2000, seed=0, compare_k=4, bank_dir=None, test_dir=None,
+        src_chars=600):
     results = load_results(eval_dir, test_dir)
     if not results:
         where = Path(test_dir) if test_dir else Path(eval_dir) / "test"
@@ -560,7 +571,7 @@ def run(eval_dir, split_seed=None, n_boot=2000, seed=0, compare_k=4, bank_dir=No
                 f"This box has no sweep results — copy the eval dir here or run on the H200.")
     parts = [table(results), "", headline(results, n_boot, seed), "",
              contrasts(results, n_boot, seed), "",
-             distributions(results), "", compare(results, compare_k, bank_dir), "",
+             distributions(results), "", compare(results, compare_k, bank_dir, src_chars), "",
              leakage_checks(results, eval_dir, split_seed), "",
              bottleneck(results, eval_dir, test_dir)]
     return "\n".join(parts)
@@ -649,6 +660,8 @@ def main():
     p.add_argument("--out", help="write the report markdown here too")
     p.add_argument("--examples", type=int, default=4, help="rows per bucket in the cross-condition compare")
     p.add_argument("--bank", help="rl bank dir (REGEN); if set, shows the source prefix per cherry-picked row")
+    p.add_argument("--src-chars", type=int, default=600,
+                   help="chars of trailing sentence context shown per cherry-picked row (with --bank)")
     p.add_argument("--selftest", action="store_true", help="run on fabricated data; no real results needed")
     args = p.parse_args()
     if args.selftest:
@@ -657,7 +670,7 @@ def main():
     if not args.eval_dir and not args.test_dir:
         raise SystemExit("--eval-dir or --test-dir required (or --selftest)")
     report = run(args.eval_dir, args.split_seed, args.n_boot, args.seed, args.examples,
-                 args.bank, args.test_dir)
+                 args.bank, args.test_dir, args.src_chars)
     print(report)
     if args.out:
         Path(args.out).write_text(report + "\n")
