@@ -51,6 +51,42 @@ def test_ar_loss_per_tap_and_gradients():
                for p in backbone.parameters() if p.requires_grad), "backbone got no grad"
 
 
+def test_single_tap_target_alignment():
+    """Capacity-ablation path: a 1-tap AR must score against ONE target column, not
+    broadcast against the triplet. pred/gold/per-tap MSE are all k=1."""
+    torch.manual_seed(0)
+    backbone, d = _tiny_backbone()
+    model = MultiTapCriticModel(backbone, tap_layers=(4,), d_model=d)  # single tap
+    model.train()
+    mse_scale = math.sqrt(d)
+    B, T = 4, 9
+    ids = torch.randint(0, 120, (B, T))
+    attn = torch.ones(B, T, dtype=torch.long)
+    gold = torch.randn(B, 1, d)  # ONE target column (e.g. activation_centre for L24)
+    loss, pred = ar_compute_loss(model, ids, attn, gold, mse_scale)
+    assert pred.shape == (B, 1, d)
+    assert per_tap_mse(pred, gold, mse_scale).shape == (1,)
+    assert torch.isfinite(loss)
+
+
+def test_tap_target_count_mismatch_raises():
+    """The whole point of the guard: a 1-tap pred against a 3-target gold must FAIL
+    loud, not silently broadcast (which would train the head on the mean of three)."""
+    backbone, d = _tiny_backbone()
+    model = MultiTapCriticModel(backbone, tap_layers=(4,), d_model=d)
+    mse_scale = math.sqrt(d)
+    B, T = 2, 6
+    ids = torch.randint(0, 120, (B, T))
+    attn = torch.ones(B, T, dtype=torch.long)
+    gold3 = torch.randn(B, 3, d)  # WRONG: triplet target with a single-tap model
+    raised = False
+    try:
+        ar_compute_loss(model, ids, attn, gold3, mse_scale)
+    except AssertionError:
+        raised = True
+    assert raised, "1-tap pred vs 3-target gold must raise, not broadcast"
+
+
 def test_perfect_prediction_is_zero_loss():
     backbone, d = _tiny_backbone()
     model = MultiTapCriticModel(backbone, tap_layers=(3, 4, 5), d_model=d)

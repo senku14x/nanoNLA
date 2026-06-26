@@ -151,20 +151,33 @@ def multitap_predict(model, input_ids, attention_mask, mse_scale):
     return torch.stack(preds, dim=1)  # [B, n_taps, d]
 
 
+def _assert_tap_target_aligned(pred, gold):
+    """pred[B,k,d] and gold[B,k,d] must have the SAME tap count, else F.mse_loss /
+    the (pred-gold) subtraction silently BROADCASTS (e.g. a 1-tap pred against a
+    3-target gold trains the head on the mean of all three). Fail loud instead."""
+    assert pred.shape[1] == gold.shape[1], (
+        f"AR tap/target mismatch: pred {tuple(pred.shape)} vs gold {tuple(gold.shape)}. "
+        f"Pass target_cols matching the model's tap_layers (AR_LAYER_TO_TARGET_COL) so a "
+        f"single-/two-tap AR pulls only its target column(s) — otherwise the loss broadcasts."
+    )
+
+
 def three_target_loss(pred, gold, mse_scale):
-    """L_state = (1/3d) Σ_j ||û^j - u^j||^2, averaged over the batch (plan §6.3).
+    """L_state = (1/kd) Σ_j ||û^j - u^j||^2, averaged over the batch (plan §6.3).
 
     pred, gold: [B, n_taps, d] (gold is RAW; both normalized to mse_scale here so
     the cosine identity holds — plan §6.3 note). Mean over all elements equals
-    the per-sample (1/3d)Σ_j averaged over B.
+    the per-sample (1/kd)Σ_j averaged over B. n_taps may be 1 (capacity ablation).
     """
+    _assert_tap_target_aligned(pred, gold)
     pred_n = normalize_activation(pred, mse_scale)
     gold_n = normalize_activation(gold, mse_scale)
     return F.mse_loss(pred_n, gold_n)
 
 
 def three_target_reward(pred, gold, mse_scale):
-    """Per-sample reward r = -(1/3d) Σ_j ||û^j - u^j||^2 (point 5). Returns [B]."""
+    """Per-sample reward r = -(1/kd) Σ_j ||û^j - u^j||^2 (point 5). Returns [B]."""
+    _assert_tap_target_aligned(pred, gold)
     pred_n = normalize_activation(pred, mse_scale)
     gold_n = normalize_activation(gold, mse_scale)
     return -((pred_n - gold_n) ** 2).mean(dim=(1, 2))
