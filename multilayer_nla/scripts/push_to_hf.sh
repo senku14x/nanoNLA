@@ -21,7 +21,7 @@ EVALC="${EVALC:-$DATA/sweep_eval_converged}"     # 3-tap converged eval (test/, 
 SWEEP="${SWEEP:-$DATA/sweep}"                     # built datasets (row counts in the card)
 CKPT="${CKPT:-$DATA/sweep_ckpt}"                  # AR + per-condition AV checkpoints
 REGEN="${REGEN:-$DATA/published_L24x_window}"     # rl bank (source tokens in the qualitative compare)
-ARL24="${ARL24:-$EVALC/test_arL24}"              # L24-only-AR cut (optional)
+ARL24_DIR="${ARL24_DIR:-$EVALC/test_arL24}"      # L24-only-AR EVAL dir (NOT the ckpt) — optional cut
 
 # ── destinations (override via env) ─────────────────────────────────
 RESULTS_REPO="${RESULTS_REPO:-senku21x/qwen3-8b-nla-multilayer-L19-29}"   # DATASET repo (the bank)
@@ -51,10 +51,12 @@ python -m multilayer_nla.analyze_sweep --eval-dir "$EVALC" --split-seed 42 \
     --best-samples-out "$EVALC/best_samples.md" --best-k 10 \
     --best-conds "$BEST_CONDS" --src-chars "$BEST_SRC_CHARS"
 ARL24_ARGS=()
-if [ -d "$ARL24" ]; then
-  python -m multilayer_nla.analyze_sweep --test-dir "$ARL24" --eval-dir "$EVALC" \
+if [ -f "$ARL24_DIR/test_local.json" ]; then   # guard on a real EVAL summary, not just a dir
+  python -m multilayer_nla.analyze_sweep --test-dir "$ARL24_DIR" --eval-dir "$EVALC" \
       --split-seed 42 --bank "$REGEN" --out "$EVALC/analysis_arL24.md"
-  ARL24_ARGS=(--arl24-dir "$ARL24")
+  ARL24_ARGS=(--arl24-dir "$ARL24_DIR")
+else
+  echo "[push] no L24-only summaries at $ARL24_DIR — skipping the L24 cut (set ARL24_DIR=\$EVALC/test_arL24)"
 fi
 python -m multilayer_nla.make_datacard --eval-dir "$EVALC" "${ARL24_ARGS[@]}" \
     --sweep-dir "$SWEEP" --weights-repo "$WEIGHTS_REPO" --results-repo "$RESULTS_REPO" \

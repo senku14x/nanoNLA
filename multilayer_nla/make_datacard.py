@@ -1,4 +1,4 @@
-"""Generate the self-contained DATACARD / results card for the §7 SFT control sweep.
+r"""Generate the self-contained DATACARD / results card for the §7 SFT control sweep.
 
 READ-ONLY reporting layer over `analyze_sweep` — it re-uses the same loaders and the
 paired-bootstrap stats so EVERY number in the card is computed from the frozen eval

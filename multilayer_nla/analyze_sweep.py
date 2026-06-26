@@ -615,8 +615,10 @@ def run(eval_dir, split_seed=None, n_boot=2000, seed=0, compare_k=4, bank_dir=No
     results = load_results(eval_dir, test_dir)
     if not results:
         where = Path(test_dir) if test_dir else Path(eval_dir) / "test"
-        return (f"No test_<cond>.json found under {where}. "
-                f"This box has no sweep results — copy the eval dir here or run on the H200.")
+        raise SystemExit(
+            f"No test_<cond>.json found under {where}. Point --test-dir/--eval-dir at the EVAL "
+            f"outputs (e.g. $EVALC/test_arL24), NOT a checkpoint dir — and don't write a broken "
+            f"report.")
     parts = [table(results), "", headline(results, n_boot, seed), "",
              contrasts(results, n_boot, seed), "",
              distributions(results), "", compare(results, compare_k, bank_dir, src_chars), "",
