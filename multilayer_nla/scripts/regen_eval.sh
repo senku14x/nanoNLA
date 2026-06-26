@@ -30,9 +30,19 @@ CONDS=(local duplicate wide single)
 iterdir() { printf '%s/iter_%07d' "$1" "$2"; }   # trainers save to iter_{step+1:07d}
 mkdir -p "$SWEEP" "$EVAL/test"
 
-# ── 0. fetch bank + checkpoints (SKIP_DOWNLOAD=1 if already present) ─────
+# ── 0a. HF auth (always — needed for the download AND the upload at the end) ──
+#     Paste your token when prompted (hidden), or pre-set HF_TOKEN in the env.
+if [ -z "${HF_TOKEN:-}" ]; then
+  [ -t 0 ] || { echo "!! No HF_TOKEN and no TTY to prompt — run with: HF_TOKEN=hf_xxx bash $0"; exit 1; }
+  read -rsp "Paste your HuggingFace token (input hidden): " HF_TOKEN; echo
+fi
+export HF_TOKEN
+huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential
+huggingface-cli whoami
+pip install -q hf_transfer 2>/dev/null && export HF_HUB_ENABLE_HF_TRANSFER=1 || true   # faster large pulls
+
+# ── 0b. fetch bank + checkpoints (SKIP_DOWNLOAD=1 if already present) ─────
 if [ -z "${SKIP_DOWNLOAD:-}" ]; then
-  [ -n "${HF_TOKEN:-}" ] && huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential || true
   huggingface-cli download "$HF_DATASET" --repo-type dataset --local-dir "$REGEN"
   huggingface-cli download "$HF_CKPTS"                      --local-dir "$CKPT"
 fi
