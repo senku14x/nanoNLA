@@ -31,6 +31,7 @@ import argparse
 import glob
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -258,6 +259,80 @@ def distributions(results):
     return "\n".join(out)
 
 
+# ----------------------------------------------------------------- 3b. cross-condition compare
+
+_EXPL_RE = re.compile(r"<explanation>(.*?)</explanation>", re.DOTALL)
+
+
+def _expl_text(generated, maxchars=400):
+    """The explanation payload (or raw text), whitespace-collapsed and truncated."""
+    if not generated:
+        return "(empty)"
+    m = _EXPL_RE.search(generated)
+    t = " ".join((m.group(1) if m else generated).split())
+    return (t[:maxchars] + "…") if len(t) > maxchars else t
+
+
+def _join_conditions(results):
+    """Inner-join per-example rows across all available conditions on (doc_id, src_row_id).
+    Returns (conds_present, [{doc_id, src_row_id, by_cond:{cond:row}}]) — only rows that exist
+    in EVERY available condition (same input position, fair side-by-side)."""
+    conds = [c for c in CONDS if results.get(c, {}).get("rows")]
+    if len(conds) < 2:
+        return conds, []
+    idx = {c: {(_r["doc_id"], _r.get("src_row_id")): _r for _r in results[c]["rows"]} for c in conds}
+    keys = set.intersection(*[set(idx[c]) for c in conds])
+    joined = [{"doc_id": k[0], "src_row_id": k[1], "by_cond": {c: idx[c][k] for c in conds}}
+              for k in keys]
+    return conds, joined
+
+
+def _row_fve(r):
+    """Per-row penalized FVE: the row's overall FVE if parsed, else 0 (failure)."""
+    v = r.get("fve_overall")
+    return float(v) if (r.get("parse_success") and v is not None) else 0.0
+
+
+def _cmp_block(row, conds):
+    lines = []
+    for c in conds:
+        r = row["by_cond"][c]
+        tag = (f"FVE {r['fve_overall']*100:+.1f}%" if (r.get("parse_success") and r.get("fve_overall") is not None)
+               else "PARSE FAIL")
+        lines.append(f"- **{c:9s}** [{tag}] {_expl_text(r.get('generated_text'))}")
+    return "\n".join(lines)
+
+
+def compare(results, k=4):
+    """Side-by-side generated explanations across conditions for the SAME doc/row, sampled at
+    the local-vs-duplicate extremes, the median, and the widest cross-condition disagreement."""
+    conds, joined = _join_conditions(results)
+    if not joined:
+        return "## Cross-condition comparison\n\n(need >=2 conditions' jsonl with matching rows)\n"
+    out = [f"## Cross-condition comparison — same doc/row ({len(joined)} joined; conds: {', '.join(conds)})",
+           "_Read whether the AV input config actually changes the explanation's CONTENT, or just",
+           "produces near-identical boilerplate that scores by distributional luck._\n"]
+    buckets = []
+    if "local" in conds and "duplicate" in conds:
+        joined.sort(key=lambda x: _row_fve(x["by_cond"]["local"]) - _row_fve(x["by_cond"]["duplicate"]))
+        m = len(joined) // 2
+        buckets = [("duplicate >> local (local loses most)", joined[:k]),
+                   ("local >> duplicate (local wins most)", joined[-k:][::-1]),
+                   ("near-median local-duplicate", joined[max(0, m - k // 2): m + (k - k // 2)])]
+    else:
+        buckets = [("sample rows", joined[:k])]
+    spread = lambda x: (lambda vs: max(vs) - min(vs))([_row_fve(x["by_cond"][c]) for c in conds])
+    buckets.append(("widest spread across conditions", sorted(joined, key=spread, reverse=True)[:k]))
+    for title, rows in buckets:
+        out.append(f"### {title}")
+        for x in rows:
+            summ = " / ".join(f"{c} {_row_fve(x['by_cond'][c])*100:+.0f}" for c in conds)
+            out.append(f"\n**doc {x['doc_id']} · row {x['src_row_id']}**  ({summ})")
+            out.append(_cmp_block(x, conds))
+        out.append("")
+    return "\n".join(out)
+
+
 # ----------------------------------------------------------------- 4. leakage / sanity
 
 def doc_bucket(doc_id, fracs, seed):
@@ -338,13 +413,14 @@ def bottleneck(results, eval_dir):
 
 # ----------------------------------------------------------------- driver / selftest
 
-def run(eval_dir, split_seed=None, n_boot=2000, seed=0):
+def run(eval_dir, split_seed=None, n_boot=2000, seed=0, compare_k=4):
     results = load_results(eval_dir)
     if not results:
         return (f"No test_<cond>.json found under {Path(eval_dir)/'test'}. "
                 f"This box has no sweep results — copy $DATA/sweep_eval here or run on the H200.")
     parts = [table(results), "", headline(results, n_boot, seed), "",
-             distributions(results), "", leakage_checks(results, eval_dir, split_seed), "",
+             distributions(results), "", compare(results, compare_k), "",
+             leakage_checks(results, eval_dir, split_seed), "",
              bottleneck(results, eval_dir)]
     return "\n".join(parts)
 
@@ -369,7 +445,8 @@ def _selftest():
                 taps = None
                 rows_by_cond[c].append({
                     "doc_id": did, "src_row_id": di * ppd + pos,
-                    "generated_text": "x", "parse_success": parsed,
+                    "generated_text": f"<explanation>{c}: doc{di} pos{pos} on topic {di % 5}</explanation>",
+                    "parse_success": parsed,
                     "fve_prev": (fve - 0.01) if parsed else None,
                     "fve_centre": fve if parsed else None,
                     "fve_next": (fve + 0.01) if parsed else None,
@@ -413,6 +490,9 @@ def _selftest():
         assert abs(d["mean_diff"] - 0.05) < 0.01, f"effect size off: {d['mean_diff']}"
         print(f"\n[selftest] paired Δ recovered = {d['mean_diff']*100:+.2f}% "
               f"CI95 [{d['ci_lo']*100:+.2f},{d['ci_hi']*100:+.2f}]  ✓ excludes 0")
+        cj, joined = _join_conditions(results)
+        assert cj == list(CONDS) and len(joined) == n_docs * ppd, (cj, len(joined))
+        print(f"[selftest] compare join: {len(cj)} conds x {len(joined)} shared rows  ✓")
         print("[selftest] PASS")
 
 
@@ -423,6 +503,7 @@ def main():
     p.add_argument("--n-boot", type=int, default=2000)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", help="write the report markdown here too")
+    p.add_argument("--examples", type=int, default=4, help="rows per bucket in the cross-condition compare")
     p.add_argument("--selftest", action="store_true", help="run on fabricated data; no real results needed")
     args = p.parse_args()
     if args.selftest:
@@ -430,7 +511,7 @@ def main():
         return
     if not args.eval_dir:
         raise SystemExit("--eval-dir required (or --selftest)")
-    report = run(args.eval_dir, args.split_seed, args.n_boot, args.seed)
+    report = run(args.eval_dir, args.split_seed, args.n_boot, args.seed, args.examples)
     print(report)
     if args.out:
         Path(args.out).write_text(report + "\n")
