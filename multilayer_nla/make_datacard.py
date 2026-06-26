@@ -110,7 +110,7 @@ CONTROLS = """\
 
 
 def build_card(eval_dir, arl24_dir=None, sweep_dir=None, weights_repo=None,
-               n_boot=2000, seed=0):
+               results_repo=None, n_boot=2000, seed=0):
     results = load_results(eval_dir)
     if not results:
         raise SystemExit(f"no test_<cond>.json under {Path(eval_dir)/'test'}")
@@ -135,13 +135,20 @@ def build_card(eval_dir, arl24_dir=None, sweep_dir=None, weights_repo=None,
     ds = _dataset_section(sweep_dir) if sweep_dir else ""
     if ds:
         parts.append(ds)
-    if weights_repo:
-        parts += [f"\n## Weights & raw artifacts\n",
-                  f"- Weights (LoRA adapters): shared AR + per-condition AV under `{weights_repo}`.",
-                  "- Raw per-condition summaries: `test/test_<cond>.json`; per-example: `test/test_<cond>.jsonl`.",
-                  "- Full analysis (distributions, qualitative samples, leakage): `analysis.md`"
-                  + (", `analysis_arL24.md`" if arl24_dir else "") + ".",
-                  "- Headline table: `result_table.md`."]
+    if weights_repo or results_repo:
+        art = ["\n## Weights & raw artifacts\n"]
+        if weights_repo:
+            art.append(f"- Weights (LoRA adapters): shared AR + per-condition AV — model repo "
+                       f"[`{weights_repo}`](https://huggingface.co/{weights_repo}).")
+        if results_repo:
+            art.append(f"- Results + this datacard: dataset repo "
+                       f"[`{results_repo}`](https://huggingface.co/datasets/{results_repo}) "
+                       f"(alongside the L19-29 activation bank).")
+        art += ["- Raw per-condition summaries: `test/test_<cond>.json`; per-example: `test/test_<cond>.jsonl`.",
+                "- Full analysis (distributions, qualitative samples, leakage): `analysis.md`"
+                + (", `analysis_arL24.md`" if arl24_dir else "") + ".",
+                "- Headline table: `result_table.md`."]
+        parts += art
     return "\n".join(parts)
 
 
@@ -151,13 +158,14 @@ def main():
     p.add_argument("--eval-dir", required=True, help="3-tap sweep dir (expects test/ subdir)")
     p.add_argument("--arl24-dir", help="L24-only-AR test dir ($EVALC/test_arL24), optional")
     p.add_argument("--sweep-dir", help="built-datasets dir ($SWEEP) for row counts, optional")
-    p.add_argument("--weights-repo", help="HF repo id pointer string for the card, optional")
+    p.add_argument("--weights-repo", help="HF model repo id (weights pointer in the card), optional")
+    p.add_argument("--results-repo", help="HF dataset repo id (results pointer in the card), optional")
     p.add_argument("--n-boot", type=int, default=2000)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", required=True)
     args = p.parse_args()
     card = build_card(args.eval_dir, args.arl24_dir, args.sweep_dir, args.weights_repo,
-                      args.n_boot, args.seed)
+                      args.results_repo, args.n_boot, args.seed)
     Path(args.out).write_text(card + "\n")
     print(card)
     print(f"\n[datacard] -> {args.out}")
