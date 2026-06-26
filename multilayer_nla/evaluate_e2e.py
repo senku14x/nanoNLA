@@ -42,6 +42,8 @@ from nla.schema import (
     normalize_activation,
 )
 from multilayer_nla.datasets import (
+    AR_LAYER_TO_TARGET_COL,
+    AR_TARGET_COL_TO_NAME,
     AR_TARGET_COLUMNS,
     apply_chat_template_no_think,
     build_av_prompt,
@@ -215,9 +217,12 @@ def ar_sqerr_batch(critic, tokenizer, expls, golds, mse_scale, device, max_len=1
         for r, (_, ids) in enumerate(chunk):
             bids[r, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
             attn[r, :len(ids)] = 1
-        pred = multitap_predict(critic, bids, attn, mse_scale)                       # [bs,3,d]
+        pred = multitap_predict(critic, bids, attn, mse_scale)                       # [bs,k,d]
         g = torch.stack([torch.as_tensor(golds[oi], dtype=torch.float32, device=device)
-                         for oi, _ in chunk])                                        # [bs,3,d]
+                         for oi, _ in chunk])                                        # [bs,k,d]
+        assert pred.shape[1] == g.shape[1], (
+            f"AR tap/target mismatch: pred {tuple(pred.shape)} vs gold {tuple(g.shape)} — gold must be "
+            f"sliced to the AR's taps (main() does this); refusing to broadcast.")
         pn, gn = normalize_activation(pred, mse_scale), normalize_activation(g, mse_scale)
         se = ((pn - gn) ** 2).mean(dim=2)                                            # [bs,3]
         for r, (oi, _) in enumerate(chunk):
@@ -350,11 +355,19 @@ def main():
     actor, tokenizer, inject_char, inj_id, vectors_ref, eos_ids = load_actor(
         args.base_ckpt, args.av_ckpt, k, args.quant, device)
     critic, mse_scale = load_critic(args.base_ckpt, args.ar_ckpt, args.quant, device)
-    # predict-the-mean baselines from THIS eval split's targets only, per tap, at the
-    # critic's mse_scale (NEVER from AR training rows).
+    # Align the gold targets to the AR's taps: a 3-tap AR scores [L23,L24,L25]; a single-/two-tap
+    # AR (e.g. the L24-only reconstructor) scores ONLY its tap(s). load_eval_rows loaded gold as
+    # [prev,centre,next]; slice to the AR's taps so a 1-tap pred isn't silently broadcast vs 3 cols.
+    tap_cols = [AR_LAYER_TO_TARGET_COL[l] for l in critic.tap_layers]
+    tap_idx = [AR_TARGET_COLUMNS.index(tc) for tc in tap_cols]
+    tap_names = [AR_TARGET_COL_TO_NAME[tc] for tc in tap_cols]
+    for r in rows:
+        r["gold"] = r["gold"][tap_idx]          # [k, d] aligned to the AR's taps
+    # predict-the-mean baselines from THIS eval split's tapped targets only, at the critic's
+    # mse_scale (NEVER from AR training rows).
     baselines = [compute_predict_mean_baselines(
         torch.tensor(np.stack([r["gold"][j] for r in rows]), dtype=torch.float32), mse_scale)[1]
-        for j in range(len(AR_TARGET_COLUMNS))]
+        for j in range(len(tap_idx))]
 
     texts, lens, expls, errs = evaluate(
         actor, tokenizer, critic, inject_char, inj_id, vectors_ref, eos_ids, rows, k,
@@ -377,15 +390,15 @@ def main():
     n_failed = sum(1 for e in errs if e is None)
     summary = {
         "condition": args.condition,
-        "ar_target_layers": [23, 24, 25],
+        "ar_target_layers": list(critic.tap_layers),
         "av_ckpt": args.av_ckpt, "ar_ckpt": args.ar_ckpt, "eval_parquet": args.eval_parquet,
         "n_total": agg["n_total"], "n_success": agg["n_success"],
         "successful_extraction_rate": agg["n_success"] / max(agg["n_total"], 1),
         "failed_generation_count": n_failed,
-        "fve_prev": agg["fve"][0], "fve_centre": agg["fve"][1], "fve_next": agg["fve"][2],
+        **{f"fve_{nm}": agg["fve"][i] for i, nm in enumerate(tap_names)},
         "fve_overall": agg["fve_overall"],
-        "pen_fve_prev": agg["pen_fve"][0], "pen_fve_centre": agg["pen_fve"][1],
-        "pen_fve_next": agg["pen_fve"][2], "pen_fve_overall": agg["pen_fve_overall"],
+        **{f"pen_fve_{nm}": agg["pen_fve"][i] for i, nm in enumerate(tap_names)},
+        "pen_fve_overall": agg["pen_fve_overall"],
         "fve_overall_ci95": list(boot_succ), "pen_fve_overall_ci95": list(boot_pen),
         "shuffled_pen_fve_overall": shuffled_pen,
         "mean_generated_tokens": float(np.mean(lens)) if lens else 0.0,
@@ -402,15 +415,13 @@ def main():
             f.write(json.dumps({
                 "doc_id": r["doc_id"], "condition": args.condition, "src_row_id": r["src_row_id"],
                 "generated_text": t, "parse_success": e is not None,
-                "fve_prev": per_tap_fve[0] if per_tap_fve else None,
-                "fve_centre": per_tap_fve[1] if per_tap_fve else None,
-                "fve_next": per_tap_fve[2] if per_tap_fve else None,
+                **{f"fve_{nm}": (per_tap_fve[i] if per_tap_fve else None) for i, nm in enumerate(tap_names)},
                 "fve_overall": (None if per_tap_fve is None else sum(per_tap_fve) / len(per_tap_fve)),
                 "generation_length": ln,  # generated TOKENS (matches mean/median_generated_tokens)
             }) + "\n")
 
     print(f"[eval:{args.condition}] ext={summary['successful_extraction_rate']:.1%} "
-          f"FVE p/c/n {agg['fve'][0]*100:.1f}/{agg['fve'][1]*100:.1f}/{agg['fve'][2]*100:.1f}% "
+          f"FVE {'/'.join(tap_names)} {'/'.join(f'{v*100:.1f}' for v in agg['fve'])}% "
           f"overall {agg['fve_overall']*100:.1f}% | penalized {agg['pen_fve_overall']*100:.1f}% "
           f"| shuffled {shuffled_pen*100:.1f}% | tok~{summary['mean_generated_tokens']:.0f}")
     print(f"[eval:{args.condition}] summary -> {args.summary}  per-example -> {args.out}")
