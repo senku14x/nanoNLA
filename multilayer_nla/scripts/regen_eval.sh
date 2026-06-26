@@ -30,21 +30,23 @@ CONDS=(local duplicate wide single)
 iterdir() { printf '%s/iter_%07d' "$1" "$2"; }   # trainers save to iter_{step+1:07d}
 mkdir -p "$SWEEP" "$EVAL/test"
 
-# ── 0a. HF auth (always — needed for the download AND the upload at the end) ──
-#     Paste your token when prompted (hidden), or pre-set HF_TOKEN in the env.
+# ── 0a. HF auth — token from the ENV only (NO interactive prompt: pasting a long
+#     token into a hidden `read` crashes many web terminals). Set it first, on one
+#     line, then run this with `bash` (NOT `source`/`.` — set -e would close your shell):
+#         export HF_TOKEN=hf_xxxxx
+#         bash multilayer_nla/scripts/regen_eval.sh
 if [ -z "${HF_TOKEN:-}" ]; then
-  [ -t 0 ] || { echo "!! No HF_TOKEN and no TTY to prompt — run with: HF_TOKEN=hf_xxx bash $0"; exit 1; }
-  read -rsp "Paste your HuggingFace token (input hidden): " HF_TOKEN; echo
+  echo "!! HF_TOKEN not set. Do:  export HF_TOKEN=hf_xxxxx   then   bash $0"; exit 1
 fi
-export HF_TOKEN
-huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential
-huggingface-cli whoami
-pip install -q hf_transfer 2>/dev/null && export HF_HUB_ENABLE_HF_TRANSFER=1 || true   # faster large pulls
+huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential >/dev/null
+echo "[hf] logged in as $(huggingface-cli whoami)"
+pip install -q hf_transfer 2>/dev/null && export HF_HUB_ENABLE_HF_TRANSFER=1 || true   # parallel chunked pulls
 
-# ── 0b. fetch bank + checkpoints (SKIP_DOWNLOAD=1 if already present) ─────
+# ── 0b. fetch bank + checkpoints IN PARALLEL (the bank is large; SKIP_DOWNLOAD=1 to reuse) ──
+DL_WORKERS="${DL_WORKERS:-16}"
 if [ -z "${SKIP_DOWNLOAD:-}" ]; then
-  huggingface-cli download "$HF_DATASET" --repo-type dataset --local-dir "$REGEN"
-  huggingface-cli download "$HF_CKPTS"                      --local-dir "$CKPT"
+  huggingface-cli download "$HF_DATASET" --repo-type dataset --local-dir "$REGEN" --max-workers "$DL_WORKERS"
+  huggingface-cli download "$HF_CKPTS"                      --local-dir "$CKPT"   --max-workers "$DL_WORKERS"
 fi
 echo "[check] checkpoint tree under $CKPT:"; find "$CKPT" -maxdepth 2 -type d | sort
 [ -f "$(iterdir "$CKPT/ar" "$AR_STEP")/ar_meta.json" ] || {
