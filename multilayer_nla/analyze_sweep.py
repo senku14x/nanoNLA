@@ -366,6 +366,17 @@ def _src_tail(text, chars=260):
     return ("…" + t[-chars:]) if len(t) > chars else t
 
 
+def _final_token(text):
+    """Best-effort display of the VERBALIZED token: detokenized_text_truncated ends exactly
+    at the activation's position, so the final whitespace-word is (the tail of) that token.
+    The exact subword boundary needs the live tokenizer, which this CPU-only tool does not
+    load — so this is the last word, labelled approximate, never asserted as the exact token."""
+    if not text:
+        return "(unavailable)"
+    words = text.split()
+    return words[-1] if words else "(empty)"
+
+
 def _join_conditions(results):
     """Inner-join per-example rows across all available conditions on (doc_id, src_row_id).
     Returns (conds_present, [{doc_id, src_row_id, by_cond:{cond:row}}]) — only rows that exist
@@ -445,7 +456,10 @@ def compare(results, k=4, bank_dir=None):
             summ = " / ".join(f"{c} {_row_fve(x['by_cond'][c])*100:+.0f}" for c in conds)
             out.append(f"\n**doc {x['doc_id']} · row {x['src_row_id']}**  ({summ})")
             if src_texts:
-                out.append(f"- _SOURCE (ends at the verbalized final token)_: {_src_tail((src_texts.get(x['src_row_id']) or {}).get('text'))}")
+                _txt = (src_texts.get(x['src_row_id']) or {}).get('text')
+                out.append(f"- _VERBALIZED TOKEN_ (the activation's position) ≈ **«{_final_token(_txt)}»**  "
+                           f"_(last word of the prefix; exact subword needs the tokenizer)_")
+                out.append(f"- _source prefix → ends AT that token_: {_src_tail(_txt)}")
             out.append(_cmp_block(x, conds))
         out.append("")
     return "\n".join(out)
