@@ -10,7 +10,14 @@ DATA="${DATA:-/data/mlnla}"
 EVALC="${EVALC:-$DATA/sweep_eval_converged}"
 DEST="${DEST:-multilayer_nla/results/sft_control_sweep}"
 
-git pull --rebase origin "$BRANCH"
+# refresh the branch only if the tree is clean; a dirty tree (unrelated local edits) must
+# not block the snapshot — we commit ONLY $DEST below, so unrelated changes are untouched.
+if git diff --quiet && git diff --cached --quiet; then
+  git pull --rebase origin "$BRANCH" || echo "[save] pull skipped (continuing)"
+else
+  echo "[save] working tree has local changes; skipping pull (will commit only $DEST):"
+  git status --short
+fi
 mkdir -p "$DEST/test" "$DEST/test_arL24" "$DEST/dev"
 
 # top-level markdown + selection (DATACARD.md, analysis.md, analysis_arL24.md, result_table.md)

@@ -50,22 +50,40 @@ def _dataset_section(sweep_dir):
     wanted = (["ar_common", "ar_dev", "ar_test"] +
               [f"av_{c}" for c in CONDS] +
               [f"rl_dev_{c}" for c in CONDS] + [f"rl_test_{c}" for c in CONDS])
+    counts = {}
     rows = []
     for name in wanted:
         p = sweep_dir / f"{name}.parquet"
         if p.exists():
             try:
                 n = pq.ParquetFile(p).metadata.num_rows
+                counts[name] = n
                 rows.append(f"| `{name}.parquet` | {n:,} |")
             except Exception:
                 rows.append(f"| `{name}.parquet` | (unreadable) |")
     if not rows:
         return ""
+    # INTEGRITY: every av_<cond> streams the full av_sft (no filter), so all counts must be
+    # equal. Flag any outlier loudly — an unequal count means that condition's AV trained on
+    # a truncated/biased subset and its comparison is confounded.
+    av_counts = {c: counts[f"av_{c}"] for c in CONDS if f"av_{c}" in counts}
+    warn = ""
+    if av_counts:
+        mode = max(set(av_counts.values()), key=list(av_counts.values()).count)
+        bad = {c: n for c, n in av_counts.items() if n != mode}
+        if bad:
+            warn = ("\n> ⚠ **AV row-count mismatch — DATA DEFECT.** Every `av_<cond>` must have the\n"
+                    f"> same row count ({mode:,}, the full `av_sft`); these do not: "
+                    + ", ".join(f"`{c}`={n:,}" for c, n in bad.items())
+                    + ".\n> The affected condition(s)' AV trained on a truncated/biased subset — "
+                      "their\n> end-to-end numbers are CONFOUNDED and must be rebuilt or flagged "
+                      "provisional.\n")
     return ("\n## Datasets (built by `build_sweep.py`; raw vectors, `norm=\"none\"`)\n\n"
             "All AV-input columns are positional `av_in_*`; AR targets are the fixed\n"
             "`activation_prev/centre/next` (== L23/L24/L25) — distinct names so the target\n"
-            "cannot follow the input. The condition lives in the data, not a train-time flag.\n\n"
-            "| parquet | rows |\n| --- | ---: |\n" + "\n".join(rows) + "\n")
+            "cannot follow the input. The condition lives in the data, not a train-time flag.\n"
+            + warn +
+            "\n| parquet | rows |\n| --- | ---: |\n" + "\n".join(rows) + "\n")
 
 
 ABSTRACT = """\

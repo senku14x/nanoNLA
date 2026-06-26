@@ -32,9 +32,16 @@ WEIGHTS_REPO_TYPE="${WEIGHTS_REPO_TYPE:-model}"
 WEIGHTS_PREFIX="${WEIGHTS_PREFIX:-}"             # "" = repo root; e.g. "weights" to nest
 
 AR_STEP="${AR_STEP:-3000}"; AV_STEP="${AV_STEP:-1000}"   # the SELECTED checkpoints in the table
+SKIP_RESULTS="${SKIP_RESULTS:-0}"               # 1 -> don't re-upload results (already on HF)
+SKIP_WEIGHTS="${SKIP_WEIGHTS:-0}"               # 1 -> only push results
 CONDS=(local duplicate wide single s2_19_21_23 s2_20_22_24)
 iterdir() { printf '%s/iter_%07d' "$1" "$2"; }
 rjoin()   { if [ -n "$1" ]; then printf '%s/%s' "$1" "$2"; else printf '%s' "$2"; fi; }
+
+# Checkpoint locations — OVERRIDE these if your dirs are named differently. The shared AR
+# trained to a custom dir (e.g. $CKPT/ar_3tap_bs256e_3k), NOT $CKPT/ar — so set AR_CKPT.
+AR_CKPT="${AR_CKPT:-$(iterdir "$CKPT/ar" "$AR_STEP")}"   # full path to the AR iter dir
+AV_BASE="${AV_BASE:-$CKPT}"                              # dir holding av_<cond>/iter_*
 
 # ── 1. (re)generate analysis WITH source tokens, then the datacard (numbers from disk) ──
 python -m multilayer_nla.analyze_sweep --eval-dir "$EVALC" --split-seed 42 \
@@ -50,18 +57,37 @@ python -m multilayer_nla.make_datacard --eval-dir "$EVALC" "${ARL24_ARGS[@]}" \
     --out "$EVALC/DATACARD.md"
 
 # ── 2. results + datacard -> DATASET repo (separate folder; additive) ──
-hf upload "$RESULTS_REPO" "$EVALC" "$RESULTS_PREFIX" --repo-type "$RESULTS_REPO_TYPE" \
-    --commit-message "§7 SFT control sweep — results + datacard"
+if [ "$SKIP_RESULTS" != 1 ]; then
+  hf upload "$RESULTS_REPO" "$EVALC" "$RESULTS_PREFIX" --repo-type "$RESULTS_REPO_TYPE" \
+      --commit-message "§7 SFT control sweep — results + datacard"
+else
+  echo "[push] SKIP_RESULTS=1 — not re-uploading results"
+fi
 
 # ── 3. selected weights (shared AR + per-condition AV) -> MODEL repo ──
-hf upload "$WEIGHTS_REPO" "$(iterdir "$CKPT/ar" "$AR_STEP")" \
-    "$(rjoin "$WEIGHTS_PREFIX" "ar/iter_$(printf '%07d' "$AR_STEP")")" \
-    --repo-type "$WEIGHTS_REPO_TYPE" --commit-message "shared AR (step $AR_STEP)"
-for c in "${CONDS[@]}"; do
-  hf upload "$WEIGHTS_REPO" "$(iterdir "$CKPT/av_$c" "$AV_STEP")" \
-      "$(rjoin "$WEIGHTS_PREFIX" "av_$c/iter_$(printf '%07d' "$AV_STEP")")" \
-      --repo-type "$WEIGHTS_REPO_TYPE" --commit-message "AV $c (step $AV_STEP)"
-done
+if [ "$SKIP_WEIGHTS" != 1 ]; then
+  # fail fast (before any upload) with a discovery listing if a ckpt dir is missing
+  miss=0
+  [ -d "$AR_CKPT" ] || { echo "MISSING AR ckpt: $AR_CKPT"; miss=1; }
+  for c in "${CONDS[@]}"; do
+    d="$(iterdir "$AV_BASE/av_$c" "$AV_STEP")"
+    [ -d "$d" ] || { echo "MISSING AV ckpt: $d"; miss=1; }
+  done
+  if [ "$miss" = 1 ]; then
+    echo "---- candidate checkpoint dirs under $CKPT: ----"
+    ls -d "$CKPT"/*/iter_* 2>/dev/null || ls -d "$CKPT"/* 2>/dev/null || true
+    echo "Set AR_CKPT=/abs/path/to/ar/iter_XXXXXXX (and AV_BASE=... if AVs live elsewhere), then re-run."
+    exit 1
+  fi
+  hf upload "$WEIGHTS_REPO" "$AR_CKPT" \
+      "$(rjoin "$WEIGHTS_PREFIX" "ar/iter_$(printf '%07d' "$AR_STEP")")" \
+      --repo-type "$WEIGHTS_REPO_TYPE" --commit-message "shared AR (step $AR_STEP)"
+  for c in "${CONDS[@]}"; do
+    hf upload "$WEIGHTS_REPO" "$(iterdir "$AV_BASE/av_$c" "$AV_STEP")" \
+        "$(rjoin "$WEIGHTS_PREFIX" "av_$c/iter_$(printf '%07d' "$AV_STEP")")" \
+        --repo-type "$WEIGHTS_REPO_TYPE" --commit-message "AV $c (step $AV_STEP)"
+  done
+fi
 
 echo "[push] results -> https://huggingface.co/datasets/$RESULTS_REPO/tree/main/$RESULTS_PREFIX"
 echo "[push] weights -> https://huggingface.co/$WEIGHTS_REPO/tree/main"
