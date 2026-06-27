@@ -103,6 +103,75 @@ def _draw(ax, data, ceil, target_label):
               loc="upper left", fontsize=8, framealpha=0.95)
 
 
+# ---- grouped-by-target-layer figure (per-tap FVE + AR-gold skyline) + Δ-vs-control panel ----
+G_ORDER = ["single", "local", "duplicate", "wide", "s2_19_21_23", "s2_20_22_24"]
+G_LABEL = {"single": "single", "local": "local", "duplicate": "duplicate", "wide": "wide",
+           "s2_19_21_23": "pre i.", "s2_20_22_24": "pre ii."}
+G_COLOR = {"single": "#b3b3b3", "local": "#3b2f7a", "duplicate": "#2c6fa6", "wide": "#1aa39a",
+           "s2_19_21_23": "#4fc16b", "s2_20_22_24": "#c2d92b"}
+G_TAPS = [("fve_prev", "L23"), ("fve_centre", "L24"), ("fve_next", "L25"), ("fve_overall", "Average")]
+
+
+def plot_by_target(eval_dir, out_path, with_delta=False, split_label="held-out TEST (1,000 docs)"):
+    """Grouped bars: per-target-layer (L23/L24/L25/Average) FVE for each condition + AR-gold
+    skyline. If with_delta, add a right panel of paired Δ-vs-`duplicate` (success-only, 95% CI)."""
+    from multilayer_nla.analyze_sweep import _join, load_results, paired_bootstrap_diff
+    _set_pub_style()
+    res = load_results(eval_dir)  # test/ summaries + per-example rows
+    conds = [c for c in G_ORDER if c in res]
+    if with_delta:
+        fig, (axL, axR) = plt.subplots(1, 2, figsize=(15, 6), gridspec_kw={"width_ratios": [2.4, 1.0]})
+    else:
+        fig, axL = plt.subplots(figsize=(10.5, 6)); axR = None
+
+    ng, nc = len(G_TAPS), len(conds)
+    w = 0.82 / nc
+    for ci, c in enumerate(conds):
+        s = res[c]["summary"]
+        vals = [s[k] * 100 for k, _ in G_TAPS]
+        xs = [g + (ci - (nc - 1) / 2) * w for g in range(ng)]
+        axL.bar(xs, vals, width=w, color=G_COLOR[c], edgecolor="black", linewidth=0.6,
+                label=G_LABEL[c], hatch=("////" if c == "single" else None), zorder=3)
+    g = json.loads((Path(eval_dir) / "test" / "ar_gold_test.json").read_text())
+    gold = [g["fve_prev"] * 100, g["fve_centre"] * 100, g["fve_next"] * 100, g["fve_overall"] * 100]
+    axL.plot(range(ng), gold, "o--", color=C_CEIL, mfc="white", mec=C_CEIL, mew=1.6, lw=1.8, ms=8,
+             label="AR-gold", zorder=5)
+    axL.set_xticks(range(ng)); axL.set_xticklabels([lbl for _, lbl in G_TAPS])
+    axL.set_xlabel("target layer"); axL.set_ylabel("FVE (%)")
+    axL.set_ylim(0, 100); axL.set_yticks(range(0, 101, 10))
+    axL.grid(axis="y", ls=":", alpha=0.4, zorder=0)
+    axL.legend(ncol=2, fontsize=9, loc="upper right", framealpha=0.96)
+    axL.set_title(f"End-to-end FVE by target layer  ·  {split_label}\n"
+                  f"AV input varies; AR target fixed [L23,L24,L25]; shared frozen AR", fontsize=11)
+
+    if axR is not None:
+        dup = res["duplicate"]["rows"]
+        items = []
+        for c in ["single", "local", "s2_19_21_23", "wide", "s2_20_22_24"]:
+            pairs, _, _ = _join(res[c]["rows"], dup)
+            d = paired_bootstrap_diff(pairs, tap=None, penalized=False, n_boot=2000, seed=0)
+            items.append((c, d["mean_diff"] * 100, d["ci_lo"] * 100, d["ci_hi"] * 100))
+        items.sort(key=lambda t: t[1])
+        for y, (c, m, lo, hi) in enumerate(items):
+            axR.barh(y, m, color=G_COLOR[c], edgecolor="black", linewidth=0.6, zorder=3,
+                     xerr=[[m - lo], [hi - m]], error_kw={"ecolor": "#222", "elinewidth": 1.0, "capsize": 3})
+            axR.text(hi + 0.12, y, f"{m:+.1f}", va="center", ha="left", fontsize=9)
+        axR.axvline(0, color="black", lw=1.0, zorder=4)
+        axR.set_yticks(range(len(items))); axR.set_yticklabels([G_LABEL[c] for c, *_ in items])
+        axR.set_xlabel("Δ FVE vs duplicate (pp)")
+        axR.set_title("Effect size vs the k=3\nredundant control (paired, 95% CI)", fontsize=11)
+        axR.grid(axis="x", ls=":", alpha=0.4, zorder=0)
+        axR.margins(x=0.18)
+
+    fig.suptitle("We tried to improve NLAs by giving the AV multi-layer input",
+                 fontsize=13, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(out_path)
+    plt.close(fig)
+    print(f"[plot] -> {out_path}")
+    return out_path
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--eval-dir", required=True, help="dir with test/ and test_arL24/ summaries")
@@ -133,6 +202,14 @@ def main():
         made.append(out / fname)
         panels.append((sub, label, ceil_key))
         print(f"[plot] -> {out / fname}")
+
+    # grouped-by-target-layer test figure (matches the per-target-layer paper layout) +
+    # a Δ-vs-duplicate effect-size variant
+    if (Path(args.eval_dir) / "test" / "test_local.json").exists():
+        plot_by_target(args.eval_dir, out / "fve_test__by_target_layer.png", with_delta=False)
+        made.append(out / "fve_test__by_target_layer.png")
+        plot_by_target(args.eval_dir, out / "fve_test__by_target_layer_with_delta.png", with_delta=True)
+        made.append(out / "fve_test__by_target_layer_with_delta.png")
 
     # side-by-side combined figure for direct comparison
     if len(panels) == 2:
