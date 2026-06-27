@@ -28,7 +28,23 @@ from multilayer_nla.analyze_sweep import AV_INPUT_LAYERS
 
 # single-layer first, then multi-layer by span — left→right is the "diversity+span" ladder
 ORDER = ["single", "duplicate", "local", "s2_19_21_23", "s2_20_22_24", "wide"]
-C_MULTI, C_SINGLE, C_CEIL = "#1a73e8", "#9aa0a6", "#d93025"
+# Okabe-Ito colourblind-safe palette (the ML-paper standard): blue=highlight, grey=control,
+# vermillion=ceiling reference.
+C_MULTI, C_SINGLE, C_CEIL = "#0072B2", "#9E9E9E", "#D55E00"
+
+
+def _set_pub_style():
+    """ICLR/NeurIPS-style: serif fonts, despined axes, readable sizes, high-res export."""
+    matplotlib.rcParams.update({
+        "figure.dpi": 160, "savefig.dpi": 300, "savefig.bbox": "tight",
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "Nimbus Roman", "TeX Gyre Termes", "DejaVu Serif"],
+        "mathtext.fontset": "stix",
+        "font.size": 12, "axes.titlesize": 12.5, "axes.labelsize": 12,
+        "xtick.labelsize": 10.5, "ytick.labelsize": 11, "legend.fontsize": 9.5,
+        "axes.spines.top": False, "axes.spines.right": False,
+        "axes.linewidth": 0.9, "axes.axisbelow": True,
+    })
 
 
 def _distinct(c):
@@ -60,9 +76,10 @@ def _draw(ax, data, ceil, target_label):
     fves = [f for _, f, _ in data]
     yerr = list(zip(*[e for *_, e in data])) if data else [[], []]
     colors = [C_MULTI if _distinct(c) > 1 else C_SINGLE for c, _, _ in data]
-    ax.bar(xs, fves, yerr=yerr, capsize=4, color=colors, edgecolor="black", linewidth=0.6, zorder=3)
+    ax.bar(xs, fves, yerr=yerr, capsize=3, color=colors, edgecolor="black", linewidth=0.7,
+           width=0.7, zorder=3, error_kw={"ecolor": "#222222", "elinewidth": 1.0})
     for x, f in zip(xs, fves):
-        ax.text(x, f + 0.5, f"{f:.1f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
+        ax.text(x, f + 0.6, f"{f:.1f}", ha="center", va="bottom", fontsize=9.5)
     if ceil is not None:
         ax.axhline(ceil, ls="--", color=C_CEIL, lw=1.4, zorder=4)
         ax.text(len(data) - 0.45, ceil + 0.4, f"AR-gold ceiling = {ceil:.1f}",
@@ -92,6 +109,7 @@ def main():
     p.add_argument("--out-dir", required=True)
     p.add_argument("--dpi", type=int, default=160)
     args = p.parse_args()
+    _set_pub_style()
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
