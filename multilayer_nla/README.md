@@ -33,10 +33,14 @@ above, on passive FineWeb activations.
 | `manifest.py` | run provenance (§12.6) | §12.6 | — |
 | `tests/` | 47 offline tests (numpy/pyarrow/torch) | — | anywhere |
 
-**Still pending:** the pre-registered **Gate 0** headroom verdict (deferred by
-the operator until after the higher-priority training runs); the **§7 condition
-flag** (`coherent / duplicate / single / mismatched`) as a train/inject-time
-switch; and the real **coherent + duplicate** run on the labeled corpus.
+**Status update.** The **§7 SFT control sweep is COMPLETE** — 6 conditions
+(local / duplicate / wide / single / s2_19_21_23 / s2_20_22_24), held-out test;
+results + configs in **`EXPERIMENT_REPORT.md`** and **`SWEEP_STATUS.md`** (headline:
+multi-layer AV input helps reconstruction, significant but ~5× smaller than the
+verbalizer→ceiling gap). The condition lives in the **data** (positional `av_in_*`
+columns written by `build_sweep.py`), **not** a train/inject-time flag — the old
+`coherent/duplicate/single/mismatched` flag idea was dropped. **Still pending:** the
+pre-registered **Gate 0** headroom verdict (deferred); RL-per-condition (not yet wired).
 
 ---
 
@@ -179,9 +183,12 @@ not the 4096-token prefix, so this rarely bites — but check the length distrib
 on the regenerated `ar_sft` parquet and raise `--max-len` if a non-trivial fraction
 would be dropped.
 
-The §7 controls (`coherent` / `duplicate` / `single` / `mismatched`) run on these
-**identical labeled rows** — they only change how the triplet is arranged at
-inject time, so they are a train-time flag, not a separate data build.
+The §7 controls run on these **identical labeled rows**. NOTE (updated): the shipped
+sweep makes the condition a **data** property — `build_sweep.py` writes per-condition
+positional `av_in_*` columns (actual conditions: local / duplicate / wide / single /
+s2_19_21_23 / s2_20_22_24), so it IS a separate cheap data build per condition, **not** a
+train/inject-time flag. The AR target stays fixed at [L23,L24,L25] regardless. See
+`SWEEP_STATUS.md` / `EXPERIMENT_REPORT.md`.
 
 ---
 
