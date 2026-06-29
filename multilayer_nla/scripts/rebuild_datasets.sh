@@ -36,12 +36,16 @@ if [ "$miss" = 1 ]; then
 fi
 echo "[rebuild] bank OK at $REGEN"
 
+# splits --source: shard glob if sharded, else the single file (mirrors build_sweep._subset_inputs,
+# so a non-sharded regenerate, e.g. runbook §2b without --num-shards, still works).
+src_for() { if ls "$REGEN/$1".shard*of*.parquet >/dev/null 2>&1; then printf '%s' "$REGEN/$1.shard*of*.parquet"; else printf '%s' "$REGEN/$1.parquet"; fi; }
+
 # ── 1. document-level splits (seed 42, 80/10/10): rl (end-to-end) + ar (gold) ──
 [ -f "$SWEEP/rl_split_manifest.json" ] || python -m multilayer_nla.splits \
-  --source "$REGEN/rl.shard*of*.parquet" --name rl --out-dir "$SWEEP" \
+  --source "$(src_for rl)" --name rl --out-dir "$SWEEP" \
   --seed "$SPLIT_SEED" --fracs 0.8,0.1,0.1 --dev-subset "$DEV_SUBSET" --test-subset "$TEST_SUBSET"
 [ -f "$SWEEP/ar_split_manifest.json" ] || python -m multilayer_nla.splits \
-  --source "$REGEN/ar_sft.shard*of*.parquet" --name ar --out-dir "$SWEEP" \
+  --source "$(src_for ar_sft)" --name ar --out-dir "$SWEEP" \
   --seed "$SPLIT_SEED" --fracs 0.8,0.1,0.1
 
 # ── 2. build ALL 6 conditions + preflight (the canonical, gated build) ──
