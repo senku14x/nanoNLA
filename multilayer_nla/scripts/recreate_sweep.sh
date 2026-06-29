@@ -26,13 +26,17 @@ export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"   # fast mult
 command -v hf >/dev/null || { echo "ABORT: 'hf' CLI not found. pip install -U 'huggingface_hub[cli]' && hf auth login"; exit 1; }
 
 # ── 1. FETCH — bank (dataset repo) + 8 adapters (model repo) ──────────────────
-shopt -s nullglob; have_bank=("$REGEN"/av_sft.shard*of*.parquet); shopt -u nullglob
-if [ ${#have_bank[@]} -eq 0 ]; then
-  echo "[recreate] downloading bank shards from $DS_REPO ..."
+# Need ALL THREE subsets (a prior mean-only pull may have grabbed only av_sft+rl). hf download
+# with --include is idempotent, so this fills any missing subset without re-pulling what's there.
+shopt -s nullglob; need_dl=0
+for sub in av_sft ar_sft rl; do s=("$REGEN"/$sub.shard*of*.parquet); [ ${#s[@]} -gt 0 ] || need_dl=1; done
+shopt -u nullglob
+if [ "$need_dl" -eq 1 ]; then
+  echo "[recreate] downloading bank shards (av_sft+ar_sft+rl) from $DS_REPO ..."
   hf download "$DS_REPO" --repo-type dataset --local-dir "$REGEN" \
     --include "av_sft.shard*of*.parquet" "ar_sft.shard*of*.parquet" "rl.shard*of*.parquet"
 else
-  echo "[recreate] bank already present in $REGEN — skip"
+  echo "[recreate] all three bank subsets present in $REGEN — skip"
 fi
 if [ ! -f "$WEIGHTS/ar/iter_0003000/ar_meta.json" ]; then
   echo "[recreate] downloading 8 adapters from $MODEL_REPO ..."
