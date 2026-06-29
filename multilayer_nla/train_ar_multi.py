@@ -20,7 +20,13 @@ import numpy as np
 import torch
 
 from nla.schema import compute_predict_mean_baselines, normalize_activation
-from multilayer_nla.datasets import SLOT_COLUMNS, load_ar_sft_dataset, prepare_ar_chunk_multi
+from multilayer_nla.datasets import (
+    AR_LAYER_TO_TARGET_COL,
+    AR_TARGET_COL_TO_NAME,
+    SLOT_COLUMNS,
+    load_ar_sft_dataset,
+    prepare_ar_chunk_multi,
+)
 from multilayer_nla.models_multi import (
     DEFAULT_TAP_LAYERS,
     init_multitap_critic_from_base,
@@ -41,15 +47,19 @@ def ar_compute_loss(model, batch_ids, attn, gold, mse_scale):
 
 def per_tap_mse(pred, gold, mse_scale):
     """Per-tap normalized MSE [n_taps] — mean over batch and feature dims."""
+    assert pred.shape[1] == gold.shape[1], (
+        f"per_tap_mse tap/target mismatch: pred {tuple(pred.shape)} vs gold {tuple(gold.shape)} "
+        f"(would broadcast). Pass target_cols matching the model's tap_layers.")
     pn = normalize_activation(pred, mse_scale)
     gn = normalize_activation(gold, mse_scale)
     return ((pn - gn) ** 2).mean(dim=(0, 2))
 
 
-def _per_tap_baselines(rows, mse_scale):
-    """Predict-the-mean MSE baseline per tap (the FVE denominator, §8)."""
+def _per_tap_baselines(rows, mse_scale, cols=SLOT_COLUMNS):
+    """Predict-the-mean MSE baseline per tap (the FVE denominator, §8), one per
+    target column in `cols` (subset for a single-/two-tap AR)."""
     bls = []
-    for c in SLOT_COLUMNS:
+    for c in cols:
         acts = torch.tensor(np.stack([r[c] for r in rows[:4000]]), dtype=torch.float32)
         _, rawvar = compute_predict_mean_baselines(acts, mse_scale)
         bls.append(rawvar)
@@ -58,17 +68,19 @@ def _per_tap_baselines(rows, mse_scale):
 
 @torch.no_grad()
 def evaluate_ar(model, eval_rows, tokenizer, mse_scale, baselines, device,
-                max_len, batch_size, max_batches=None):
+                max_len, batch_size, max_batches=None, target_cols=SLOT_COLUMNS):
     """Held-out per-tap MSE + FVE (no grad). The FVE denominator is the eval set's
     OWN predict-mean baseline (its target variance), so this is generalization FVE on
-    documents unseen in training. Returns (mse[list], fve[list], mean_loss)."""
+    documents unseen in training. `target_cols` must match the model's tap_layers.
+    Returns (mse[list], fve[list], mean_loss)."""
     was_training = model.training
     model.eval()
     mse_acc = torch.zeros(len(baselines), device=device)
     loss_acc, nb = 0.0, 0
     for cs in range(0, len(eval_rows), batch_size):
         chunk = eval_rows[cs:cs + batch_size]
-        ids, attn, gold = prepare_ar_chunk_multi(chunk, tokenizer, device, max_len=max_len)
+        ids, attn, gold = prepare_ar_chunk_multi(chunk, tokenizer, device, max_len=max_len,
+                                                 target_cols=target_cols)
         loss, pred = ar_compute_loss(model, ids, attn, gold, mse_scale)
         mse_acc += per_tap_mse(pred, gold, mse_scale)
         loss_acc += loss.item()
@@ -120,6 +132,13 @@ def main():
     device = "cuda"
     dtype = torch.bfloat16
     tap_layers = tuple(int(x) for x in args.tap_layers.split(","))
+    # The AR reconstruction target is fixed within {L23,L24,L25}; map each tap to its
+    # target column so a single-/two-tap AR (capacity ablation) pulls ONLY that column.
+    assert all(l in AR_LAYER_TO_TARGET_COL for l in tap_layers), (
+        f"AR tap layers must be within the fixed target {{23,24,25}}; got {tap_layers}. "
+        f"The §7 invariant fixes the AR target at [L23,L24,L25] for every condition.")
+    target_cols = tuple(AR_LAYER_TO_TARGET_COL[l] for l in tap_layers)
+    tap_names = tuple(AR_TARGET_COL_TO_NAME[c] for c in target_cols)
 
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.base_ckpt)
@@ -158,15 +177,15 @@ def main():
     d_model = int(np.asarray(rows[0][SLOT_COLUMNS[0]]).shape[-1])
     mse_scale = math.sqrt(d_model)
     print(f"[ar] {len(rows)} rows, d_model={d_model}, mse_scale={mse_scale:.3f}, taps={tap_layers}")
-    baselines = _per_tap_baselines(rows, mse_scale)
+    baselines = _per_tap_baselines(rows, mse_scale, target_cols)
     print("[ar] per-tap predict-mean baselines: " +
-          ", ".join(f"{nm}={b:.4f}" for nm, b in zip(SLOT_NAMES, baselines)))
+          ", ".join(f"{nm}={b:.4f}" for nm, b in zip(tap_names, baselines)))
     eval_rows = eval_baselines = None
     if args.eval_parquet:
         eval_rows = load_ar_sft_dataset(args.eval_parquet)
-        eval_baselines = _per_tap_baselines(eval_rows, mse_scale)
+        eval_baselines = _per_tap_baselines(eval_rows, mse_scale, target_cols)
         print(f"[ar] held-out eval: {len(eval_rows)} rows from {args.eval_parquet}; baselines " +
-              ", ".join(f"{nm}={b:.4f}" for nm, b in zip(SLOT_NAMES, eval_baselines)))
+              ", ".join(f"{nm}={b:.4f}" for nm, b in zip(tap_names, eval_baselines)))
 
     try:
         import bitsandbytes as bnb
@@ -200,7 +219,8 @@ def main():
                 rng.shuffle(perm); cursor = 0
             chunk = [rows[i] for i in perm[cursor:cursor + args.batch_size]]
             cursor += args.batch_size
-            ids, attn, gold = prepare_ar_chunk_multi(chunk, tokenizer, device, max_len=args.max_len)
+            ids, attn, gold = prepare_ar_chunk_multi(chunk, tokenizer, device, max_len=args.max_len,
+                                                     target_cols=target_cols)
             loss, pred = ar_compute_loss(model, ids, attn, gold, mse_scale)
             (loss / grad_accum).backward()
             accum_loss += loss.item()
@@ -213,15 +233,15 @@ def main():
         log = {"step": step, "loss": mean_loss, "lr": sched.get_last_lr()[0],
                "grad_norm": float(grad_norm), "wall_s": time.time() - t0}
         fve_overall = 0.0
-        for nm, m, bl in zip(SLOT_NAMES, tap_mse, baselines):
+        for nm, m, bl in zip(tap_names, tap_mse, baselines):
             fve = 1.0 - m / bl
             log[f"loss/{nm}"] = m
             log[f"fve/{nm}"] = fve
             fve_overall += fve / len(tap_layers)
         log["fve/overall"] = fve_overall
-        print(f"step {step:04d} | loss {mean_loss:.4f} | FVE p/c/n "
-              f"{log['fve/prev']*100:.1f}/{log['fve/centre']*100:.1f}/{log['fve/next']*100:.1f}% "
-              f"| lr {log['lr']:.2e} | t {log['wall_s']:.1f}s", flush=True)
+        fve_str = "/".join(f"{log[f'fve/{nm}']*100:.1f}" for nm in tap_names)
+        print(f"step {step:04d} | loss {mean_loss:.4f} | FVE {'/'.join(tap_names)} "
+              f"{fve_str}% | lr {log['lr']:.2e} | t {log['wall_s']:.1f}s", flush=True)
         if not args.no_wandb:
             import wandb
             wandb.log(log, step=step)
@@ -229,13 +249,13 @@ def main():
         if eval_rows is not None and ((step + 1) % args.eval_every == 0 or (step + 1) == args.num_steps):
             ev_mse, ev_fve, ev_loss = evaluate_ar(
                 model, eval_rows, tokenizer, mse_scale, eval_baselines,
-                device, args.max_len, args.batch_size, args.eval_batches)
+                device, args.max_len, args.batch_size, args.eval_batches, target_cols=target_cols)
             elog = {"eval/loss": ev_loss, "eval/fve/overall": sum(ev_fve) / len(ev_fve)}
-            for nm, m, f in zip(SLOT_NAMES, ev_mse, ev_fve):
+            for nm, m, f in zip(tap_names, ev_mse, ev_fve):
                 elog[f"eval/loss/{nm}"] = m
                 elog[f"eval/fve/{nm}"] = f
-            print(f"  [eval] held-out FVE p/c/n "
-                  f"{ev_fve[0]*100:.1f}/{ev_fve[1]*100:.1f}/{ev_fve[2]*100:.1f}% "
+            ev_str = "/".join(f"{f*100:.1f}" for f in ev_fve)
+            print(f"  [eval] held-out FVE {'/'.join(tap_names)} {ev_str}% "
                   f"| overall {elog['eval/fve/overall']*100:.1f}% | loss {ev_loss:.4f}", flush=True)
             if not args.no_wandb:
                 import wandb
@@ -250,7 +270,8 @@ def main():
                   if ("lora_" in n) or n.startswith("heads.")}
             save_file(sd, str(out / "ar_multitap.safetensors"))
             (out / "ar_meta.json").write_text(json.dumps({
-                "tap_layers": list(tap_layers), "lora_r": args.lora_r, "lora_alpha": args.lora_alpha,
+                "tap_layers": list(tap_layers), "target_cols": list(target_cols),
+                "lora_r": args.lora_r, "lora_alpha": args.lora_alpha,
                 "quant": args.quant, "strip_final_norm": args.strip_final_norm,
                 "mse_scale": mse_scale, "d_model": d_model,
                 "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],

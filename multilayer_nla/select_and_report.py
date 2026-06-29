@@ -25,8 +25,9 @@ import json
 import re
 from pathlib import Path
 
-CONDS = ("local", "duplicate", "wide", "single")
-AV_INPUT_LAYERS = {"local": "23,24,25", "duplicate": "24,24,24", "wide": "20,24,28", "single": "24"}
+CONDS = ("local", "duplicate", "wide", "single", "s2_19_21_23", "s2_20_22_24")
+AV_INPUT_LAYERS = {"local": "23,24,25", "duplicate": "24,24,24", "wide": "20,24,28", "single": "24",
+                   "s2_19_21_23": "19,21,23", "s2_20_22_24": "20,22,24"}
 DEV_RE = re.compile(r"dev_(?P<cond>\w+)_ar(?P<ar>\d+)_av(?P<av>\d+)\.json$")
 
 

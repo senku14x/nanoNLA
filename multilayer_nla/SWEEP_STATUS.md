@@ -1,7 +1,47 @@
 # §7 SFT control sweep — status & handoff
 
-_Last updated: 2026-06-25. Branch `multilayer_working`, PR #3 (draft). This doc is the
-single source of truth for the current experiment; read it before continuing._
+_Last updated: 2026-06-28. **Sweep COMPLETE** (converged run; 6 conditions). Full numbers +
+configs: `multilayer_nla/EXPERIMENT_REPORT.md`. This doc = status, design & handoff; the
+Results section below is the headline, the rest is the design / how-to-run record._
+
+---
+
+## 0. RESULTS (held-out TEST, 1,000 docs) — sweep COMPLETE
+
+**Multi-layer AV input improves reconstruction of the fixed [L23,L24,L25] target — real,
+significant, but modest.** The conclusion rests on the **paired bootstrap over shared
+documents** (marginal CIs overlap; the paired Δ does not). Test overall FVE:
+
+| condition | AV input | test overall FVE | paired Δ vs duplicate (95% CI) |
+| --- | --- | ---: | --- |
+| single | 24 | 39.1 | −0.8 [−1.3, −0.3] |
+| duplicate | 24,24,24 | 39.9 | (control) |
+| local | 23,24,25 | 41.6 | +1.6 [+1.2, +2.1] |
+| s2_19_21_23 | 19,21,23 | 42.1 | +2.2 |
+| wide | 20,24,28 | 43.2 | +3.1 [+2.6, +3.6] |
+| s2_20_22_24 | 20,22,24 | 43.3 | +3.3 |
+
+- **Headline local − duplicate = +1.63pp [+1.17, +2.08]** (layer diversity at fixed k=3 markers).
+- Additive decomposition (all paired CIs exclude 0): marker-count +0.8, **diversity +1.6**,
+  span +1.5; they stack.
+- Diversity helps even WITHOUT the target layer (`s2_19_21_23`, all <L24, beats single/duplicate);
+  proximity adds more (`s2_20_22_24` − `s2_19_21_23` = +1.16 [+0.73, +1.61]).
+- **Replicates on a single-target L24-only AR** (local−duplicate +1.66 [+1.20, +2.11]) → not a
+  3-tap-averaging artifact; the L24-only AR ≈ the 3-tap AR's L24 (no task contention).
+- **Bottleneck is the verbalizer, not the AR.** The ~4pp across-condition spread sits ~20pp
+  below the AR-gold ceiling (test overall 62.4; prev/centre/next 59.7/63.2/64.3). SFT only;
+  warm-start labels are layer-blind (single-layer L24).
+- **Integrity:** `verify_sweep_integrity.py` 83/83 — fixed-target byte-identical across all 6,
+  slot layers correct, shuffled control ≈ −80%, dev/test + corpus disjoint.
+- **Note (data fix):** `av_s2_19_21_23.parquet` first built truncated (74,101 rows vs 216,570,
+  a partial `--mode av` build); rebuilt to full size, AV retrained + re-evaled. Result stable
+  (42.0 → 42.1), so the conclusion is unaffected.
+
+**Selected ckpts:** shared 3-tap AR `ar_3tap_bs256e_3k/iter_0003000` (batch 256, 3000 steps);
+per-condition AV `av_<cond>/iter_0001000` (batch 64, 1000 steps); L24-only AR
+`ar_l24only/iter_0003000`. **Published:** model `senku21x/qwen3-8b-nla-multilayer-sweep` (8
+adapters on frozen Qwen3-8B); results + datacard in dataset
+`senku21x/qwen3-8b-nla-multilayer-L19-29` @ `results/sft_control_sweep/`.
 
 ---
 
@@ -28,10 +68,16 @@ gap between conditions is attributable to the input, not a moving target.
 
 | condition | AV input layers | k / prompt | AR target | role |
 | --- | --- | --- | --- | --- |
-| **local** | 23, 24, 25 | 3 / 3-marker | 23, 24, 25 | ceiling (AV sees the exact target) |
-| **duplicate** | 24, 24, 24 | 3 / 3-marker | 23, 24, 25 | **primary control** — only the centre |
-| **wide** | 20, 24, 28 | 3 / 3-marker | 23, 24, 25 | wider span (secondary; span≠depth confound) |
-| **single** | 24 | 1 / 1-marker | 23, 24, 25 | single-layer baseline (secondary; marker-count confound) |
+| **local** | 23, 24, 25 | 3 / 3-marker | 23, 24, 25 | adjacent triplet (AV sees the exact target) |
+| **duplicate** | 24, 24, 24 | 3 / 3-marker | 23, 24, 25 | **primary control** — only the centre, ×3 |
+| **wide** | 20, 24, 28 | 3 / 3-marker | 23, 24, 25 | wider span (span vs depth) |
+| **single** | 24 | 1 / 1-marker | 23, 24, 25 | single-layer baseline (marker-count confound) |
+| **s2_19_21_23** | 19, 21, 23 | 3 / 3-marker | 23, 24, 25 | stride-2, all below target (diversity without L24) |
+| **s2_20_22_24** | 20, 22, 24 | 3 / 3-marker | 23, 24, 25 | stride-2, spans up to target (diversity + proximity) |
+
+_The two `s2_*` conditions were added after the first 4; they're built per-mode (`--mode av/rl-eval`),
+so re-run `verify_sweep_integrity.py` (or `build_sweep --mode preflight`) to gate them — the
+canonical `--mode all` preflight only covers a single build._
 
 - **Headline test: `local` − `duplicate`** = the marginal value of actually seeing
   the neighbour layers (L23, L25) in the input, vs inferring them from L24 alone —
@@ -113,36 +159,45 @@ wide bank (L19-29 shards, doc_id)
 - **Smoke run** validated the full pipeline end-to-end on tiny steps; **injection
   confirmed working** (English output, not CJK).
 
-## 5. What's HAPPENING now
+## 5. What HAPPENED (run as executed — COMPLETE)
 
-The **real sweep is running on the H200, in tmux**, into fresh dirs
-(`$DATA/sweep`, `$DATA/sweep_ckpt`, `$DATA/sweep_eval`). Sequence: split → build
-(+ preflight) → shared AR (1000 steps) → av local/duplicate/single/wide (1000 each)
-→ 16-cell dev eval grid → dev-only selection → one-shot test → `result_table.md`.
-wandb project **"multi layer nla"**, runs `ar-shared`, `av-local/duplicate/wide/single`
-(eval steps write JSON, not wandb). The 5 SFT trainings are the long pole; if the box
-dies, re-running the same command resumes.
+The converged run differs from the original `run_sweep.sh` defaults in three ways (all
+recorded in the ckpt names / `EXPERIMENT_REPORT.md`):
+- **AR retrained longer/bigger**: `ar_3tap_bs256e_3k` = batch 256, **3000** steps (vs the
+  original undertrained `ar/` at 1000 steps, which is NOT used by any final number). A
+  matched **L24-only AR** `ar_l24only` (tap [24], 3000 steps) was also trained for the
+  single-target cut.
+- **6 AVs** `av_<cond>` at batch 64, 1000 steps (selected `iter_0001000`).
+- Eval lives in `$DATA/sweep_eval_converged` (`test/`, `dev/`, `test_arL24/`); selection by
+  dev `pen_fve_overall` → AR 3000 / AV 1000.
+
+wandb project **"multi layer nla"**; runs named by save-dir (`ar_3tap_bs256e_3k`, `ar_l24only`,
+`av-<cond>`) with full config logged via `config=vars(args)`. Integrity verified 83/83.
+Results published to HF (see §0). The old undertrained `ar/iter_000{500,1000}` is the only
+stale artifact on disk; it feeds nothing and can be deleted.
 
 ## 6. What's NEXT
 
-1. Read **`$DATA/sweep_eval/result_table.md`** — local vs duplicate held-out **test**
-   FVE, with the AR-gold row (reconstructor ceiling) and the shuffled-control row
-   (must collapse) beside it.
-2. **Interpret honestly:** trust the *gap*, not absolute FVE (these are SFT
-   warm-starts, no RL). If `local` clears `duplicate` with separated bootstrap CIs
-   (and AR-gold is high) → the neighbour layers carry recoverable signal and **RL is
-   justified**. If CIs overlap → "no detectable effect at this N," consider a larger
-   `TEST_SUBSET`. AR-gold high but end-to-end low ⇒ the verbalizer/extraction is the
-   bottleneck; AR-gold low ⇒ the reconstructor is.
-3. **Pre-registration discipline:** do NOT change data, hyperparameters, prompts,
-   layer layouts, or evaluator logic after seeing the test table.
-4. **RL is deferred.** RL-per-condition is **not yet wired** — `train_rl_multi.py`
-   still uses the old fixed 3-slot scheme (SLOT_COLUMNS, k=3) for both inject and
-   reward. To RL the sweep conditions it needs the **same input/target decoupling**
-   the evaluator got (inject `av_in_*` with k slots; reward against fixed
-   [23,24,25]). The GRPO surrogate, Fix-4 KL reference, and multitap critic scoring
-   all already exist — it's a contained follow-up, only when the sweep says signal is
-   there to optimise toward.
+The verdict is in (§0): multi-layer input helps but is **secondary** to the verbalizer
+bottleneck (~20pp below the AR-gold ceiling). So the next levers attack the verbalizer / the
+text channel, not the input-layer choice:
+
+1. **Better warm-start labels** (cheap, data-side). Labels are currently layer-blind
+   (single-layer L24) and next-token-flavoured. Two distinct experiments: (a) *causal /
+   important-info-first* structure → should close the AV→gold gap; (b) *more-informative*
+   labels → could raise the 62.4 gold ceiling itself. Test separately so you know which gap moved.
+2. **Multi-token bottleneck** (controlled). Vary the AV token budget (e.g. 60/120/240) with
+   difficulty controlled, and check if FVE rises — raises channel capacity directly, may
+   interact with multi-layer input. NB observationally, longer current outputs score *worse*
+   (difficulty confound), so this needs an intervention, not a correlation.
+3. **RL with a held-out eval.** RL optimises the AV text directly against reconstruction — the
+   one lever SFT lacks — and is the most direct attack on the 20pp gap. **Still not wired:**
+   `train_rl_multi.py` uses the old fixed 3-slot scheme; it needs the same `av_in_*`/fixed-target
+   decoupling the evaluator got (inject k `av_in_*` slots; reward vs fixed [23,24,25]). GRPO
+   surrogate, KL reference, multitap critic already exist. Measure on a proper held-out set —
+   the earlier ~48% was on training rollouts (untrustworthy).
+4. **Pre-registration discipline:** the §7 test numbers are locked; do NOT retro-tune data,
+   hyperparameters, prompts, or evaluator logic against them. New levers = new pre-registered runs.
 5. Optional: gdrive backup of the bank + `sweep*` dirs via rclone.
 
 ## 7. How to run (paths & commands)

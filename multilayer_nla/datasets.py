@@ -79,6 +79,14 @@ def detect_av_slots(parquet_path: str) -> list:
 SLOT_COLUMNS = ("activation_prev", "activation_centre", "activation_next")
 AR_TARGET_COLUMNS = SLOT_COLUMNS
 
+# Map an AR tap (center-relative absolute layer) to its fixed target column. The AR
+# reconstruction target is always within {L23,L24,L25}; a single- or two-tap AR
+# (the capacity-ablation experiment) MUST pull only the matching target columns, or
+# three_target_loss silently broadcasts pred[B,k,d] against gold[B,3,d] and trains the
+# k heads against the mean of all three targets. Keep these two maps in lockstep.
+AR_LAYER_TO_TARGET_COL = {23: "activation_prev", 24: "activation_centre", 25: "activation_next"}
+AR_TARGET_COL_TO_NAME = {"activation_prev": "prev", "activation_centre": "centre", "activation_next": "next"}
+
 
 def av_user_content(k: int = N_SLOTS, placeholder: str = INJECT_PLACEHOLDER) -> str:
     if k not in (1, N_SLOTS):
@@ -338,14 +346,19 @@ def load_ar_sft_dataset(parquet_path: str, n_max: int | None = None) -> list:
     return rows
 
 
-def prepare_ar_chunk_multi(rows: list[dict], tokenizer, device, *, max_len: int = 1024):
-    """(input_ids, attn, gold[B, N_SLOTS, d]) for an AR-SFT batch.
+def prepare_ar_chunk_multi(rows: list[dict], tokenizer, device, *, max_len: int = 1024,
+                           target_cols=SLOT_COLUMNS):
+    """(input_ids, attn, gold[B, len(target_cols), d]) for an AR-SFT batch.
 
     Critic prompt tokenized with add_special_tokens=False (matches RL-time
     scoring; True would prepend BOS on Llama/Gemma -> train/reward mismatch).
     Over-length rows are SKIPPED (right-truncation would cut the <summary>
-    suffix and the last-token tap would land mid-text). gold is the three RAW
-    activations stacked [prev, centre, next] — normalized in the loss.
+    suffix and the last-token tap would land mid-text). gold is the RAW
+    activations for `target_cols` stacked in order — normalized in the loss.
+
+    `target_cols` MUST match the model's tap_layers (via AR_LAYER_TO_TARGET_COL),
+    so a single-/two-tap AR pulls only its target column(s). Default = the full
+    [prev, centre, next] triplet (the shipped 3-tap AR).
     """
     ids_list, kept = [], []
     n_skipped = 0
@@ -368,7 +381,7 @@ def prepare_ar_chunk_multi(rows: list[dict], tokenizer, device, *, max_len: int 
         batch_ids[i, :t.numel()] = t.to(device)
         attn[i, :t.numel()] = 1
     gold = torch.tensor(
-        np.stack([[np.asarray(r[c], dtype=np.float32) for c in SLOT_COLUMNS] for r in kept]),
+        np.stack([[np.asarray(r[c], dtype=np.float32) for c in target_cols] for r in kept]),
         dtype=torch.float32, device=device,
-    )  # [B, N_SLOTS, d]
+    )  # [B, len(target_cols), d]
     return batch_ids, attn, gold

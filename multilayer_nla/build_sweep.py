@@ -43,10 +43,15 @@ CONDITIONS = {
     "duplicate": [24, 24, 24],
     "wide":      [20, 24, 28],
     "single":    [24],
+    # stride-2 spans: do MORE-separated layers carry more distinct info than the adjacent
+    # local triplet? AR target stays fixed [23,24,25]; only the AV input slots change.
+    "s2_19_21_23": [19, 21, 23],
+    "s2_20_22_24": [20, 22, 24],
 }
-# The three conditions that share source rows + AR targets and differ ONLY in av_in_*
-# (single has a different marker count, so it's excluded from that identity check).
-IDENTITY_CONDS = ("local", "duplicate", "wide")
+# Conditions that share source rows + AR targets and differ ONLY in av_in_* (all k=3), so
+# the preflight asserts byte-identical targets + source-row identity across them. (single is
+# k=1 — different marker count — so it's excluded from that identity check.)
+IDENTITY_CONDS = ("local", "duplicate", "wide", "s2_19_21_23", "s2_20_22_24")
 AR_TARGET_LAYERS = [23, 24, 25]
 
 
@@ -423,7 +428,7 @@ def build_all(in_dir, out_dir, rl_manifest, ar_manifest, *, ar_target_layers=AR_
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--mode", choices=["av", "ar", "rl-eval", "all"], required=True)
+    p.add_argument("--mode", choices=["av", "ar", "rl-eval", "all", "preflight"], required=True)
     p.add_argument("--in", dest="inp", help="bank shard glob (single-mode)")
     p.add_argument("--in-dir", help="regen bank dir with av_sft/ar_sft/rl shards (--mode all)")
     p.add_argument("--out", help="output parquet (single-mode)")
@@ -451,6 +456,19 @@ def main():
         build_all(args.in_dir, args.out_dir, args.rl_split_manifest, args.ar_split_manifest,
                   ar_target_layers=_layers(args.ar_target_layers), batch_size=args.batch_size,
                   allow_existing=args.allow_existing, marker_check_ckpt=args.base_ckpt)
+        return
+
+    if args.mode == "preflight":
+        # Run the CANONICAL preflight over an already-built --out-dir (aborts on first
+        # violation). Use as the strict gate after rebuilding a condition; the resilient,
+        # report-all variant is multilayer_nla.verify_sweep_integrity.
+        assert args.out_dir and args.rl_split_manifest, \
+            "--mode preflight needs --out-dir and --rl-split-manifest"
+        rl_seed, rl_fracs, rl_names, _ = _read_split(args.rl_split_manifest)
+        assert_conditions(Path(args.out_dir), rl_fracs, rl_seed)
+        if args.base_ckpt:
+            assert_marker_counts(args.out_dir, args.base_ckpt)
+        print("[sweep:preflight] canonical assert_conditions PASSED")
         return
 
     assert args.inp and args.out, f"--mode {args.mode} needs --in and --out"
