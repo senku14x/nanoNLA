@@ -59,6 +59,20 @@ def _layer_col(L: int) -> str:
     return f"activation_L{L}"
 
 
+def _pool_mean(t, layers):
+    """Element-wise MEAN of the given bank layers -> ONE raw [d] vector per row (the
+    k=1 averaged-input slot). RAW (no normalization — the data-gen invariant); the
+    injection hook norm-matches at inject time exactly as for a single-layer slot.
+    Mean of the raw vectors (not of the √d-normalized ones), so it is a plain pooled
+    activation, comparable to `single` which injects the raw L24 vector."""
+    arrs = [t.column(_layer_col(L)).combine_chunks().flatten()
+             .to_numpy(zero_copy_only=False).astype(np.float32).reshape(t.num_rows, -1)
+            for L in layers]
+    m = np.mean(arrs, axis=0).astype(np.float32)            # [rows, d]
+    flat = pa.array(m.reshape(-1), type=pa.float32())
+    return pa.FixedSizeListArray.from_arrays(flat, m.shape[1])
+
+
 def _need_layers(schema_names, layers, what: str) -> None:
     missing = [_layer_col(L) for L in dict.fromkeys(layers) if _layer_col(L) not in schema_names]
     if missing:
@@ -77,14 +91,20 @@ def _bucket_keep(doc_ids, bucket_idx, fracs, seed, subset=None):
     )
 
 
-def build_av(bank_paths, out_path, av_layers, *, batch_size=4096) -> int:
+def build_av(bank_paths, out_path, av_layers, *, pool=False, batch_size=4096) -> int:
     """av_<cond>.parquet from the av_sft bank: k-marker prompt + response label +
     av_in_*(av_layers) + doc_id + src_row_id. No bucket filter — AV trains on ALL av_sft.
 
     src_row_id is the global ordinal over the av_sft stream (pre-anything), so the
-    same source row gets the same id across local/duplicate/wide (the identity check).
+    same source row gets the same id across local/duplicate/wide (the identity check) —
+    and across the pooled `mean` condition, so it stays paired with them.
+
+    pool=True -> MEAN-pool av_layers into ONE slot (k=1, av_in_0), reusing the 1-marker
+    `single` prompt. The averaged-input condition: the AV sees one vector that mixes the
+    layers instead of k distinct slots; everything downstream (prompt, injection, eval)
+    treats it exactly like `single`.
     """
-    k = len(av_layers)
+    k = 1 if pool else len(av_layers)
     slot_cols = av_in_columns(k)
     av_prompt = build_av_prompt(k)
     schema_names = pq.ParquetFile(bank_paths[0]).schema_arrow.names
@@ -112,8 +132,11 @@ def build_av(bank_paths, out_path, av_layers, *, batch_size=4096) -> int:
                 "doc_id": t.column("doc_id"),
                 "src_row_id": pa.array(list(range(n, n + m)), pa.int64()),
             }
-            for sc, L in zip(slot_cols, av_layers):
-                cols[sc] = t.column(_layer_col(L))
+            if pool:
+                cols["av_in_0"] = _pool_mean(t, av_layers)
+            else:
+                for sc, L in zip(slot_cols, av_layers):
+                    cols[sc] = t.column(_layer_col(L))
             out = pa.table(cols)
             if writer is None:
                 writer = pq.ParquetWriter(out_path, out.schema)
@@ -121,7 +144,8 @@ def build_av(bank_paths, out_path, av_layers, *, batch_size=4096) -> int:
             n += m
     if writer is not None:
         writer.close()
-    print(f"[sweep:av] {Path(out_path).name}  ({n} rows, av_in={av_layers}, k={k})")
+    av_desc = f"mean{av_layers}" if pool else av_layers
+    print(f"[sweep:av] {Path(out_path).name}  ({n} rows, av_in={av_desc}, k={k})")
     return n
 
 
@@ -165,15 +189,19 @@ def build_ar(bank_paths, out_path, target_layers, *, bucket_idx=None, fracs=None
 
 
 def build_rl_eval(bank_paths, out_path, av_layers, target_layers, bucket_idx, fracs, seed,
-                  *, subset=None, batch_size=4096) -> int:
+                  *, pool=False, subset=None, batch_size=4096) -> int:
     """rl_<bucket>_<cond>.parquet from the rl bank: av_in_*(av_layers) +
     activation_prev/centre/next(=target_layers) + doc_id + src_row_id. Filtered to
     bucket_idx (dev/test); optional `subset` (locked doc_ids) restricts further.
 
     src_row_id is the global ordinal over the rl stream (pre-filter) so the same source
-    row gets the same id across conditions.
+    row gets the same id across conditions — INCLUDING the pooled `mean` condition, which
+    is what keeps it paired with single/local for the paired bootstrap. The AR target is
+    the SAME fixed triplet [L23,L24,L25]; only the av_in_* (here, one mean slot) changes.
+
+    pool=True -> MEAN-pool av_layers into ONE slot (k=1, av_in_0); see build_av.
     """
-    k = len(av_layers)
+    k = 1 if pool else len(av_layers)
     slot_cols = av_in_columns(k)
     assert len(target_layers) == len(AR_TARGET_COLUMNS), "rl-eval needs exactly 3 target layers"
     schema_names = pq.ParquetFile(bank_paths[0]).schema_arrow.names
@@ -191,8 +219,11 @@ def build_rl_eval(bank_paths, out_path, av_layers, target_layers, bucket_idx, fr
                 "doc_id": t.column("doc_id"),
                 "src_row_id": pa.array(list(range(seen, seen + m)), pa.int64()),
             }
-            for sc, L in zip(slot_cols, av_layers):
-                cols[sc] = t.column(_layer_col(L))
+            if pool:
+                cols["av_in_0"] = _pool_mean(t, av_layers)
+            else:
+                for sc, L in zip(slot_cols, av_layers):
+                    cols[sc] = t.column(_layer_col(L))
             for tc, L in zip(AR_TARGET_COLUMNS, target_layers):
                 cols[tc] = t.column(_layer_col(L))
             out = pa.table(cols)
@@ -206,7 +237,8 @@ def build_rl_eval(bank_paths, out_path, av_layers, target_layers, bucket_idx, fr
             seen += m
     if writer is not None:
         writer.close()
-    print(f"[sweep:rl-eval] {Path(out_path).name}  ({n} rows, av_in={av_layers}, "
+    print(f"[sweep:rl-eval] {Path(out_path).name}  ({n} rows, "
+          f"av_in={('mean'+str(av_layers)) if pool else av_layers}, "
           f"targets={target_layers}, bucket={bucket_idx})")
     return n
 
@@ -335,6 +367,30 @@ def assert_conditions(out_dir: Path, fracs, seed) -> dict:
     return report
 
 
+def assert_pool_mean(rl_path, pool_layers, target_layers) -> None:
+    """Self-contained gate for a MEAN-pooled rl-eval parquet: av_in_0 must equal the
+    element-wise mean of the pooled layers. When pool_layers == target_layers (the
+    [23,24,25] averaged-input condition), those layers ARE the in-file target columns
+    (activation_prev/centre/next), so the mean is checked EXACTLY with no bank re-read —
+    proving the builder pooled the right layers (the analogue of assert_conditions §5)."""
+    names = pq.ParquetFile(rl_path).schema_arrow.names
+    assert "av_in_0" in names and "av_in_1" not in names, (
+        f"{rl_path}: expected a k=1 pooled parquet (av_in_0 only), got {[n for n in names if n.startswith('av_in_')]}")
+    av0 = _col_np(rl_path, "av_in_0")
+    if list(pool_layers) == list(target_layers):
+        tgt = np.mean([_col_np(rl_path, tc) for tc in AR_TARGET_COLUMNS], axis=0).astype(np.float32)
+        assert np.allclose(av0, tgt, rtol=1e-4, atol=1e-4), (
+            f"{rl_path}: av_in_0 != mean(in-file targets L{target_layers}) — wrong layers pooled")
+        # and it must NOT be any single target (a real mean, not a copy)
+        for tc in AR_TARGET_COLUMNS:
+            assert not np.array_equal(av0, _col_np(rl_path, tc)), (
+                f"{rl_path}: av_in_0 byte-equals {tc} — not a mean (k=1 single-layer slot?)")
+        print(f"[verify-pool] {Path(rl_path).name}: av_in_0 == mean(L{pool_layers}) OK")
+    else:
+        print(f"[verify-pool] {Path(rl_path).name}: pooled {pool_layers} != targets {target_layers}; "
+              f"exact in-file check N/A (recompute the mean from the bank to verify).")
+
+
 def assert_marker_counts(out_dir, base_ckpt) -> None:
     """Render each condition's AV prompt through the REAL tokenizer + chat template and
     assert it has exactly k injection markers — the runtime invariant prepare_av_chunk_multi
@@ -428,12 +484,15 @@ def build_all(in_dir, out_dir, rl_manifest, ar_manifest, *, ar_target_layers=AR_
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--mode", choices=["av", "ar", "rl-eval", "all", "preflight"], required=True)
+    p.add_argument("--mode", choices=["av", "ar", "rl-eval", "all", "preflight", "verify-pool"], required=True)
     p.add_argument("--in", dest="inp", help="bank shard glob (single-mode)")
     p.add_argument("--in-dir", help="regen bank dir with av_sft/ar_sft/rl shards (--mode all)")
     p.add_argument("--out", help="output parquet (single-mode)")
     p.add_argument("--out-dir", help="output dir (--mode all)")
     p.add_argument("--av-slot-layers", help="comma-sep AV input layers, e.g. 23,24,25 or 24,24,24 or 24")
+    p.add_argument("--av-pool", action="store_true",
+                   help="MEAN-pool --av-slot-layers into ONE k=1 slot (av_in_0) — the averaged-input "
+                        "`mean` condition (--mode av / rl-eval). Reuses the 1-marker `single` prompt.")
     p.add_argument("--ar-target-layers", default="23,24,25",
                    help="comma-sep AR target layers (MUST stay 23,24,25 for the sweep)")
     p.add_argument("--bucket", help="split bucket to keep (train|dev|test) for ar / rl-eval")
@@ -471,11 +530,16 @@ def main():
         print("[sweep:preflight] canonical assert_conditions PASSED")
         return
 
+    if args.mode == "verify-pool":
+        assert args.out and args.av_slot_layers, "--mode verify-pool needs --out (rl parquet) and --av-slot-layers"
+        assert_pool_mean(args.out, _layers(args.av_slot_layers), _layers(args.ar_target_layers))
+        return
+
     assert args.inp and args.out, f"--mode {args.mode} needs --in and --out"
     ins = sorted(_glob.glob(args.inp)) or [args.inp]
     if args.mode == "av":
         assert args.av_slot_layers, "--mode av needs --av-slot-layers"
-        build_av(ins, args.out, _layers(args.av_slot_layers), batch_size=args.batch_size)
+        build_av(ins, args.out, _layers(args.av_slot_layers), pool=args.av_pool, batch_size=args.batch_size)
     elif args.mode in ("ar", "rl-eval"):
         seed, fracs, names, sub = _read_split(args.rl_split_manifest) if args.rl_split_manifest else (42, (0.8, 0.1, 0.1), ("train", "dev", "test"), {})
         bidx = _bucket_idx(names, args.bucket) if args.bucket else None
@@ -485,7 +549,8 @@ def main():
         else:
             assert args.av_slot_layers and args.bucket, "--mode rl-eval needs --av-slot-layers and --bucket"
             build_rl_eval(ins, args.out, _layers(args.av_slot_layers), _layers(args.ar_target_layers),
-                          bidx, fracs, seed, subset=sub.get(args.bucket), batch_size=args.batch_size)
+                          bidx, fracs, seed, pool=args.av_pool, subset=sub.get(args.bucket),
+                          batch_size=args.batch_size)
 
 
 if __name__ == "__main__":
