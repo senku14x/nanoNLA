@@ -36,9 +36,12 @@ from pathlib import Path
 
 import numpy as np
 
-CONDS = ("local", "duplicate", "wide", "single", "s2_19_21_23", "s2_20_22_24", "mean")
+CONDS = ("local", "duplicate", "wide", "single", "s2_19_21_23", "s2_20_22_24",
+         "mean", "mean_20_24_28", "mean_19_21_23", "mean_20_22_24")
 AV_INPUT_LAYERS = {"local": "23,24,25", "duplicate": "24,24,24", "wide": "20,24,28", "single": "24",
-                   "s2_19_21_23": "19,21,23", "s2_20_22_24": "20,22,24", "mean": "mean(23,24,25)"}
+                   "s2_19_21_23": "19,21,23", "s2_20_22_24": "20,22,24",
+                   "mean": "mean(23,24,25)", "mean_20_24_28": "mean(20,24,28)",
+                   "mean_19_21_23": "mean(19,21,23)", "mean_20_22_24": "mean(20,22,24)"}
 TAPS = ("prev", "centre", "next")
 
 
@@ -238,6 +241,11 @@ KEY_CONTRASTS = (
     # mean-pool ablation: decompose local−single into pooled-content + slot-distinctness.
     ("mean", "single", "pooled CONTENT @ k=1 — mean(23,24,25) in 1 slot vs L24-only (extra layer content, no extra slots)"),
     ("local", "mean", "slot DISTINCTNESS — 3 distinct slots [23,24,25] vs their MEAN in 1 slot (same content, resolved vs pooled)"),
+    # distinct-vs-pooled at the other layer configs (generalization of the slot-distinctness result).
+    ("wide", "mean_20_24_28", "slot DISTINCTNESS @ wide span — [20,24,28] distinct vs their mean in 1 slot"),
+    ("s2_19_21_23", "mean_19_21_23", "slot DISTINCTNESS @ stride-2 below target — distinct vs pooled"),
+    ("s2_20_22_24", "mean_20_22_24", "slot DISTINCTNESS @ stride-2 incl. L24 — distinct vs pooled"),
+    ("mean_20_22_24", "mean_19_21_23", "target PROXIMITY under POOLING — pool(20,22,24, incl L24) vs pool(19,21,23, below)"),
 )
 
 

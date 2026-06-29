@@ -16,8 +16,15 @@ set -euo pipefail
 export PYTHONPATH="${PYTHONPATH:-$PWD}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-C=mean
+C="${COND:-mean}"                               # condition name (default mean = pool of 23,24,25)
 POOL_LAYERS="${POOL_LAYERS:-23,24,25}"          # layers averaged into the single av_in_0 slot
+# Other pooled triplets (run each as its own condition; outputs keyed by $C so no collision):
+#   COND=mean_20_24_28 POOL_LAYERS=20,24,28  bash .../run_mean_input.sh   (pool of wide)
+#   COND=mean_19_21_23 POOL_LAYERS=19,21,23  bash .../run_mean_input.sh   (pool of s2_19_21_23)
+#   COND=mean_20_22_24 POOL_LAYERS=20,22,24  bash .../run_mean_input.sh   (pool of s2_20_22_24)
+# verify-pool's exact in-file check only applies when POOL_LAYERS == the AR target [23,24,25];
+# for other pools it prints N/A (the pooled layers aren't in-file) — correctness rests on the
+# unit-tested _pool_mean + the CJK smoke. The mean[23,24,25] gate already passed once.
 BASE="${BASE:-Qwen/Qwen3-8B}"
 DATA="${DATA:-/data/mlnla}"
 REGEN="${REGEN:-$DATA/published_L24x_window}"    # L19-29 bank: av_sft.shard*of*.parquet, rl.shard*of*.parquet
