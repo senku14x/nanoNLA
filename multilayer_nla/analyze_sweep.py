@@ -36,9 +36,9 @@ from pathlib import Path
 
 import numpy as np
 
-CONDS = ("local", "duplicate", "wide", "single", "s2_19_21_23", "s2_20_22_24")
+CONDS = ("local", "duplicate", "wide", "single", "s2_19_21_23", "s2_20_22_24", "mean")
 AV_INPUT_LAYERS = {"local": "23,24,25", "duplicate": "24,24,24", "wide": "20,24,28", "single": "24",
-                   "s2_19_21_23": "19,21,23", "s2_20_22_24": "20,22,24"}
+                   "s2_19_21_23": "19,21,23", "s2_20_22_24": "20,22,24", "mean": "mean(23,24,25)"}
 TAPS = ("prev", "centre", "next")
 
 
@@ -235,6 +235,9 @@ KEY_CONTRASTS = (
     ("s2_20_22_24", "local", "SPAN — stride-2 (20,22,24) vs narrow adjacent (23,24,25)"),
     ("s2_20_22_24", "s2_19_21_23", "target PROXIMITY @ equal span-4 stride-2 — (20,22,24, incl. L24) vs (19,21,23, below target)"),
     ("wide", "duplicate", "diversity+span combined vs redundant baseline"),
+    # mean-pool ablation: decompose local−single into pooled-content + slot-distinctness.
+    ("mean", "single", "pooled CONTENT @ k=1 — mean(23,24,25) in 1 slot vs L24-only (extra layer content, no extra slots)"),
+    ("local", "mean", "slot DISTINCTNESS — 3 distinct slots [23,24,25] vs their MEAN in 1 slot (same content, resolved vs pooled)"),
 )
 
 
