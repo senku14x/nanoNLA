@@ -133,6 +133,62 @@ def test_locked_subset_is_deterministic_and_sized():
     assert splits.locked_subset(docs, 9999, seed=42) == sorted(docs)  # n>=len -> all
 
 
+def test_build_sweep_pool_mean():
+    """MEAN-pooled (averaged-input) condition: build_av/build_rl_eval(pool=True) emit a
+    single k=1 slot av_in_0 == mean of the pooled layers, pass the assert_pool_mean gate,
+    and stay paired (doc_id, src_row_id) with single[24] so the paired bootstrap holds.
+    Quadratic-in-L synthetic bank so mean(L23,24,25) != any single layer (the default
+    linear bank would make the mean exactly == L24 and mask a copy-vs-mean bug)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        bank = Path(tmp) / "bank"
+        sweep = Path(tmp) / "sweep"
+        bank.mkdir(parents=True, exist_ok=True)
+
+        def valnl(doc, pos, L):
+            return float(doc) * 1000.0 + float(pos) + float(L * L) * 0.001
+
+        for subset, with_resp in (("av_sft", True), ("rl", False)):
+            cols = {L: [] for L in LAYERS}
+            dids, resp = [], []
+            for doc in range(60):
+                for pos in range(3):
+                    for L in LAYERS:
+                        cols[L].append(np.full(D, valnl(doc, pos, L), np.float32))
+                    dids.append(f"{subset}:{doc}")
+                    if with_resp:
+                        resp.append(wrap_explanation(f"e{doc}.{pos}"))
+            tbl = {"doc_id": pa.array(dids)}
+            for L in LAYERS:
+                tbl[f"activation_L{L}"] = _fsl(cols[L])
+            if with_resp:
+                tbl["response"] = pa.array(resp)
+            pq.write_table(pa.table(tbl), str(bank / f"{subset}.shard00of01.parquet"), row_group_size=53)
+
+        splits.build_split_manifest([str(bank / "rl.shard00of01.parquet")], "rl", str(sweep),
+                                    seed=42, dev_subset=None, test_subset=None)
+        seed, fracs, names, sub = build_sweep._read_split(str(sweep / "rl_split_manifest.json"))
+        avb = [str(bank / "av_sft.shard00of01.parquet")]
+        rlb = [str(bank / "rl.shard00of01.parquet")]
+
+        build_sweep.build_av(avb, str(sweep / "av_mean.parquet"), [23, 24, 25], pool=True)
+        nm = pq.ParquetFile(sweep / "av_mean.parquet").schema_arrow.names
+        assert "av_in_0" in nm and "av_in_1" not in nm, "pooled AV must be k=1 (av_in_0 only)"
+
+        bidx = list(names).index("dev")
+        build_sweep.build_rl_eval(rlb, str(sweep / "rl_dev_mean.parquet"), [23, 24, 25], [23, 24, 25],
+                                  bidx, fracs, seed, pool=True, subset=sub.get("dev"))
+        build_sweep.build_rl_eval(rlb, str(sweep / "rl_dev_single.parquet"), [24], [23, 24, 25],
+                                  bidx, fracs, seed, subset=sub.get("dev"))
+        # exact gate: av_in_0 == mean(in-file targets L23/24/25) and != each single target
+        build_sweep.assert_pool_mean(str(sweep / "rl_dev_mean.parquet"), [23, 24, 25], [23, 24, 25])
+        # pooling must NOT change which rows survive -> stays paired with single
+        def key(p):
+            t = pq.read_table(p, columns=["doc_id", "src_row_id"])
+            return list(zip(t.column("doc_id").to_pylist(), t.column("src_row_id").to_pylist()))
+        assert key(sweep / "rl_dev_mean.parquet") == key(sweep / "rl_dev_single.parquet"), \
+            "pooled rows not paired with single (doc_id, src_row_id) — paired bootstrap would break"
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
