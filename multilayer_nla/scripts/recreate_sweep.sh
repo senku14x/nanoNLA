@@ -21,7 +21,8 @@ REGEN="${REGEN:-$DATA/bank}"        # bank shards land here
 WEIGHTS="${WEIGHTS:-$DATA/weights}" # downloaded adapters land here
 SWEEP="${SWEEP:-$DATA/sweep}"       # rebuilt datasets
 mkdir -p "$REGEN" "$WEIGHTS" "$SWEEP"
-export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"   # fast multi-threaded pull
+export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"   # per-file multi-threaded transfer
+HF_WORKERS="${HF_WORKERS:-8}"   # concurrent files (24 bank shards -> downloads 8 at a time)
 
 command -v hf >/dev/null || { echo "ABORT: 'hf' CLI not found. pip install -U 'huggingface_hub[cli]' && hf auth login"; exit 1; }
 
@@ -32,15 +33,15 @@ shopt -s nullglob; need_dl=0
 for sub in av_sft ar_sft rl; do s=("$REGEN"/$sub.shard*of*.parquet); [ ${#s[@]} -gt 0 ] || need_dl=1; done
 shopt -u nullglob
 if [ "$need_dl" -eq 1 ]; then
-  echo "[recreate] downloading bank shards (av_sft+ar_sft+rl) from $DS_REPO ..."
-  hf download "$DS_REPO" --repo-type dataset --local-dir "$REGEN" \
+  echo "[recreate] downloading bank shards (av_sft+ar_sft+rl) from $DS_REPO with $HF_WORKERS workers ..."
+  hf download "$DS_REPO" --repo-type dataset --local-dir "$REGEN" --max-workers "$HF_WORKERS" \
     --include "av_sft.shard*of*.parquet" "ar_sft.shard*of*.parquet" "rl.shard*of*.parquet"
 else
   echo "[recreate] all three bank subsets present in $REGEN — skip"
 fi
 if [ ! -f "$WEIGHTS/ar/iter_0003000/ar_meta.json" ]; then
   echo "[recreate] downloading 8 adapters from $MODEL_REPO ..."
-  hf download "$MODEL_REPO" --local-dir "$WEIGHTS"   # idempotent
+  hf download "$MODEL_REPO" --local-dir "$WEIGHTS" --max-workers "$HF_WORKERS"   # idempotent
 else
   echo "[recreate] adapters already present in $WEIGHTS — skip"
 fi
