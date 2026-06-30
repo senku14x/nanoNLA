@@ -232,8 +232,9 @@ def write_summary(out_md, cells, gains, conditional_label, *, target_layers=TARG
     for B in budgets:
         row = [f"{cells[f'{B},{l}']['fve_real_minus_shuffled']*100:+.1f}" for l in target_layers]
         lines.append(f"| {B} | " + " | ".join(row) + " |")
+    b0, b1, b2 = budgets
     lines += ["", f"G_local = {gains['G_local']*100:+.2f}pp  ·  G_outer = {gains['G_outer']*100:+.2f}pp",
-              "(G_local: 32→64 gain on {L23,L25}; G_outer: 64→128 gain on {L20,L22,L26,L28}.)",
+              f"(G_local: {b0}→{b1} gain on {{L23,L25}}; G_outer: {b1}→{b2} gain on {{L20,L22,L26,L28}}.)",
               "", "Do not read a high real-text FVE where real−shuffled is small."]
     Path(out_md).write_text("\n".join(lines))
 
