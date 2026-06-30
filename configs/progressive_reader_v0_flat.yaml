@@ -1,0 +1,59 @@
+# Progressive Reader v0 — Flat-All baseline (spec §8.2). PRIMARY BASELINE.
+# Identical to the progressive config EXCEPT every target layer is supervised at every
+# budget. It may score better globally (more direct supervision) — that is expected; the
+# question is whether Progressive allocates quality in the intended depth-by-budget
+# structure that Flat does not. Same data rows, model, optimizer, #updates, max_len, seeds.
+experiment: progressive_reader_v0
+objective: flat_all
+
+data:
+  path: "${REGEN}/av_sft.shard*of*.parquet"
+  teacher_field: auto
+  split: { fracs: [0.8, 0.1, 0.1], seed: 42, names: [train, dev, test] }
+  require_full_prefix_for_max_budget: true
+
+target_layers: [20, 22, 23, 24, 25, 26, 28]
+prefix_budgets: [32, 64, 128]
+stages:                           # all layers at all budgets (require_nested=false)
+  32: [20, 22, 23, 24, 25, 26, 28]
+  64: [20, 22, 23, 24, 25, 26, 28]
+  128: [20, 22, 23, 24, 25, 26, 28]
+
+reader:
+  base_ckpt: Qwen/Qwen3-8B
+  prompt_prefix: "Explanation:\n"
+  suffix: "\n[RECONSTRUCT]"
+  reader_tap_by_target_layer: {20: 20, 22: 22, 23: 23, 24: 24, 25: 25, 26: 26, 28: 28}
+  strip_final_norm: true
+  mse_scale: sqrt_d_model
+
+loss:
+  mode: progressive_stage_mean
+  lambda: {32: 1.0, 64: 1.0, 128: 1.0}
+
+optim:
+  use_lora: true
+  lora_r: 128
+  lora_alpha: 16
+  lora_dropout: 0.0
+  use_rslora: true
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  lr: 3.0e-5
+  min_lr: 3.0e-6
+  lr_warmup_steps: 50
+  max_grad_norm: 1.0
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  max_len: 1024
+
+train:
+  seed: 0
+  num_steps: 3000
+  batch_size: 64
+  gradient_accumulation_steps: 4
+  bucket_by_budget: true
+  save_every: 500
+  eval_every: 500
+
+selection:
+  metric: M_scheduled              # SAME common dev metric as Progressive (spec §9)

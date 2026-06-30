@@ -1,0 +1,61 @@
+# Progressive Reader v0 — the Progressive objective (spec §8.1).
+# Reader-only: gold teacher prefix -> 7-tap reconstructor -> raw source activations.
+# Hyperparameters inherit the shared AR recipe (EXPERIMENT_REPORT §iii); document any
+# deviation in docs/progressive_reader_v0.md.
+experiment: progressive_reader_v0
+objective: progressive            # progressive | flat_all
+
+data:
+  # bank corpus with per-row teacher text + activation_L{20,22,23,24,25,26,28} + doc_id.
+  path: "${REGEN}/av_sft.shard*of*.parquet"
+  teacher_field: auto             # auto -> response (av_sft) else prompt (ar_sft)
+  split: { fracs: [0.8, 0.1, 0.1], seed: 42, names: [train, dev, test] }
+  require_full_prefix_for_max_budget: true   # keep only rows with n>=128 (headline; spec §3)
+
+target_layers: [20, 22, 23, 24, 25, 26, 28]
+prefix_budgets: [32, 64, 128]
+stages:                           # NESTED: S_32 ⊂ S_64 ⊂ S_128 (validated at startup)
+  32: [24]
+  64: [23, 24, 25]
+  128: [20, 22, 23, 24, 25, 26, 28]
+
+reader:
+  base_ckpt: Qwen/Qwen3-8B
+  prompt_prefix: "Explanation:\n"
+  suffix: "\n[RECONSTRUCT]"        # readout = final suffix token (attention_mask.sum(1)-1)
+  reader_tap_by_target_layer: {20: 20, 22: 22, 23: 23, 24: 24, 25: 25, 26: 26, 28: 28}
+  strip_final_norm: true
+  mse_scale: sqrt_d_model          # = 64; directional FVE space
+
+loss:
+  mode: progressive_stage_mean     # progressive_stage_mean | progressive_layer_balanced
+  lambda: {32: 1.0, 64: 1.0, 128: 1.0}
+  # NOTE run BOTH modes for the headline: stage_mean gives L24 3x the supervision mass;
+  # layer_balanced (1/c_l) isolates a real hierarchy from direct-supervision imbalance.
+
+optim:                             # inherits the AR recipe
+  use_lora: true
+  lora_r: 128
+  lora_alpha: 16
+  lora_dropout: 0.0
+  use_rslora: true
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  lr: 3.0e-5
+  min_lr: 3.0e-6
+  lr_warmup_steps: 50
+  max_grad_norm: 1.0
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  max_len: 1024
+
+train:
+  seed: 0
+  num_steps: 3000
+  batch_size: 64
+  gradient_accumulation_steps: 4   # effective 256 (AR has no grad-checkpointing -> 64x4)
+  bucket_by_budget: true           # don't mix 32- and 128-token rows unnecessarily
+  save_every: 500
+  eval_every: 500                  # save the full dev matrix at every eval (spec §1.5/§9)
+
+selection:
+  metric: M_scheduled              # dev-only; never select on test (spec §9)
