@@ -29,7 +29,7 @@ reader:
 
 loss:
   mode: progressive_stage_mean     # progressive_stage_mean | progressive_layer_balanced
-  lambda: {32: 1.0, 64: 1.0, 128: 1.0}
+  lambda: {32: 1.0, 64: 1.0, 96: 1.0}
   # NOTE run BOTH modes for the headline: stage_mean gives L24 3x the supervision mass;
   # layer_balanced (1/c_l) isolates a real hierarchy from direct-supervision imbalance.
 
@@ -55,7 +55,7 @@ train:
   gradient_accumulation_steps: 8   # effective 256 (same as the AR recipe)
   gradient_checkpointing: false    # flip true for micro-batch 64+ on an 80GB H100 (~20% slower)
   eval_batch_size: 128
-  bucket_by_budget: true           # don't mix 32- and 128-token rows unnecessarily
+  bucket_by_budget: true           # don't mix 32- and 96-token rows unnecessarily
   save_every: 500
   eval_every: 500                  # save the full dev matrix at every eval (spec §1.5/§9)
 
