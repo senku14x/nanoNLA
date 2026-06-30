@@ -27,6 +27,7 @@ PROG_CFG="${PROG_CFG:-configs/progressive_reader_v0_progressive.yaml}"
 FLAT_CFG="${FLAT_CFG:-configs/progressive_reader_v0_flat.yaml}"
 GC="${GC:-}"                       # set GC=--gradient-checkpointing if micro-batch 32 OOMs
 SPLIT="${SPLIT:-test}"
+EVAL_BS="${EVAL_BS:-128}"          # eval is forward-only — lots of VRAM headroom; 512 is safe on 80GB
 # wandb: OFF by default (metrics are still written to disk: train_log.jsonl + dev_matrix_step*.json).
 # WANDB=1 -> live dashboard (run `wandb login` first, or export WANDB_API_KEY / WANDB_MODE=offline).
 WANDB="${WANDB:-0}"
@@ -45,7 +46,7 @@ eval_one () {  # $1 config  $2 run-dir  $3 out  [$4 compare-to]
   local cmp=(); [ -n "${4:-}" ] && cmp=(--compare-to "$4")
   echo "[matrix] EVAL  $3  (split=$SPLIT${4:+, compare-to=$(basename "$(dirname "$4")")})"
   python -m multilayer_nla.progressive_reader.evaluate --checkpoint "$2/best" \
-    --config "$1" --split "$SPLIT" --out "$3" "${cmp[@]}" 2>&1 | tee "$ROOT/logs/eval_$(basename "$3").log"
+    --config "$1" --split "$SPLIT" --out "$3" --batch-size "$EVAL_BS" "${cmp[@]}" 2>&1 | tee "$ROOT/logs/eval_$(basename "$3").log"
 }
 
 # 1) TRAIN (flat first so its per_example.jsonl exists before the prog evals compare against it)
