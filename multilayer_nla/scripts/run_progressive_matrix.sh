@@ -27,13 +27,17 @@ PROG_CFG="${PROG_CFG:-configs/progressive_reader_v0_progressive.yaml}"
 FLAT_CFG="${FLAT_CFG:-configs/progressive_reader_v0_flat.yaml}"
 GC="${GC:-}"                       # set GC=--gradient-checkpointing if micro-batch 32 OOMs
 SPLIT="${SPLIT:-test}"
+# wandb: OFF by default (metrics are still written to disk: train_log.jsonl + dev_matrix_step*.json).
+# WANDB=1 -> live dashboard (run `wandb login` first, or export WANDB_API_KEY / WANDB_MODE=offline).
+WANDB="${WANDB:-0}"
+NW="--no-wandb"; [ "$WANDB" = 1 ] && NW=""
 mkdir -p "$ROOT/logs"
 
 train_one () {  # $1 config  $2 loss-mode  $3 run-dir
   if [ -f "$3/best/reader.safetensors" ]; then echo "[matrix] SKIP train $3 (checkpoint exists)"; return; fi
   echo "[matrix] TRAIN $3  ($2)"
   python -m multilayer_nla.progressive_reader.train --config "$1" \
-    --loss-mode "$2" --run-dir "$3" --no-wandb $GC 2>&1 | tee "$ROOT/logs/train_$(basename "$3").log"
+    --loss-mode "$2" --run-dir "$3" $NW $GC 2>&1 | tee "$ROOT/logs/train_$(basename "$3").log"
 }
 
 eval_one () {  # $1 config  $2 run-dir  $3 out  [$4 compare-to]
