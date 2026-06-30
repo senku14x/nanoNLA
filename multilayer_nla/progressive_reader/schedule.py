@@ -9,13 +9,16 @@ from __future__ import annotations
 TARGET_LAYERS: tuple[int, ...] = (20, 22, 23, 24, 25, 26, 28)
 
 # The three exact teacher-token-prefix budgets (token-ID counts, not characters).
-PREFIX_BUDGETS: tuple[int, ...] = (32, 64, 128)
+# Max is 96, not 128: the gold explanations are ~112 tokens median (p90=127), so
+# coverage@128 is only 9.5% — 96 keeps ~91% of rows under the strict-prefix filter
+# (data_audit.json). Adjust here + the configs if a re-audit changes the distribution.
+PREFIX_BUDGETS: tuple[int, ...] = (32, 64, 96)
 
-# The genuinely NESTED progressive schedule  S_32 ⊂ S_64 ⊂ S_128.
+# The genuinely NESTED progressive schedule  S_32 ⊂ S_64 ⊂ S_96.
 PROGRESSIVE_STAGES: dict[int, tuple[int, ...]] = {
     32: (24,),
     64: (23, 24, 25),
-    128: (20, 22, 23, 24, 25, 26, 28),
+    96: (20, 22, 23, 24, 25, 26, 28),
 }
 
 # Flat-All baseline: every target layer supervised at every budget.

@@ -150,22 +150,26 @@ def _cell_cos(recs, budget, layer):
     return float(c.mean()) if len(c) else float("nan")
 
 
-def stage_gains(cells):
-    """G_local = ½Σ_{23,25}[FVE(64,ℓ)−FVE(32,ℓ)];  G_outer = ¼Σ_{20,22,26,28}[FVE(128,ℓ)−FVE(64,ℓ)]."""
+def stage_gains(cells, budgets=PREFIX_BUDGETS):
+    """G_local = ½Σ_{23,25}[FVE(b1,ℓ)−FVE(b0,ℓ)];  G_outer = ¼Σ_{20,22,26,28}[FVE(b2,ℓ)−FVE(b1,ℓ)],
+    where (b0,b1,b2) are the three ascending budgets (32/64/96)."""
+    b0, b1, b2 = budgets
     def f(B, l):
         return cells[f"{B},{l}"]["fve"]
-    g_local = sum(f(64, l) - f(32, l) for l in (23, 25)) / 2.0
-    g_outer = sum(f(128, l) - f(64, l) for l in (20, 22, 26, 28)) / 4.0
+    g_local = sum(f(b1, l) - f(b0, l) for l in (23, 25)) / 2.0
+    g_outer = sum(f(b2, l) - f(b1, l) for l in (20, 22, 26, 28)) / 4.0
     return {"G_local": g_local, "G_outer": g_outer}
 
 
-def m_scheduled(cells):
-    """Common dev selection metric M_scheduled (spec §9), applied identically to all conditions."""
+def m_scheduled(cells, budgets=PREFIX_BUDGETS):
+    """Common dev selection metric M_scheduled (spec §9), applied identically to all conditions.
+    Stage 0 (smallest budget) -> L24; stage 1 -> {23,24,25}; stage 2 (largest) -> all 7."""
+    b0, b1, b2 = budgets
     def f(B, l):
         return cells[f"{B},{l}"]["fve"]
-    return (f(32, 24)
-            + sum(f(64, l) for l in (23, 24, 25)) / 3.0
-            + sum(f(128, l) for l in TARGET_LAYERS) / len(TARGET_LAYERS)) / 3.0
+    return (f(b0, 24)
+            + sum(f(b1, l) for l in (23, 24, 25)) / 3.0
+            + sum(f(b2, l) for l in TARGET_LAYERS) / len(TARGET_LAYERS)) / 3.0
 
 
 # ---------------------------------------------------------------- paired comparison (vs flat)
@@ -291,7 +295,8 @@ def main():
     tok = AutoTokenizer.from_pretrained(args.base_ckpt)
     base = load_base_rows(rc["path"], tok, target_layers=target_layers,
                           teacher_field=rc.get("teacher_field", "auto"),
-                          require_full_128=rc.get("require_full_prefix_for_max_budget", True),
+                          require_full_max_budget=rc.get("require_full_prefix_for_max_budget", True),
+                          max_budget=max(budgets),
                           fracs=tuple(rc["split"]["fracs"]), seed=rc["split"]["seed"],
                           names=tuple(rc["split"]["names"]))
     rows = base[args.split]
@@ -305,9 +310,9 @@ def main():
                                    shuffle_perm=perm, batch_size=args.batch_size, max_len=cfg["optim"]["max_len"])
     cells = matrix_from_records(by_mode.get("real", []), by_mode.get("no_text"), by_mode.get("shuffled"),
                                 baselines, target_layers=target_layers, budgets=budgets, n_boot=args.n_boot)
-    gains = stage_gains(cells)
+    gains = stage_gains(cells, budgets)
     (out / f"{args.split}_matrix.json").write_text(json.dumps(
-        {"cells": cells, "gains": gains, "M_scheduled": m_scheduled(cells),
+        {"cells": cells, "gains": gains, "M_scheduled": m_scheduled(cells, budgets),
          "objective": meta["objective"], "loss_mode": meta["loss_mode"]}, indent=2))
     with open(out / f"{args.split}_per_example.jsonl", "w") as f:
         for mode, recs in by_mode.items():
@@ -327,7 +332,7 @@ def main():
               f"{[round(x*100,2) for x in comp['delta_G_local']['ci95']]}  ·  "
               f"ΔG_outer {comp['delta_G_outer']['mean']*100:+.2f}pp "
               f"{[round(x*100,2) for x in comp['delta_G_outer']['ci95']]}")
-    print(f"[eval] {label}: M_sched {m_scheduled(cells)*100:.2f}%  G_local {gains['G_local']*100:+.2f} "
+    print(f"[eval] {label}: M_sched {m_scheduled(cells, budgets)*100:.2f}%  G_local {gains['G_local']*100:+.2f} "
           f"G_outer {gains['G_outer']*100:+.2f} -> {out}")
 
 

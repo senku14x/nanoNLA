@@ -46,7 +46,7 @@ def test_stage_expansion_and_target_identity():
         for v in views:
             assert np.array_equal(v["targets"], rows["targets"][base])
         # budgets + active masks follow the schedule
-        assert [v["budget"] for v in views] == [32, 64, 128]
+        assert [v["budget"] for v in views] == [32, 64, 96]
         assert views[0]["active_mask"] == [0, 0, 0, 1, 0, 0, 0]        # {24}
         assert sum(views[1]["active_mask"]) == 3 and sum(views[2]["active_mask"]) == 7
         # exact teacher prefix lands between the fixed prompt/suffix (§13.1 through the dataset)
@@ -69,7 +69,7 @@ def test_no_text_and_shuffled_modes():
     assert_deranged(rows["doc_ids"], perm)
     sh = ProgressiveReaderDataset(rows, _FakeTok(), PROGRESSIVE_STAGES, text_mode="shuffled", shuffle_perm=perm)
     for base in range(sh.n_base):
-        v = sh[base * 3 + 2]                                          # budget 128
+        v = sh[base * 3 + 2]                                          # budget 96
         content = v["input_ids"][pre_len:len(v["input_ids"]) - len(sh.suf_ids)]
         # shuffled teacher = ANOTHER document's prefix, SAME effective length, targets are THIS row's
         assert content == rows["full_ids"][perm[base]][:v["budget"]]

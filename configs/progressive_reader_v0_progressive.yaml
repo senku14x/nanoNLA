@@ -10,14 +10,14 @@ data:
   path: "${REGEN}/av_sft.shard*of*.parquet"
   teacher_field: auto             # auto -> response (av_sft) else prompt (ar_sft)
   split: { fracs: [0.8, 0.1, 0.1], seed: 42, names: [train, dev, test] }
-  require_full_prefix_for_max_budget: true   # keep only rows with n>=128 (headline; spec §3)
+  require_full_prefix_for_max_budget: true   # keep only rows with n>=max_budget (headline; spec §3)
 
 target_layers: [20, 22, 23, 24, 25, 26, 28]
-prefix_budgets: [32, 64, 128]
-stages:                           # NESTED: S_32 ⊂ S_64 ⊂ S_128 (validated at startup)
+prefix_budgets: [32, 64, 96]
+stages:                           # NESTED: S_32 ⊂ S_64 ⊂ S_96 (validated at startup)
   32: [24]
   64: [23, 24, 25]
-  128: [20, 22, 23, 24, 25, 26, 28]
+  96: [20, 22, 23, 24, 25, 26, 28]
 
 reader:
   base_ckpt: Qwen/Qwen3-8B

@@ -58,18 +58,22 @@ Fixed prompt `Explanation:\n` + exact teacher prefix IDs + fixed suffix `\n[RECO
 
 ## Stage expansion (spec §5)
 One base dataset (one row per activation record) + a lightweight **virtual** stage index:
-each base row → exactly 3 stage views `(i,32,S_32) (i,64,S_64) (i,128,S_128)`. Activation
+each base row → exactly 3 stage views `(i,32,S_32) (i,64,S_64) (i,96,S_96)`. Activation
 targets are **not** triplicated on disk; all three views expose byte-identical targets.
 
 ## The GATE (run first)
 `python -m multilayer_nla.progressive_reader.audit --data "$REGEN/av_sft.shard*of*.parquet"
 --base-ckpt Qwen/Qwen3-8B --out runs/progressive_reader_v0/data_audit.json`
 
-Reports teacher-length quantiles, `coverage_at_budget{32,64,128}`, the strict-`n≥128`
+Reports teacher-length quantiles, `coverage_at_budget{32,64,96}`, the strict-`n≥max`
 retained rows/docs per split, target-layer presence, and doc-split overlaps. **If
 `coverage@128 < 50%`, decide before building train/eval** (lower max budget / accept the
 smaller strict set / use censored mode — not headline). These are API summaries, so this is
 genuinely uncertain.
+
+
+## AUDIT RESULT — budgets locked to {32, 64, 96}
+The data_audit (216,570 rows, 24,974 docs) found gold explanations are short and tight: **median 112 tokens** (p10/p90 = 98/127, max 201). So **coverage@128 = 9.5%** (strict-128 would keep only ~10% of rows — the longest, a selection confound), while **coverage@32/64 = 100%** and **coverage@96 ≈ 91%**. Max budget dropped 128 → **96** (strict-96 keeps ~91%; train/dev/test ≈ shown in data_audit.json). All 7 target layers present, doc-split overlaps 0. Note for the pre-registration: the explanations being short and uniform further *weakens* the prior for a strong depth hierarchy (limited 'rate' to progressively reveal across a ~60-token span).
 
 ## Pre-registration
 - **Hypothesis:** longer gold prefixes progressively unlock *deeper/outer* layers (a depth
@@ -92,8 +96,9 @@ genuinely uncertain.
 - **Done (this slice):** `schedule.py` (nested-schedule validation), `prefix.py` (exact-prefix
   + SHA-256), `controls.py` (doc-level derangement), `audit.py` (the gate), stdlib tests
   (§13.1/§13.2/§13.8) — all passing.
-- **Gated next:** `data.py`, `model.py`, `loss.py`, `train.py`, `evaluate.py`, plots, and the
-  model/data-dependent tests (§13.3–§13.7, §13.9) — built after the audit confirms coverage.
+- **Built:** `data.py`, `model.py`, `loss.py`, `train.py`, `evaluate.py` (+ H100-safe
+  configs) — pipeline complete; budgets locked to {32,64,96} post-audit. The model/gradient/
+  eval-matrix tests (§13.5–§13.7, §13.9) are exercised by the smoke run.
 
 ## Next experiment after this succeeds (do NOT auto-proceed)
 AV-SFT against a **frozen** progressive AR: train an AV to emit text the frozen progressive

@@ -1,8 +1,8 @@
 """Progressive Reader v0 — data preflight audit (spec §3). THE GATE.
 
-The make-or-break question: do the gold teacher explanations actually reach 128 tokens
-often enough for the 64/128 conditions to be non-degenerate? These are API summaries, so
-`coverage_at_budget[128]` could be low — if it is, the strict-prefix v0 guts the data and
+The make-or-break question: do the gold teacher explanations actually reach the max budget often
+often enough for the larger-budget conditions to be non-degenerate? These are API summaries, so
+coverage at the max budget could be low — if it is, the strict-prefix v0 guts the data and
 we rethink BEFORE building train/eval. Run this first.
 
 Reads an existing bank corpus (av_sft / ar_sft / rl shards: per-row teacher label +
@@ -114,8 +114,9 @@ def run(data_glob: str, base_ckpt: str, *, fracs=(0.8, 0.1, 0.1), seed: int = 42
     split_rows = {nm: 0 for nm in names3}
     strict_rows = {nm: 0 for nm in names3}
     strict_docs = {nm: set() for nm in names3}
-    full128 = lengths >= 128
-    for d, b, ok in zip(doc_ids, buckets, full128):
+    maxb = max(PREFIX_BUDGETS)
+    full_max = lengths >= maxb
+    for d, b, ok in zip(doc_ids, buckets, full_max):
         nm = names3[b]
         split_rows[nm] += 1
         split_docs[nm].add(d)
@@ -143,13 +144,14 @@ def run(data_glob: str, base_ckpt: str, *, fracs=(0.8, 0.1, 0.1), seed: int = 42
         "document_overlap_train_dev": overlap("train", "dev"),
         "document_overlap_train_test": overlap("train", "test"),
         "document_overlap_dev_test": overlap("dev", "test"),
-        # strict-prefix (n>=128) effect, per split (spec §3): how much data the headline keeps.
-        "strict_128": {
+        # strict-prefix (n>=max_budget) effect, per split (spec §3): how much data the headline keeps.
+        "strict_max_budget": {
+            "max_budget": maxb,
             "train_rows": strict_rows["train"], "dev_rows": strict_rows["dev"],
             "test_rows": strict_rows["test"],
             "train_documents": len(strict_docs["train"]), "dev_documents": len(strict_docs["dev"]),
             "test_documents": len(strict_docs["test"]),
-            "retained_row_frac": float(full128.mean()) if len(full128) else 0.0,
+            "retained_row_frac": float(full_max.mean()) if len(full_max) else 0.0,
         },
         "split": {"fracs": list(fracs), "seed": seed, "names": list(names3)},
     }
@@ -166,9 +168,11 @@ def _verdict(res: dict) -> None:
           f"{res['train_rows']}/{res['dev_rows']}/{res['test_rows']}")
     print(f"  teacher tokens: p10/p50/p90/p100 = {q['p10']}/{q['p50']}/{q['p90']}/{q['p100']}  "
           f"mean {res['teacher_length_mean']:.0f}")
-    print(f"  coverage @ 32/64/128 tokens: {cov['32']*100:.1f}% / {cov['64']*100:.1f}% / {cov['128']*100:.1f}%")
-    s = res["strict_128"]
-    print(f"  STRICT n>=128 keeps {s['retained_row_frac']*100:.1f}% of rows "
+    s = res["strict_max_budget"]
+    maxb = s["max_budget"]
+    print("  coverage @ " + "/".join(str(b) for b in cov) + " tokens: "
+          + " / ".join(f"{cov[b]*100:.1f}%" for b in cov))
+    print(f"  STRICT n>={maxb} keeps {s['retained_row_frac']*100:.1f}% of rows "
           f"-> train/dev/test = {s['train_rows']}/{s['dev_rows']}/{s['test_rows']} rows "
           f"({s['test_documents']} test docs)")
     miss = res["target_layers_missing"]
@@ -177,14 +181,13 @@ def _verdict(res: dict) -> None:
     ov = res["document_overlap_train_dev"] + res["document_overlap_train_test"] + res["document_overlap_dev_test"]
     print(f"  doc-split overlaps (must be 0): {ov}")
     print("-" * 72)
-    if cov["128"] < 0.5:
-        print(f"  GATE: coverage@128 = {cov['128']*100:.1f}% < 50% — strict-prefix v0 keeps "
-              f"only {s['retained_row_frac']*100:.0f}% of rows.")
-        print("  -> Decide BEFORE building train/eval: (a) lower the max budget to a covered")
-        print("     value, (b) accept the smaller strict set if test docs are still plentiful,")
-        print("     or (c) use require_full_prefix_for_max_budget=false (censored — NOT headline).")
+    cmax = cov[str(maxb)]
+    if cmax < 0.5:
+        print(f"  GATE: coverage@{maxb} = {cmax*100:.1f}% < 50% — strict-prefix keeps "
+              f"only {s['retained_row_frac']*100:.0f}% of rows. Lower the max budget (configs +"
+              f" schedule.PREFIX_BUDGETS), or accept the strict set, or use censored mode (NOT headline).")
     else:
-        print(f"  GATE: coverage@128 = {cov['128']*100:.1f}% >= 50% — strict-prefix v0 is viable.")
+        print(f"  GATE: coverage@{maxb} = {cmax*100:.1f}% >= 50% — strict-prefix v0 is viable.")
     if miss:
         print(f"  GATE: target layers {miss} absent — re-probe within the bank window or re-extract.")
     print("=" * 72)

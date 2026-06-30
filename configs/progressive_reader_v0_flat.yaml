@@ -13,11 +13,11 @@ data:
   require_full_prefix_for_max_budget: true
 
 target_layers: [20, 22, 23, 24, 25, 26, 28]
-prefix_budgets: [32, 64, 128]
+prefix_budgets: [32, 64, 96]
 stages:                           # all layers at all budgets (require_nested=false)
   32: [20, 22, 23, 24, 25, 26, 28]
   64: [20, 22, 23, 24, 25, 26, 28]
-  128: [20, 22, 23, 24, 25, 26, 28]
+  96: [20, 22, 23, 24, 25, 26, 28]
 
 reader:
   base_ckpt: Qwen/Qwen3-8B

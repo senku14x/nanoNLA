@@ -30,13 +30,14 @@ def _teacher_text(raw, field):
 
 
 def load_base_rows(data_glob, tokenizer, *, target_layers=TARGET_LAYERS, teacher_field="auto",
-                   require_full_128=True, fracs=(0.8, 0.1, 0.1), seed=42,
-                   names=("train", "dev", "test"), max_documents=None, max_rows=None,
+                   require_full_max_budget=True, max_budget=max(PREFIX_BUDGETS), fracs=(0.8, 0.1, 0.1),
+                   seed=42, names=("train", "dev", "test"), max_documents=None, max_rows=None,
                    tok_batch=1024):
     """Stream the bank corpus → per-split base rows. Tokenizes the teacher text ONCE (the
     canonical teacher-token-ID source, spec §1.1) and stores ids + sha256 + length, the 7 raw
     target vectors, doc_id, src_row_id, and the doc-level split bucket. Returns
-    {split: dict-of-arrays}. require_full_128 keeps only rows with n>=128 (headline)."""
+    {split: dict-of-arrays}. require_full_max_budget keeps only rows with n>=max_budget so the
+    largest budget is a real prefix (not a short explanation) — strict-prefix headline (spec §3)."""
     import glob as _glob
     import numpy as np
     import pyarrow.parquet as pq
@@ -86,7 +87,7 @@ def load_base_rows(data_glob, tokenizer, *, target_layers=TARGET_LAYERS, teacher
     lengths = np.fromiter((len(x) for x in full_ids), dtype=np.int64, count=len(full_ids))
     targets = np.stack(tgt_parts) if tgt_parts else np.zeros((0, len(target_layers), 1), np.float32)
 
-    keep = lengths >= 128 if require_full_128 else np.ones(len(full_ids), dtype=bool)
+    keep = lengths >= max_budget if require_full_max_budget else np.ones(len(full_ids), dtype=bool)
     # smoke: limit to the first `max_documents` unique docs (deterministic by stream order)
     if max_documents is not None:
         seen, doc_keep = set(), np.zeros(len(full_ids), dtype=bool)

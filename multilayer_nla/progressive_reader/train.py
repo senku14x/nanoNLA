@@ -82,7 +82,8 @@ def main():
     rc = cfg["data"]
     base = load_base_rows(rc["path"], tok, target_layers=target_layers,
                           teacher_field=rc.get("teacher_field", "auto"),
-                          require_full_128=rc.get("require_full_prefix_for_max_budget", True),
+                          require_full_max_budget=rc.get("require_full_prefix_for_max_budget", True),
+                          max_budget=max(budgets),
                           fracs=tuple(rc["split"]["fracs"]), seed=rc["split"]["seed"],
                           names=tuple(rc["split"]["names"]), max_documents=rc.get("max_documents"))
     tr, dv = base["train"], base["dev"]
@@ -181,7 +182,7 @@ def main():
                                  max_len=o["max_len"])
             cells = {f"{B},{l}": {"fve": ev._cell_fve(recs, B, l, train_baselines[i])}
                      for B in budgets for i, l in enumerate(target_layers)}
-            m = ev.m_scheduled(cells)
+            m = ev.m_scheduled(cells, budgets)
             (run / f"dev_matrix_step{step+1}.json").write_text(json.dumps(cells, indent=2))
             print(f"  [dev] M_scheduled = {m*100:.2f}%", flush=True)
             if not args.no_wandb:

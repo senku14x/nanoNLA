@@ -12,11 +12,11 @@ data:
   max_documents: 200               # tiny doc-limited subset for the path-check
 
 target_layers: [20, 22, 23, 24, 25, 26, 28]
-prefix_budgets: [32, 64, 128]
+prefix_budgets: [32, 64, 96]
 stages:
   32: [24]
   64: [23, 24, 25]
-  128: [20, 22, 23, 24, 25, 26, 28]
+  96: [20, 22, 23, 24, 25, 26, 28]
 
 reader:
   base_ckpt: Qwen/Qwen3-8B
