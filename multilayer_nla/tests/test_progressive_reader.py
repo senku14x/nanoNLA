@@ -73,6 +73,22 @@ def test_shuffled_derangement():
         assert_deranged(doc_ids, perm)                   # §13.8
 
 
+def test_eval_metrics_match_spec():
+    # M_scheduled (§9) and G_local/G_outer (§11) must match the spec formulas exactly.
+    from multilayer_nla.progressive_reader.evaluate import m_scheduled, stage_gains
+    from multilayer_nla.progressive_reader.schedule import PREFIX_BUDGETS
+    def fve(B, l):
+        return round(0.2 + 0.001 * B + 0.005 * l, 5)
+    cells = {f"{B},{l}": {"fve": fve(B, l)} for B in PREFIX_BUDGETS for l in TARGET_LAYERS}
+    exp_m = (fve(32, 24)
+             + sum(fve(64, l) for l in (23, 24, 25)) / 3.0
+             + sum(fve(128, l) for l in TARGET_LAYERS) / len(TARGET_LAYERS)) / 3.0
+    assert abs(m_scheduled(cells) - exp_m) < 1e-9
+    g = stage_gains(cells)
+    assert abs(g["G_local"] - sum(fve(64, l) - fve(32, l) for l in (23, 25)) / 2.0) < 1e-9
+    assert abs(g["G_outer"] - sum(fve(128, l) - fve(64, l) for l in (20, 22, 26, 28)) / 4.0) < 1e-9
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

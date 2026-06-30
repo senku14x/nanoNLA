@@ -49,8 +49,10 @@ optim:
 train:
   seed: 0
   num_steps: 3000
-  batch_size: 64
-  gradient_accumulation_steps: 4
+  batch_size: 32
+  gradient_accumulation_steps: 8
+  gradient_checkpointing: false
+  eval_batch_size: 128
   bucket_by_budget: true
   save_every: 500
   eval_every: 500

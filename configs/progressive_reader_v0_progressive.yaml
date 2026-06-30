@@ -51,8 +51,10 @@ optim:                             # inherits the AR recipe
 train:
   seed: 0
   num_steps: 3000
-  batch_size: 64
-  gradient_accumulation_steps: 4   # effective 256 (AR has no grad-checkpointing -> 64x4)
+  batch_size: 32                   # micro-batch; H100-safe (29-block reader, short ~140-tok seqs)
+  gradient_accumulation_steps: 8   # effective 256 (same as the AR recipe)
+  gradient_checkpointing: false    # flip true for micro-batch 64+ on an 80GB H100 (~20% slower)
+  eval_batch_size: 128
   bucket_by_budget: true           # don't mix 32- and 128-token rows unnecessarily
   save_every: 500
   eval_every: 500                  # save the full dev matrix at every eval (spec §1.5/§9)

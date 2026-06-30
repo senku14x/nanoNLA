@@ -50,6 +50,8 @@ train:
   num_steps: 20                    # a few steps only
   batch_size: 8
   gradient_accumulation_steps: 1
+  gradient_checkpointing: false
+  eval_batch_size: 32
   bucket_by_budget: true
   save_every: 10
   eval_every: 10
