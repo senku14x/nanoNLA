@@ -188,8 +188,8 @@ def score_with_multitap_critic(critic, tokenizer, explanations, golds, mse_scale
             continue
         x = torch.tensor([ids], dtype=torch.long, device=device)
         with torch.no_grad():
-            pred = multitap_predict(critic, x, None, mse_scale)  # [1, 3, d]
-        g = torch.as_tensor(gold, dtype=torch.float32, device=device).unsqueeze(0)  # [1,3,d]
+            pred = multitap_predict(critic, x, None, mse_scale)  # [1, k, d]
+        g = torch.as_tensor(gold, dtype=torch.float32, device=device).unsqueeze(0)  # [1, k, d]
         r = three_target_reward(pred, g, mse_scale).item()
         rewards.append(r if math.isfinite(r) else None)
     return rewards
@@ -281,6 +281,12 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--av-ckpt", required=True, help="AV-SFT LoRA dir (policy init + frozen KL reference)")
     p.add_argument("--ar-ckpt", required=True, help="AR multitap dir (ar_multitap.safetensors + ar_meta.json)")
+    p.add_argument("--ar-target-slots", default="prev,centre,next",
+                   help="Which AV-input slots the AR reconstructs (comma-sep of prev,centre,next). "
+                        "Default = all 3 (reconstruct L23/24/25). Use 'centre' to reconstruct L24 ONLY "
+                        "from the SAME 3-slot AV input. Count MUST equal the critic's tap count "
+                        "(slot k -> tap k). Decouples the AR target from the 3-slot injection; the "
+                        "injection is always all 3 slots.")
     p.add_argument("--base-ckpt", default="Qwen/Qwen3-8B")
     p.add_argument("--quant", choices=["none", "4bit"], default="none")
     p.add_argument("--rl-parquet", required=True)
@@ -375,15 +381,26 @@ def main():
     critic.eval()
     print(f"[rl] critic taps={tap_layers} mse_scale={mse_scale:.3f}; loaded {len(_sd)} AR tensors")
 
+    # AR target-slot selection (decoupled from the always-3-slot AV injection). slot k -> tap k.
+    target_slots = [s.strip() for s in args.ar_target_slots.split(",") if s.strip()]
+    bad = [s for s in target_slots if s not in SLOT_NAMES]
+    assert not bad, f"--ar-target-slots {bad} not in {SLOT_NAMES}"
+    target_slot_idx = [SLOT_NAMES.index(s) for s in target_slots]
+    assert len(target_slot_idx) == len(tap_layers), (
+        f"--ar-target-slots has {len(target_slot_idx)} slots {target_slots} but the AR critic has "
+        f"{len(tap_layers)} taps {tap_layers} — they must match (slot k -> tap k). For L24-only, use a "
+        f"1-tap AR (tap_layers=[24]) with --ar-target-slots centre.")
+    print(f"[rl] AR reconstructs slots={target_slots} (idx {target_slot_idx}) with critic taps {tap_layers}")
+
     rows = load_rl_dataset_multi(args.rl_parquet, n_max=args.max_rows)
-    # per-tap FVE baselines
+    # predict-mean FVE baselines over the TARGET slots only (so fve/overall matches the reward)
     baselines = []
-    for j, c in enumerate(SLOT_COLUMNS):
+    for j in target_slot_idx:
         acts = torch.tensor(np.stack([r["acts"][j] for r in rows[:4000]]), dtype=torch.float32)
         _, rawvar = compute_predict_mean_baselines(acts, mse_scale)
         baselines.append(rawvar)
-    print(f"[rl] {len(rows)} rows; per-tap baselines " +
-          ", ".join(f"{nm}={b:.4f}" for nm, b in zip(SLOT_NAMES, baselines)))
+    print(f"[rl] {len(rows)} rows; per-target baselines " +
+          ", ".join(f"{SLOT_NAMES[j]}={b:.4f}" for j, b in zip(target_slot_idx, baselines)))
 
     try:
         import bitsandbytes as bnb
@@ -423,7 +440,8 @@ def main():
             for r in resp:
                 full_ids.append(r["full_ids"]); plens.append(r["prompt_len"]); acts_l.append(row["acts"])
                 expls.append(extract_explanation(r["text"])); texts.append(r["text"])
-                groups.append(gi); old_lps.append(r["old_logp"].to(device)); golds.append(row["acts"])
+                groups.append(gi); old_lps.append(r["old_logp"].to(device))
+                golds.append(row["acts"][target_slot_idx])  # AR target = selected slots (injection stays 3-slot)
 
         rewards = score_with_multitap_critic(critic, tokenizer, expls, golds, mse_scale, device)
         valid = [r for r in rewards if r is not None]
