@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Fresh-box bootstrap for multi-layer NLA RL on a GH200 (aarch64 + Hopper, ~80GB).
 # Run from the repo root AFTER cloning + checking out the branch. Does: deps -> hf/wandb
-# login -> download ingredients -> PREFLIGHT (validate before GPU) -> smoke -> 250-step RL
+# login -> download bank shard + adapters -> BUILD the RL-ready parquet (build_from_published:
+# activation_L* -> prompt + prev/centre/next) -> PREFLIGHT -> smoke -> 250-step RL
 # for BOTH configs (3tap + l24). bf16 by default (bitsandbytes is unreliable on aarch64;
 # 80GB holds the 8B actor+critic in bf16). Set QUANT=4bit only if you confirmed bnb works.
 #
@@ -45,14 +46,26 @@ echo "[rl] downloading adapters from $MODEL_REPO ..."
 for sub in "$AV_SUBDIR" "$AR3_SUBDIR" "$ARL24_SUBDIR"; do
   hf download "$MODEL_REPO" --include "$sub/**" --local-dir "$CKPTS" >/dev/null
 done
-echo "[rl] downloading rl data ($RL_SHARD) from $DS_REPO ..."
+echo "[rl] downloading RAW rl bank shard ($RL_SHARD) from $DS_REPO ..."
 hf download "$DS_REPO" --repo-type dataset --include "$RL_SHARD" --local-dir "$BANK" >/dev/null
+
+# ---- 4b. BUILD the RL-ready parquet. The bank shard has activation_L19..L29 (+ published
+#          single-marker prompt); train_rl_multi needs the 3-marker AV prompt + the derived
+#          activation_prev/centre/next slots. build_from_published --mode rl does exactly that
+#          (--center 24 -> prev=L23, centre=L24, next=L25). CPU only. ----
+TRAIN="$DATA/train"; mkdir -p "$TRAIN"; RL_PARQUET="$TRAIN/rl.parquet"
+if [ ! -f "$RL_PARQUET" ]; then
+  echo "[rl] building RL-ready parquet (build_from_published --mode rl --center 24) ..."
+  python -m multilayer_nla.build_from_published --mode rl --center 24 \
+    --in "$BANK/$RL_SHARD" --out "$RL_PARQUET"
+else
+  echo "[rl] RL-ready parquet already built: $RL_PARQUET"
+fi
 
 latest_iter(){ local d; d=$(ls -d "$1"/iter_* 2>/dev/null | sort | tail -1); echo "${d:-$1}"; }
 AV_CKPT=$(latest_iter "$CKPTS/$AV_SUBDIR")
 AR3_CKPT=$(latest_iter "$CKPTS/$AR3_SUBDIR")
 ARL24_CKPT=$(latest_iter "$CKPTS/$ARL24_SUBDIR")
-RL_PARQUET="$BANK/$RL_SHARD"
 
 # ---- 5. PREFLIGHT: validate before burning GPU ----
 python - "$AV_CKPT" "$AR3_CKPT" "$ARL24_CKPT" "$RL_PARQUET" <<'PY'
