@@ -23,6 +23,14 @@ AR_CKPT="${AR_CKPT:?set AR_CKPT to the AR multitap dir (ar_multitap.safetensors 
 RL_PARQUET="${RL_PARQUET:?set RL_PARQUET to the rl shard(s) with prev/centre/next slot columns}"
 STEPS="${STEPS:-500}"
 QUANT="${QUANT:-4bit}"              # single-GPU verified path is 4-bit
+# rollout knobs — the ONLY real speed lever (rollouts dominate step time).
+# per-step rollouts = BATCH_PROMPTS × GROUP_SIZE (default 256). Halve GROUP_SIZE -> ~2x faster
+# (slightly noisier group-advantage z-score; 8 is a fine GRPO minimum). BATCH_PROMPTS×GROUP_SIZE=64
+# (e.g. 8×8) is ~4x faster. MAX_NEW caps generated tokens (explanations run ~40-80 tok).
+BATCH_PROMPTS="${BATCH_PROMPTS:-16}"
+GROUP_SIZE="${GROUP_SIZE:-16}"
+MAX_NEW="${MAX_NEW:-150}"
+SAVE_EVERY="${SAVE_EVERY:-50}"      # lower (e.g. 25) for earlier checkpoints when you plan to early-stop
 NW=""; [ "${WANDB:-1}" = 0 ] && NW="--no-wandb"
 
 case "$CONFIG" in
@@ -36,7 +44,7 @@ echo "[rl-multi] av=$AV_CKPT ar=$AR_CKPT slots=$SLOTS -> $SAVE"
 python -m multilayer_nla.train_rl_multi --base-ckpt "$BASE" \
   --av-ckpt "$AV_CKPT" --ar-ckpt "$AR_CKPT" --ar-target-slots "$SLOTS" \
   --rl-parquet "$RL_PARQUET" --save-dir "$SAVE" \
-  --quant "$QUANT" --num-steps "$STEPS" --batch-prompts 16 --group-size 16 \
-  --max-new-tokens 150 --temperature 1.0 --lr 1e-5 --kl-beta 0.01 --clip-eps 0.2 \
+  --quant "$QUANT" --num-steps "$STEPS" --batch-prompts "$BATCH_PROMPTS" --group-size "$GROUP_SIZE" \
+  --max-new-tokens "$MAX_NEW" --save-every "$SAVE_EVERY" --temperature 1.0 --lr 1e-5 --kl-beta 0.01 --clip-eps 0.2 \
   --wandb-name "rl_multi_${CONFIG}" $NW
 echo "[rl-multi] DONE -> $SAVE"
